@@ -1,0 +1,45 @@
+name: 发布 Windows 安装包
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: 构建 MSI
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建 Tauri 安装包
+        run: pnpm tauri build
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OOPZ+ ${{ github.ref_name }}
+          body_path: .github/releases/v1.0.0.md
+          files: src-tauri/target/release/bundle/msi/*.msi
