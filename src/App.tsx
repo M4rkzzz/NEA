@@ -82,6 +82,15 @@ type UpdateStatus = {
   message: string;
 };
 
+type WormholeStatus = {
+  state: "preparing" | "waiting" | "connecting" | "transferring" | "importing" | "cancelling" | "cancelled" | "complete" | "error";
+  direction: "send" | "receive";
+  message: string;
+  code?: string;
+  transferred?: number;
+  total?: number;
+};
+
 type FeatureKey = "overview" | "switcher" | "plugin";
 
 const emptyCredential = {
@@ -116,6 +125,25 @@ function accountStatus(account: SavedAccount, currentLoginUid?: string) {
 
 function accountInitial(account: SavedAccount) {
   return account.displayName.trim().slice(0, 1).toUpperCase() || "?";
+}
+
+function exportTimestamp() {
+  const now = new Date();
+  const parts = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ];
+  const time = [
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+    String(now.getSeconds()).padStart(2, "0"),
+  ];
+  return `${parts.join("-")}_${time.join("-")}`;
+}
+
+function safeFileName(value: string) {
+  return value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim() || "oopz-account";
 }
 
 function AccountAvatar({ account, className = "", ready = false }: { account: SavedAccount; className?: string; ready?: boolean }) {
@@ -155,6 +183,9 @@ function App() {
   const [activeFeature, setActiveFeature] = useState<FeatureKey>("overview");
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [wormholeStatus, setWormholeStatus] = useState<WormholeStatus | null>(null);
+  const [quickCode, setQuickCode] = useState("");
+  const [receiveCode, setReceiveCode] = useState("");
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -167,6 +198,7 @@ function App() {
   const sessionCount = data.accounts.filter((account) => account.hasLoginState).length;
   const credentialCount = data.accounts.filter((account) => account.hasCredential).length;
   const updateActive = updateStatus?.state === "checking" || updateStatus?.state === "downloading" || updateStatus?.state === "installing";
+  const wormholeActive = Boolean(wormholeStatus && !["cancelled", "complete", "error"].includes(wormholeStatus.state));
 
   async function refresh() {
     const next = await invoke<AppData>("get_app_data");
@@ -283,29 +315,89 @@ function App() {
     }
     const target = await save({
       title: "导出账号登录数据",
-      defaultPath: `${account.displayName || "oopz-account"}.oopzplus.json`,
-      filters: [{ name: "OOPZ+ 账号登录数据", extensions: ["json", "txt"] }],
+      defaultPath: `${safeFileName(account.displayName)}_${exportTimestamp()}.oopz+`,
+      filters: [{ name: "OOPZ+ 登录态包", extensions: ["oopz+"] }],
     });
     if (!target) return;
-    await runTask("正在导出账号...", () =>
-      invoke("export_account_package", { accountId: account.id, path: target }),
+    const count = await runTask("正在导出账号...", () =>
+      invoke<number>("export_account_package", { accountId: account.id, path: target }),
     );
-    setMessage("账号登录数据已导出，请妥善保管");
+    setMessage(`已导出 ${count} 个账号登录态，请妥善保管`);
+  }
+
+  async function exportAllAccounts() {
+    const target = await save({
+      title: "导出全部账号登录态",
+      defaultPath: `${exportTimestamp()}.oopz+`,
+      filters: [{ name: "OOPZ+ 登录态包", extensions: ["oopz+"] }],
+    });
+    if (!target) return;
+    const count = await runTask("正在打包全部账号...", () =>
+      invoke<number>("export_all_accounts_package", { path: target }),
+    );
+    setMessage(`已将 ${count} 个账号登录态打包导出，请妥善保管`);
   }
 
   async function importAccountPackage() {
     const source = await open({
       title: "导入账号登录数据",
       multiple: false,
-      filters: [{ name: "OOPZ+ 账号登录数据", extensions: ["json", "txt"] }],
+      filters: [
+        { name: "OOPZ+ 登录态包", extensions: ["oopz+"] },
+        { name: "旧版 OOPZ+ 登录数据", extensions: ["json", "txt"] },
+      ],
     });
     if (!source || Array.isArray(source)) return;
-    const account = await runTask("正在导入账号...", () =>
-      invoke<SavedAccount>("import_account_package", { path: source }),
+    const accounts = await runTask("正在导入账号...", () =>
+      invoke<SavedAccount[]>("import_account_package", { path: source }),
     );
     await refresh();
-    setSelectedId(account.id);
-    setMessage(`${account.displayName} 已导入，可快速切换`);
+    setSelectedId(accounts[0]?.id ?? null);
+    setMessage(`已导入 ${accounts.length} 个账号，可快速切换`);
+  }
+
+  async function startQuickShare() {
+    setQuickCode("");
+    setWormholeStatus({ state: "preparing", direction: "send", message: "正在准备快捷分享..." });
+    try {
+      const code = await invoke<string>("start_quick_export");
+      setQuickCode(code);
+      setMessage("快捷码已生成，等待对方接收");
+    } catch (error) {
+      const message = errorMessage(error);
+      const cancelled = message.includes("已取消");
+      setWormholeStatus({ state: cancelled ? "cancelled" : "error", direction: "send", message });
+      if (cancelled) setQuickCode("");
+      setMessage(message);
+    }
+  }
+
+  async function cancelQuickShare() {
+    try {
+      await invoke("cancel_quick_share");
+      setWormholeStatus((current) => ({
+        state: "cancelling",
+        direction: "send",
+        message: "正在取消分享...",
+        code: current?.code,
+      }));
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  }
+
+  async function quickImport() {
+    const code = receiveCode.trim();
+    if (!code) {
+      setMessage("请输入快捷码");
+      return;
+    }
+    setWormholeStatus({ state: "connecting", direction: "receive", message: "正在连接发送方..." });
+    const accounts = await runTask("正在快捷导入...", () =>
+      invoke<SavedAccount[]>("quick_import", { code }),
+    );
+    setSelectedId(accounts[0]?.id ?? null);
+    setMessage(`快捷导入完成，共 ${accounts.length} 个账号`);
   }
 
   async function saveCredential() {
@@ -467,6 +559,12 @@ function App() {
       setUpdateStatus(event.payload);
       setMessage(event.payload.message);
     }));
+    keepListener(listen<WormholeStatus>("wormhole-status", (event) => {
+      setWormholeStatus(event.payload);
+      if (event.payload.code) setQuickCode(event.payload.code);
+      if (event.payload.state === "cancelled") setQuickCode("");
+      setMessage(event.payload.message);
+    }));
     return () => {
       disposed = true;
       unsubs.forEach((unsub) => unsub());
@@ -560,6 +658,7 @@ function App() {
             <h2>账号列表</h2>
             <div className="actions">
               <button onClick={() => handleAction(importAccountPackage)} disabled={busy}>导入</button>
+              <button onClick={() => handleAction(exportAllAccounts)} disabled={busy || sessionCount === 0}>导出全部</button>
               <button onClick={() => handleAction(() => refreshAccounts())} disabled={busy}>刷新</button>
             </div>
           </div>
@@ -574,6 +673,27 @@ function App() {
                 <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
               </div>
             ))}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">
+            <h2>快捷分享</h2>
+            {wormholeStatus && <span>{wormholeStatus.direction === "send" ? "分享" : "接收"}</span>}
+          </div>
+          <div className="quick-transfer">
+            <div className="quick-transfer-row">
+              <button onClick={() => void startQuickShare()} disabled={busy || wormholeActive || sessionCount === 0}>快捷分享</button>
+              {quickCode && <code className="quick-code">{quickCode}</code>}
+              {quickCode && <button onClick={() => copyText(quickCode)} disabled={wormholeActive && wormholeStatus?.direction === "receive"}>复制代码</button>}
+              {wormholeActive && wormholeStatus?.direction === "send" && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus.state === "cancelling"}>取消分享</button>}
+            </div>
+            <div className="quick-transfer-row">
+              <input value={receiveCode} onChange={(event) => setReceiveCode(event.target.value)} placeholder="输入快捷码" disabled={busy || wormholeActive} />
+              <button className="primary" onClick={() => handleAction(quickImport)} disabled={busy || wormholeActive || !receiveCode.trim()}>快捷导入</button>
+            </div>
+            {wormholeStatus && <div className="quick-transfer-status" data-state={wormholeStatus.state}>{wormholeStatus.message}</div>}
+            {wormholeStatus?.total && wormholeStatus.transferred !== undefined && <progress value={wormholeStatus.transferred} max={wormholeStatus.total} />}
           </div>
         </div>
       </div>

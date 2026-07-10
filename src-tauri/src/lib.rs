@@ -1,17 +1,20 @@
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
+use futures::{future::pending, AsyncWriteExt};
 use keyring::Entry;
+use magic_wormhole::{transfer, transit, Code, MailboxConnection, Wormhole};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -37,7 +40,14 @@ const CREDENTIAL_SERVICE: &str = "OOPZ+";
 const WATCHER_FILE_NAME: &str = "oopz-plus-watcher.exe";
 const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
-const EXPORT_FORMAT: &str = "oopz-plus-account-v1";
+const LEGACY_EXPORT_FORMAT: &str = "oopz-plus-account-v1";
+const EXPORT_FORMAT: &str = "oopz-plus-package-v2";
+const MAX_EXPORT_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_EXPORT_ACCOUNTS: usize = 100;
+const MAX_EXPORT_FILES: usize = 100_000;
+const WORMHOLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+const WORMHOLE_CODE_WORDS: usize = 4;
+const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
@@ -93,6 +103,22 @@ struct SavedAccount {
 struct AccountExportPackage {
     format: String,
     exported_at: String,
+    accounts: Vec<ExportedAccountEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyAccountExportPackage {
+    format: String,
+    exported_at: String,
+    account: ExportedAccount,
+    oopz_login: String,
+    files: Vec<ExportedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportedAccountEntry {
     account: ExportedAccount,
     oopz_login: String,
     files: Vec<ExportedFile>,
@@ -206,6 +232,20 @@ struct UpdateStatus {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WormholeStatus {
+    state: String,
+    direction: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -236,6 +276,8 @@ struct AppState {
     overlay_dragging: AtomicBool,
     update_running: AtomicBool,
     update_status: Mutex<UpdateStatus>,
+    wormhole_running: AtomicBool,
+    wormhole_cancelled: AtomicBool,
 }
 
 fn now() -> String {
@@ -2446,24 +2488,11 @@ fn import_account_inner(
     Ok(account)
 }
 
-#[tauri::command]
-fn export_account_package(
-    state: State<AppState>,
-    account_id: String,
-    path: String,
-) -> Result<(), String> {
-    let account = {
-        let data = state.data.lock().map_err(|e| e.to_string())?;
-        data.accounts
-            .iter()
-            .find(|account| account.id == account_id)
-            .cloned()
-            .ok_or_else(|| "账号不存在".to_string())?
-    };
+fn build_export_entry(account: &SavedAccount) -> Result<ExportedAccountEntry, String> {
     let oopz_login = read_oopz_login(&account.id)
         .ok_or_else(|| "这个账号还不能导出，请先登录一次".to_string())?;
     let snapshot = account_snapshot_dir(&account.id)?;
-    if !saved_snapshot_exists(&account) {
+    if !saved_snapshot_exists(account) {
         return Err("这个账号还没有可导出的本地数据".to_string());
     }
     let mut files = Vec::new();
@@ -2471,39 +2500,191 @@ fn export_account_package(
     if files.is_empty() {
         return Err("这个账号还没有可导出的本地数据".to_string());
     }
-    let package = AccountExportPackage {
-        format: EXPORT_FORMAT.to_string(),
-        exported_at: now(),
+    Ok(ExportedAccountEntry {
         account: ExportedAccount {
-            display_name: account.display_name,
-            uid: account.uid,
-            pid: account.pid,
-            user_common_id: account.user_common_id,
-            masked_phone: account.masked_phone,
-            avatar_url: account.avatar_url,
-            note: account.note,
+            display_name: account.display_name.clone(),
+            uid: account.uid.clone(),
+            pid: account.pid.clone(),
+            user_common_id: account.user_common_id.clone(),
+            masked_phone: account.masked_phone.clone(),
+            avatar_url: account.avatar_url.clone(),
+            note: account.note.clone(),
         },
         oopz_login,
         files,
+    })
+}
+
+fn write_export_package(path: &Path, accounts: Vec<ExportedAccountEntry>) -> Result<(), String> {
+    let package = AccountExportPackage {
+        format: EXPORT_FORMAT.to_string(),
+        exported_at: now(),
+        accounts,
     };
     let raw = serde_json::to_string_pretty(&package).map_err(|e| e.to_string())?;
-    fs::write(path, raw).map_err(|e| format!("导出失败: {}", e))
+    if raw.len() as u64 > MAX_EXPORT_PACKAGE_BYTES {
+        return Err("导出数据超过 512 MB，请减少账号后重试".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "导出路径无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败: {}", e))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "导出文件名无效".to_string())?;
+    let suffix = Uuid::new_v4();
+    let temp = parent.join(format!(".{}.{}.tmp", name, suffix));
+    let backup = parent.join(format!(".{}.{}.bak", name, suffix));
+    fs::write(&temp, raw).map_err(|e| format!("写入导出文件失败: {}", e))?;
+    if path.exists() {
+        fs::rename(path, &backup).map_err(|e| format!("备份原导出文件失败: {}", e))?;
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temp);
+        return Err(format!("导出失败: {}", error));
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn export_account_package_inner(
+    app: &AppHandle,
+    account_id: Option<&str>,
+    path: &Path,
+) -> Result<usize, String> {
+    let accounts = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|e| e.to_string())?;
+        match account_id {
+            Some(account_id) => vec![data
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+                .ok_or_else(|| "账号不存在".to_string())?],
+            None => data
+                .accounts
+                .iter()
+                .filter(|account| account.has_login_state)
+                .cloned()
+                .collect(),
+        }
+    };
+    if accounts.is_empty() {
+        return Err("没有可导出的账号登录态".to_string());
+    }
+    if accounts.len() > MAX_EXPORT_ACCOUNTS {
+        return Err(format!("一次最多导出 {} 个账号", MAX_EXPORT_ACCOUNTS));
+    }
+    let mut exported = Vec::with_capacity(accounts.len());
+    for account in &accounts {
+        exported.push(
+            build_export_entry(account)
+                .map_err(|error| format!("{} 导出失败: {}", account.display_name, error))?,
+        );
+    }
+    let count = exported.len();
+    write_export_package(path, exported)?;
+    Ok(count)
 }
 
 #[tauri::command]
-fn import_account_package(app: AppHandle, path: String) -> Result<SavedAccount, String> {
+async fn export_account_package(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_account_package_inner(&app, Some(&account_id), Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn export_all_accounts_package(app: AppHandle, path: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_account_package_inner(&app, None, Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn read_export_package(path: &Path) -> Result<Vec<ExportedAccountEntry>, String> {
+    let size = fs::metadata(path)
+        .map_err(|e| format!("读取导入文件失败: {}", e))?
+        .len();
+    if size == 0 || size > MAX_EXPORT_PACKAGE_BYTES {
+        return Err("导入文件为空或超过 512 MB".to_string());
+    }
     let raw = fs::read_to_string(path).map_err(|e| format!("读取导入文件失败: {}", e))?;
-    let package: AccountExportPackage =
+    let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("导入文件格式不正确: {}", e))?;
-    if package.format != EXPORT_FORMAT {
-        return Err("不支持的导入文件".to_string());
+    let format = value
+        .get("format")
+        .and_then(|format| format.as_str())
+        .ok_or_else(|| "导入文件缺少格式标识".to_string())?;
+    let accounts = match format {
+        EXPORT_FORMAT => {
+            serde_json::from_value::<AccountExportPackage>(value)
+                .map_err(|e| format!("导入文件格式不正确: {}", e))?
+                .accounts
+        }
+        LEGACY_EXPORT_FORMAT => {
+            let legacy = serde_json::from_value::<LegacyAccountExportPackage>(value)
+                .map_err(|e| format!("旧版导入文件格式不正确: {}", e))?;
+            vec![ExportedAccountEntry {
+                account: legacy.account,
+                oopz_login: legacy.oopz_login,
+                files: legacy.files,
+            }]
+        }
+        _ => return Err("不支持的导入文件".to_string()),
+    };
+    if accounts.is_empty() || accounts.len() > MAX_EXPORT_ACCOUNTS {
+        return Err(format!(
+            "导入包必须包含 1 到 {} 个账号",
+            MAX_EXPORT_ACCOUNTS
+        ));
     }
-    if package.oopz_login.is_empty() || package.files.is_empty() {
-        return Err("导入文件缺少账号数据".to_string());
+    let file_count: usize = accounts.iter().map(|entry| entry.files.len()).sum();
+    if file_count > MAX_EXPORT_FILES {
+        return Err("导入包包含的文件数量过多".to_string());
     }
-    let app_for_state = app.clone();
-    let state = app_for_state.state::<AppState>();
-    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let mut uids = HashSet::new();
+    for entry in &accounts {
+        if entry.account.display_name.trim().is_empty()
+            || entry.oopz_login.trim().is_empty()
+            || entry.files.is_empty()
+        {
+            return Err("导入文件缺少账号数据".to_string());
+        }
+        if let Some(uid) = entry.account.uid.as_deref() {
+            if !uids.insert(uid) {
+                return Err("导入包包含重复账号".to_string());
+            }
+        }
+        for file in &entry.files {
+            safe_relative_path(&file.path)?;
+            general_purpose::STANDARD
+                .decode(&file.data_base64)
+                .map_err(|_| "导入文件包含损坏的数据".to_string())?;
+        }
+    }
+    Ok(accounts)
+}
+
+fn import_export_entry(
+    data: &mut AppData,
+    package: ExportedAccountEntry,
+) -> Result<SavedAccount, String> {
     let existing_id = package.account.uid.as_ref().and_then(|uid| {
         data.accounts
             .iter()
@@ -2556,12 +2737,458 @@ fn import_account_package(app: AppHandle, path: String) -> Result<SavedAccount, 
     } else {
         data.accounts.push(account.clone());
     }
+    Ok(account)
+}
+
+fn import_account_package_inner(app: &AppHandle, path: &Path) -> Result<Vec<SavedAccount>, String> {
+    let packages = read_export_package(path)?;
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let mut imported = Vec::with_capacity(packages.len());
+    for package in packages {
+        imported.push(import_export_entry(&mut data, package)?);
+    }
     let config = data.config.clone();
     save_data(&data)?;
     drop(data);
-    update_tray(&app);
+    update_tray(app);
     ensure_plugin_runtime_for_oopz(&config);
-    Ok(account)
+    let _ = app.emit("app-data-changed", ());
+    Ok(imported)
+}
+
+#[tauri::command]
+async fn import_account_package(app: AppHandle, path: String) -> Result<Vec<SavedAccount>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        import_account_package_inner(&app, Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn emit_wormhole_status(
+    app: &AppHandle,
+    state: &str,
+    direction: &str,
+    message: impl Into<String>,
+    code: Option<String>,
+    progress: Option<(u64, u64)>,
+) {
+    let (transferred, total) = progress.map_or((None, None), |(transferred, total)| {
+        (Some(transferred), Some(total))
+    });
+    let _ = app.emit(
+        "wormhole-status",
+        WormholeStatus {
+            state: state.to_string(),
+            direction: direction.to_string(),
+            message: message.into(),
+            code,
+            transferred,
+            total,
+        },
+    );
+}
+
+fn wormhole_relay_hints() -> Result<Vec<transit::RelayHint>, String> {
+    let relay_url = transit::DEFAULT_RELAY_SERVER
+        .parse()
+        .map_err(|e| format!("公共中继地址无效: {}", e))?;
+    let hint = transit::RelayHint::from_urls(None, [relay_url])
+        .map_err(|e| format!("公共中继配置失败: {}", e))?;
+    Ok(vec![hint])
+}
+
+fn wormhole_temp_package(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{}-{}.oopz+", prefix, Uuid::new_v4()))
+}
+
+async fn wait_for_quick_share_cancel(app: AppHandle) {
+    loop {
+        if app
+            .state::<AppState>()
+            .wormhole_cancelled
+            .load(Ordering::SeqCst)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn finish_wormhole_operation(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.wormhole_running.store(false, Ordering::SeqCst);
+    state.wormhole_cancelled.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn cancel_quick_share(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if !state.wormhole_running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    state.wormhole_cancelled.store(true, Ordering::SeqCst);
+    emit_wormhole_status(&app, "cancelling", "send", "正在取消分享...", None, None);
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_quick_export(app: AppHandle) -> Result<String, String> {
+    if app
+        .state::<AppState>()
+        .wormhole_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("已有快捷分享或导入正在进行".to_string());
+    }
+    app.state::<AppState>()
+        .wormhole_cancelled
+        .store(false, Ordering::SeqCst);
+    emit_wormhole_status(
+        &app,
+        "preparing",
+        "send",
+        "正在打包全部账号登录态...",
+        None,
+        None,
+    );
+    let package_path = wormhole_temp_package("oopz-plus-share");
+    let build_app = app.clone();
+    let build_path = package_path.clone();
+    let build_result = match tauri::async_runtime::spawn_blocking(move || {
+        export_account_package_inner(&build_app, None, &build_path)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("打包任务异常结束: {}", error)),
+    };
+    if let Err(error) = build_result {
+        finish_wormhole_operation(&app);
+        emit_wormhole_status(&app, "error", "send", &error, None, None);
+        return Err(error);
+    }
+
+    if app
+        .state::<AppState>()
+        .wormhole_cancelled
+        .load(Ordering::SeqCst)
+    {
+        let _ = fs::remove_file(&package_path);
+        finish_wormhole_operation(&app);
+        emit_wormhole_status(&app, "cancelled", "send", QUICK_SHARE_CANCELLED, None, None);
+        return Err(QUICK_SHARE_CANCELLED.to_string());
+    }
+
+    let create_app = app.clone();
+    let mailbox_result = tokio::select! {
+        result = tokio::time::timeout(
+            Duration::from_secs(30),
+            MailboxConnection::create(transfer::APP_CONFIG, WORMHOLE_CODE_WORDS),
+        ) => Some(result),
+        _ = wait_for_quick_share_cancel(create_app) => None,
+    };
+    let mailbox = match mailbox_result {
+        None => {
+            let _ = fs::remove_file(&package_path);
+            finish_wormhole_operation(&app);
+            emit_wormhole_status(&app, "cancelled", "send", QUICK_SHARE_CANCELLED, None, None);
+            return Err(QUICK_SHARE_CANCELLED.to_string());
+        }
+        Some(Ok(Ok(mailbox))) => mailbox,
+        Some(Ok(Err(error))) => {
+            let _ = fs::remove_file(&package_path);
+            finish_wormhole_operation(&app);
+            let message = format!("创建快捷码失败: {}", error);
+            emit_wormhole_status(&app, "error", "send", &message, None, None);
+            return Err(message);
+        }
+        Some(Err(_)) => {
+            let _ = fs::remove_file(&package_path);
+            finish_wormhole_operation(&app);
+            let message = "连接 Magic Wormhole 服务超时".to_string();
+            emit_wormhole_status(&app, "error", "send", &message, None, None);
+            return Err(message);
+        }
+    };
+    let code = mailbox.code().to_string();
+    emit_wormhole_status(
+        &app,
+        "waiting",
+        "send",
+        "快捷码已生成，等待对方输入...",
+        Some(code.clone()),
+        None,
+    );
+
+    let transfer_app = app.clone();
+    let transfer_code = code.clone();
+    tauri::async_runtime::spawn(async move {
+        let final_code = transfer_code.clone();
+        let result = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
+            let connect_app = transfer_app.clone();
+            let wormhole = tokio::select! {
+                result = Wormhole::connect(mailbox) => {
+                    result.map_err(|e| format!("建立加密连接失败: {}", e))?
+                }
+                _ = wait_for_quick_share_cancel(connect_app) => {
+                    return Err(QUICK_SHARE_CANCELLED.to_string());
+                }
+            };
+            let offer = transfer::offer::OfferSend::new_file_or_folder(
+                "oopz-plus-login-states.oopz+".to_string(),
+                &package_path,
+            )
+            .await
+            .map_err(|e| format!("准备传输文件失败: {}", e))?;
+            let relay_hints = wormhole_relay_hints()?;
+            let connected_app = transfer_app.clone();
+            let progress_app = transfer_app.clone();
+            let progress_code = transfer_code.clone();
+            let cancel_app = transfer_app.clone();
+            let last_progress = Arc::new(AtomicU64::new(u64::MAX));
+            let progress_marker = last_progress.clone();
+            transfer::send(
+                wormhole,
+                relay_hints,
+                transit::Abilities::ALL,
+                offer,
+                move |_info| {
+                    emit_wormhole_status(
+                        &connected_app,
+                        "transferring",
+                        "send",
+                        "已连接，正在发送登录态...",
+                        Some(transfer_code),
+                        None,
+                    );
+                },
+                move |transferred, total| {
+                    let percent = if total == 0 {
+                        0
+                    } else {
+                        transferred.saturating_mul(100) / total
+                    };
+                    if progress_marker.swap(percent, Ordering::Relaxed) != percent {
+                        emit_wormhole_status(
+                            &progress_app,
+                            "transferring",
+                            "send",
+                            format!("正在发送... {}%", percent),
+                            Some(progress_code.clone()),
+                            Some((transferred, total)),
+                        );
+                    }
+                },
+                wait_for_quick_share_cancel(cancel_app),
+            )
+            .await
+            .map_err(|e| {
+                if transfer_app
+                    .state::<AppState>()
+                    .wormhole_cancelled
+                    .load(Ordering::SeqCst)
+                {
+                    QUICK_SHARE_CANCELLED.to_string()
+                } else {
+                    format!("发送失败: {}", e)
+                }
+            })
+        })
+        .await;
+        let _ = fs::remove_file(&package_path);
+        let was_cancelled = transfer_app
+            .state::<AppState>()
+            .wormhole_cancelled
+            .load(Ordering::SeqCst);
+        finish_wormhole_operation(&transfer_app);
+        if was_cancelled {
+            emit_wormhole_status(
+                &transfer_app,
+                "cancelled",
+                "send",
+                QUICK_SHARE_CANCELLED,
+                Some(final_code),
+                None,
+            );
+            return;
+        }
+        match result {
+            Ok(Ok(())) => emit_wormhole_status(
+                &transfer_app,
+                "complete",
+                "send",
+                "快捷分享完成",
+                Some(final_code),
+                None,
+            ),
+            Ok(Err(error)) => emit_wormhole_status(
+                &transfer_app,
+                "error",
+                "send",
+                error,
+                Some(final_code),
+                None,
+            ),
+            Err(_) => emit_wormhole_status(
+                &transfer_app,
+                "error",
+                "send",
+                "快捷分享已超时，请重新生成代码",
+                Some(final_code),
+                None,
+            ),
+        }
+    });
+    Ok(code)
+}
+
+async fn receive_wormhole_package(
+    app: &AppHandle,
+    code: Code,
+    target: &Path,
+) -> Result<(), String> {
+    let mailbox = MailboxConnection::connect(transfer::APP_CONFIG, code, false)
+        .await
+        .map_err(|e| format!("连接快捷码失败: {}", e))?;
+    let wormhole = Wormhole::connect(mailbox)
+        .await
+        .map_err(|e| format!("建立加密连接失败: {}", e))?;
+    let request = transfer::request_file(
+        wormhole,
+        wormhole_relay_hints()?,
+        transit::Abilities::ALL,
+        pending(),
+    )
+    .await
+    .map_err(|e| format!("接收请求失败: {}", e))?
+    .ok_or_else(|| "对方已取消传输".to_string())?;
+    if !request.file_name().ends_with(".oopz+")
+        || request.file_size() == 0
+        || request.file_size() > MAX_EXPORT_PACKAGE_BYTES
+    {
+        let _ = request.reject().await;
+        return Err("对方发送的不是有效 OOPZ+ 登录态包".to_string());
+    }
+    let mut file = async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .await
+        .map_err(|e| format!("创建接收文件失败: {}", e))?;
+    let connected_app = app.clone();
+    let progress_app = app.clone();
+    let last_progress = Arc::new(AtomicU64::new(u64::MAX));
+    let progress_marker = last_progress.clone();
+    request
+        .accept(
+            move |_info| {
+                emit_wormhole_status(
+                    &connected_app,
+                    "transferring",
+                    "receive",
+                    "已连接，正在接收登录态...",
+                    None,
+                    None,
+                );
+            },
+            move |transferred, total| {
+                let percent = if total == 0 {
+                    0
+                } else {
+                    transferred.saturating_mul(100) / total
+                };
+                if progress_marker.swap(percent, Ordering::Relaxed) != percent {
+                    emit_wormhole_status(
+                        &progress_app,
+                        "transferring",
+                        "receive",
+                        format!("正在接收... {}%", percent),
+                        None,
+                        Some((transferred, total)),
+                    );
+                }
+            },
+            &mut file,
+            pending(),
+        )
+        .await
+        .map_err(|e| format!("接收失败: {}", e))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("保存接收文件失败: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>, String> {
+    let code = code
+        .trim()
+        .parse::<Code>()
+        .map_err(|e| format!("快捷码格式不正确: {}", e))?;
+    if app
+        .state::<AppState>()
+        .wormhole_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("已有快捷分享或导入正在进行".to_string());
+    }
+    app.state::<AppState>()
+        .wormhole_cancelled
+        .store(false, Ordering::SeqCst);
+    emit_wormhole_status(
+        &app,
+        "connecting",
+        "receive",
+        "正在连接发送方...",
+        None,
+        None,
+    );
+    let package_path = wormhole_temp_package("oopz-plus-receive");
+    let receive_result = tokio::time::timeout(
+        Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS),
+        receive_wormhole_package(&app, code, &package_path),
+    )
+    .await;
+    let result = match receive_result {
+        Ok(Ok(())) => {
+            emit_wormhole_status(
+                &app,
+                "importing",
+                "receive",
+                "接收完成，正在校验并导入...",
+                None,
+                None,
+            );
+            let import_app = app.clone();
+            let import_path = package_path.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+                import_account_package_inner(&import_app, &import_path)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!("导入任务异常结束: {}", error)),
+            }
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("快捷导入已超时，请确认代码并重试".to_string()),
+    };
+    let _ = fs::remove_file(&package_path);
+    finish_wormhole_operation(&app);
+    match &result {
+        Ok(accounts) => emit_wormhole_status(
+            &app,
+            "complete",
+            "receive",
+            format!("快捷导入完成，共 {} 个账号", accounts.len()),
+            None,
+            None,
+        ),
+        Err(error) => emit_wormhole_status(&app, "error", "receive", error, None, None),
+    }
+    result
 }
 
 #[tauri::command]
@@ -2963,6 +3590,8 @@ pub fn run() {
             overlay_dragging: AtomicBool::new(false),
             update_running: AtomicBool::new(false),
             update_status: Mutex::new(initial_update_status()),
+            wormhole_running: AtomicBool::new(false),
+            wormhole_cancelled: AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
@@ -2976,7 +3605,11 @@ pub fn run() {
             scan_oopz_accounts,
             import_account,
             export_account_package,
+            export_all_accounts_package,
             import_account_package,
+            start_quick_export,
+            cancel_quick_share,
+            quick_import,
             save_manual_credential,
             cancel_oopz_discovery,
             reveal_credential,
@@ -3139,6 +3772,135 @@ mod tests {
         assert!(safe_relative_path("roaming/user/data.json").is_ok());
         assert!(safe_relative_path("../config.json").is_err());
         assert!(safe_relative_path("C:\\Windows\\system.ini").is_err());
+    }
+
+    #[test]
+    fn export_packages_support_multi_account_legacy_and_validation() {
+        let root = std::env::temp_dir().join(format!("oopz-plus-package-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("accounts.oopz+");
+        let entry = |uid: &str| ExportedAccountEntry {
+            account: ExportedAccount {
+                display_name: format!("account-{}", uid),
+                uid: Some(uid.to_string()),
+                pid: None,
+                user_common_id: None,
+                masked_phone: None,
+                avatar_url: None,
+                note: None,
+            },
+            oopz_login: format!("login-{}", uid),
+            files: vec![ExportedFile {
+                path: format!("roaming/{}/state.json", uid),
+                data_base64: general_purpose::STANDARD.encode(b"state"),
+            }],
+        };
+
+        let package = AccountExportPackage {
+            format: EXPORT_FORMAT.to_string(),
+            exported_at: now(),
+            accounts: vec![entry("one"), entry("two")],
+        };
+        fs::write(&path, serde_json::to_vec(&package).unwrap()).unwrap();
+        assert_eq!(read_export_package(&path).unwrap().len(), 2);
+
+        let legacy_entry = entry("legacy");
+        let legacy = LegacyAccountExportPackage {
+            format: LEGACY_EXPORT_FORMAT.to_string(),
+            exported_at: now(),
+            account: legacy_entry.account,
+            oopz_login: legacy_entry.oopz_login,
+            files: legacy_entry.files,
+        };
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(read_export_package(&path).unwrap().len(), 1);
+
+        let mut unsafe_entry = entry("unsafe");
+        unsafe_entry.files[0].path = "../config.json".to_string();
+        let unsafe_package = AccountExportPackage {
+            format: EXPORT_FORMAT.to_string(),
+            exported_at: now(),
+            accounts: vec![unsafe_entry],
+        };
+        fs::write(&path, serde_json::to_vec(&unsafe_package).unwrap()).unwrap();
+        assert!(read_export_package(&path).is_err());
+
+        let duplicate_package = AccountExportPackage {
+            format: EXPORT_FORMAT.to_string(),
+            exported_at: now(),
+            accounts: vec![entry("duplicate"), entry("duplicate")],
+        };
+        fs::write(&path, serde_json::to_vec(&duplicate_package).unwrap()).unwrap();
+        assert!(read_export_package(&path).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires the public Magic Wormhole services"]
+    fn magic_wormhole_public_roundtrip() {
+        futures::executor::block_on(async {
+            let root =
+                std::env::temp_dir().join(format!("oopz-plus-wormhole-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let source = root.join("source.oopz+");
+            let target = root.join("target.oopz+");
+            fs::write(&source, b"wormhole-roundtrip").unwrap();
+
+            let mailbox = MailboxConnection::create(transfer::APP_CONFIG, WORMHOLE_CODE_WORDS)
+                .await
+                .unwrap();
+            let code = mailbox.code().clone();
+            let sender = async {
+                let wormhole = Wormhole::connect(mailbox).await.unwrap();
+                let offer = transfer::offer::OfferSend::new_file_or_folder(
+                    "roundtrip.oopz+".to_string(),
+                    &source,
+                )
+                .await
+                .unwrap();
+                transfer::send(
+                    wormhole,
+                    wormhole_relay_hints().unwrap(),
+                    transit::Abilities::ALL,
+                    offer,
+                    |_| {},
+                    |_, _| {},
+                    pending(),
+                )
+                .await
+                .unwrap();
+            };
+            let receiver = async {
+                let mailbox = MailboxConnection::connect(transfer::APP_CONFIG, code, false)
+                    .await
+                    .unwrap();
+                let wormhole = Wormhole::connect(mailbox).await.unwrap();
+                let request = transfer::request_file(
+                    wormhole,
+                    wormhole_relay_hints().unwrap(),
+                    transit::Abilities::ALL,
+                    pending(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut output = async_fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .await
+                    .unwrap();
+                request
+                    .accept(|_| {}, |_, _| {}, &mut output, pending())
+                    .await
+                    .unwrap();
+                output.flush().await.unwrap();
+            };
+            futures::join!(sender, receiver);
+
+            assert_eq!(fs::read(&target).unwrap(), b"wormhole-roundtrip");
+            let _ = fs::remove_dir_all(root);
+        });
     }
 
     #[test]

@@ -509,6 +509,66 @@ button.primary {
   color: #6b7280;
 }
 
+.quick-transfer {
+  display: grid;
+  gap: 10px;
+}
+
+.quick-transfer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.quick-transfer-row input {
+  min-width: 0;
+  width: 100%;
+  height: 34px;
+  border: 1px solid #c9d1dc;
+  border-radius: 6px;
+  padding: 0 10px;
+}
+
+.quick-transfer-row button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.quick-code {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #111827;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quick-transfer-status {
+  min-height: 18px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.quick-transfer-status[data-state="error"] {
+  color: #b42318;
+}
+
+.quick-transfer-status[data-state="complete"] {
+  color: #15803d;
+}
+
+.quick-transfer-status[data-state="cancelled"] {
+  color: #6b7280;
+}
+
+.quick-transfer progress {
+  width: 100%;
+  height: 6px;
+  accent-color: #2563eb;
+}
+
 .segmented-control {
   display: inline-flex;
   height: 34px;
