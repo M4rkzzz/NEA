@@ -27,12 +27,11 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
-use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
+    EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
 };
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
@@ -2023,21 +2022,54 @@ fn watch_config_changes(app: AppHandle) {
     });
 }
 
-fn focus_main_webview(window: &WebviewWindow) {
-    let _ = window.with_webview(|webview| unsafe {
-        let _ = webview
-            .controller()
-            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-    });
-}
-
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        focus_main_webview(&window);
     }
+}
+
+fn restore_main_activation_after_oopz_minimize(app: AppHandle) {
+    thread::spawn(move || {
+        let mut tracked_window: Option<HWND> = None;
+        let mut was_minimized = false;
+
+        loop {
+            if tracked_window.is_some_and(|hwnd| unsafe { !IsWindow(hwnd).as_bool() }) {
+                tracked_window = None;
+                was_minimized = false;
+            }
+            if tracked_window.is_none() {
+                tracked_window = oopz_window_info().map(|(hwnd, _)| hwnd);
+                was_minimized = tracked_window
+                    .is_some_and(|hwnd| unsafe { IsIconic(hwnd).as_bool() });
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+
+            if let Some(oopz_hwnd) = tracked_window {
+                let minimized = unsafe { IsIconic(oopz_hwnd).as_bool() };
+                if minimized && !was_minimized {
+                    thread::sleep(Duration::from_millis(75));
+                    if let Some(main) = app.get_webview_window("main") {
+                        if let Ok(main_handle) = main.hwnd() {
+                            let main_hwnd = HWND(main_handle.0 as isize);
+                            let foreground = unsafe { GetForegroundWindow() };
+                            if foreground.0 == 0
+                                || foreground == oopz_hwnd
+                                || foreground == main_hwnd
+                            {
+                                let _ = main.set_focus();
+                            }
+                        }
+                    }
+                }
+                was_minimized = minimized;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 }
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -3733,8 +3765,6 @@ pub fn run() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = window_for_close.hide();
-                    } else if let WindowEvent::Focused(true) = event {
-                        focus_main_webview(&window_for_close);
                     }
                 });
             }
@@ -3744,6 +3774,7 @@ pub fn run() {
             }
             process_update_result(app.handle());
             start_auto_update_checks(app.handle().clone());
+            restore_main_activation_after_oopz_minimize(app.handle().clone());
 
             let _tray = tray;
             Ok(())
