@@ -2030,22 +2030,6 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn confirm_main_window_focus_after_click(window: WebviewWindow) {
-    if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 } {
-        return;
-    }
-    thread::spawn(move || {
-        for _ in 0..40 {
-            if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 } {
-                thread::sleep(Duration::from_millis(50));
-                let _ = window.set_focus();
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-    });
-}
-
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<AppState>();
     let data = state.data.lock().expect("state poisoned");
@@ -3739,8 +3723,6 @@ pub fn run() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = window_for_close.hide();
-                    } else if let WindowEvent::Focused(true) = event {
-                        confirm_main_window_focus_after_click(window_for_close.clone());
                     }
                 });
             }
