@@ -51,6 +51,7 @@ const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
+const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://ghproxy.net/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
 
@@ -402,16 +403,27 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
         .ok_or_else(|| "Release 安装包缺少 SHA-256 摘要，已拒绝自动安装".to_string())
 }
 
-fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, String> {
+fn github_proxy_url(asset: &GitHubAsset) -> String {
+    format!(
+        "{}{}",
+        GITHUB_DOWNLOAD_PROXY_PREFIX, asset.browser_download_url
+    )
+}
+
+fn download_update_asset_from_url(
+    asset: &GitHubAsset,
+    download_url: &str,
+    version: &str,
+    expected_digest: &str,
+) -> Result<PathBuf, String> {
     let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
-    let expected_digest = validate_update_asset(asset, version)?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
     let mut response = client
-        .get(&asset.browser_download_url)
+        .get(download_url)
         .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
         .send()
         .map_err(|e| format!("下载更新失败: {}", e))?
@@ -463,6 +475,26 @@ fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, 
     }
     fs::rename(&partial, &target).map_err(|e| e.to_string())?;
     Ok(target)
+}
+
+fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, String> {
+    let expected_digest = validate_update_asset(asset, version)?;
+    let proxy_url = github_proxy_url(asset);
+    match download_update_asset_from_url(asset, &proxy_url, version, expected_digest) {
+        Ok(path) => Ok(path),
+        Err(proxy_error) => download_update_asset_from_url(
+            asset,
+            &asset.browser_download_url,
+            version,
+            expected_digest,
+        )
+        .map_err(|github_error| {
+            format!(
+                "下载加速线路失败: {}; GitHub 直链失败: {}",
+                proxy_error, github_error
+            )
+        }),
+    }
 }
 
 fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
@@ -626,7 +658,7 @@ fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
         app,
         "downloading",
         Some(version.clone()),
-        format!("发现新版本 {}，正在下载...", version),
+        format!("发现新版本 {}，正在通过加速线路下载...", version),
     );
     let msi_path = download_update_asset(asset, &version)?;
     set_update_status(
@@ -3945,6 +3977,10 @@ mod tests {
             digest: Some(format!("sha256:{}", digest)),
         };
         assert_eq!(validate_update_asset(&asset, "1.2.3"), Ok(digest.as_str()));
+        assert_eq!(
+            github_proxy_url(&asset),
+            "https://ghproxy.net/https://github.com/M4rkzzz/oopz-plus/releases/download/v1.2.3/OOPZ%2B_1.2.3_x64_en-US.msi"
+        );
 
         let untrusted = GitHubAsset {
             browser_download_url: "https://example.com/update.msi".to_string(),
