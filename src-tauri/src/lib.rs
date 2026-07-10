@@ -28,10 +28,11 @@ use tauri::{
 };
 use uuid::Uuid;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, SetActiveWindow, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
+    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, SwitchToThisWindow, GA_ROOTOWNER,
+    GWLP_HWNDPARENT,
 };
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
@@ -2051,16 +2052,23 @@ fn restore_main_activation_after_oopz_minimize(app: AppHandle) {
             if let Some(oopz_hwnd) = tracked_window {
                 let minimized = unsafe { IsIconic(oopz_hwnd).as_bool() };
                 if minimized && !was_minimized {
-                    thread::sleep(Duration::from_millis(75));
-                    if let Some(main) = app.get_webview_window("main") {
-                        if let Ok(main_handle) = main.hwnd() {
-                            let main_hwnd = HWND(main_handle.0 as isize);
-                            let foreground = unsafe { GetForegroundWindow() };
-                            if foreground.0 == 0
-                                || foreground == oopz_hwnd
-                                || foreground == main_hwnd
-                            {
-                                let _ = main.set_focus();
+                    for delay in [100, 150, 250] {
+                        thread::sleep(Duration::from_millis(delay));
+                        if !unsafe { IsIconic(oopz_hwnd).as_bool() } {
+                            break;
+                        }
+                        let foreground = unsafe { GetForegroundWindow() };
+                        if foreground != oopz_hwnd && foreground.0 != 0 {
+                            break;
+                        }
+                        if let Some(main) = app.get_webview_window("main") {
+                            if let Ok(main_handle) = main.hwnd() {
+                                let main_hwnd = main_handle.0 as isize;
+                                let _ = app.run_on_main_thread(move || unsafe {
+                                    let hwnd = HWND(main_hwnd);
+                                    SwitchToThisWindow(hwnd, true);
+                                    let _ = SetActiveWindow(hwnd);
+                                });
                             }
                         }
                     }
