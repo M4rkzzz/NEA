@@ -1,0 +1,58 @@
+name: Release Windows installer
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match package version v$version"
+          }
+
+      - name: Build MSI
+        run: pnpm tauri build
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OOPZ+ ${{ github.ref_name }}
+          body_path: .github/releases/${{ github.ref_name }}.md
+          files: src-tauri/target/release/bundle/msi/*.msi
+
+      - name: Publish Gitee release
+        shell: pwsh
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: ./scripts/publish-gitee-release.ps1 -SkipBuild

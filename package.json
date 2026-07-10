@@ -1,13 +1,14 @@
 {
   "name": "oopz-plus",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release:gitee": "pwsh -NoProfile -File ./scripts/publish-gitee-release.ps1"
   },
   "dependencies": {
     "react": "^19.1.0",

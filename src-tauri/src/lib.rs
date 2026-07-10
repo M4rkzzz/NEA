@@ -49,8 +49,14 @@ const WORMHOLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 const WORMHOLE_CODE_WORDS: usize = 4;
 const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
+const GITEE_LATEST_RELEASE_URL: &str =
+    "https://gitee.com/api/v5/repos/M4rkzzz/oopz-plus/releases/latest";
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
+const GITEE_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://gitee.com/M4rkzzz/oopz-plus/releases/download/";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/M4rkzzz/oopz-plus/releases/download/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
 
@@ -265,6 +271,21 @@ struct GitHubAsset {
     digest: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GiteeRelease {
+    tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GiteeAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GiteeAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 struct AppState {
     data: Mutex<AppData>,
     switch_operation: Mutex<()>,
@@ -388,7 +409,7 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
     }
     if !asset
         .browser_download_url
-        .starts_with("https://github.com/M4rkzzz/oopz-plus/releases/download/")
+        .starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX)
     {
         return Err("更新下载地址不可信".to_string());
     }
@@ -402,16 +423,56 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
         .ok_or_else(|| "Release 安装包缺少 SHA-256 摘要，已拒绝自动安装".to_string())
 }
 
-fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, String> {
+fn validate_update_download_url(url: &str) -> Result<(), String> {
+    if url.starts_with(GITEE_RELEASE_DOWNLOAD_PREFIX)
+        || url.starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX)
+    {
+        Ok(())
+    } else {
+        Err("更新下载地址不可信".to_string())
+    }
+}
+
+fn gitee_asset_for_version<'a>(
+    release: &'a GiteeRelease,
+    version: &str,
+) -> Result<&'a GiteeAsset, String> {
+    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    // Gitee currently normalizes '+' in uploaded asset names to a space.
+    let normalized_name = format!("OOPZ _{}_x64_en-US.msi", version);
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.name.eq_ignore_ascii_case(&expected_name)
+                || asset.name.eq_ignore_ascii_case(&normalized_name)
+        })
+        .ok_or_else(|| format!("Gitee Release 缺少安装包 {}", expected_name))?;
+    validate_update_download_url(&asset.browser_download_url)?;
+    if !asset
+        .browser_download_url
+        .starts_with(GITEE_RELEASE_DOWNLOAD_PREFIX)
+    {
+        return Err("Gitee 更新下载地址不可信".to_string());
+    }
+    Ok(asset)
+}
+
+fn download_update_asset(
+    asset: &GitHubAsset,
+    download_url: &str,
+    version: &str,
+) -> Result<PathBuf, String> {
     let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
     let expected_digest = validate_update_asset(asset, version)?;
+    validate_update_download_url(download_url)?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
     let mut response = client
-        .get(&asset.browser_download_url)
+        .get(download_url)
         .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
         .send()
         .map_err(|e| format!("下载更新失败: {}", e))?
@@ -463,6 +524,56 @@ fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, 
     }
     fs::rename(&partial, &target).map_err(|e| e.to_string())?;
     Ok(target)
+}
+
+fn read_release_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::blocking::Response,
+    source: &str,
+) -> Result<T, String> {
+    let mut raw = String::new();
+    response
+        .take(2 * 1024 * 1024)
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("读取 {} 更新信息失败: {}", source, e))?;
+    serde_json::from_str(&raw).map_err(|e| format!("{} 更新信息格式错误: {}", source, e))
+}
+
+fn fetch_gitee_release(client: &reqwest::blocking::Client) -> Result<Option<GiteeRelease>, String> {
+    let response = client
+        .get(GITEE_LATEST_RELEASE_URL)
+        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .map_err(|e| format!("Gitee 更新检查失败: {}", e))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|e| format!("Gitee 更新检查失败: {}", e))?;
+    read_release_response(response, "Gitee").map(Some)
+}
+
+fn fetch_github_release(
+    client: &reqwest::blocking::Client,
+) -> Result<Option<GitHubRelease>, String> {
+    let response = client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("GitHub 更新检查失败: {}", e))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("GitHub 更新检查暂时受限，请稍后重试".to_string());
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|e| format!("GitHub 更新检查失败: {}", e))?;
+    read_release_response(response, "GitHub").map(Some)
 }
 
 fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
@@ -574,43 +685,122 @@ fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
             return Ok(());
         }
     }
-    set_update_status(app, "checking", None, "正在检查 GitHub 更新...");
+    set_update_status(app, "checking", None, "正在优先检查 Gitee 更新...");
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client
-        .get(GITHUB_LATEST_RELEASE_URL)
-        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .map_err(|e| format!("检查更新失败: {}", e))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let (current, _) = parse_release_version(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| "当前版本号格式不正确".to_string())?;
+
+    let gitee_release = fetch_gitee_release(&client);
+    let mut github_fallback_release = None;
+    'gitee: {
+        let Ok(Some(release)) = &gitee_release else {
+            break 'gitee;
+        };
+        if release.prerelease {
+            break 'gitee;
+        }
+        let Some((available, version)) = parse_release_version(&release.tag_name) else {
+            break 'gitee;
+        };
+        if available <= current {
+            record_update_check(app)?;
+            set_update_status(app, "current", None, "当前已是最新版本");
+            return Ok(());
+        }
+        let Ok(gitee_asset) = gitee_asset_for_version(release, &version) else {
+            break 'gitee;
+        };
+
+        set_update_status(
+            app,
+            "checking",
+            Some(version.clone()),
+            format!("发现新版本 {}，正在校验更新信息...", version),
+        );
+        let github_release = fetch_github_release(&client)?
+            .ok_or_else(|| "GitHub 缺少同版本 Release，无法校验 Gitee 安装包".to_string())?;
+        if github_release.draft || github_release.prerelease {
+            github_fallback_release = Some(github_release);
+            break 'gitee;
+        }
+        let Some((github_available, _)) = parse_release_version(&github_release.tag_name) else {
+            github_fallback_release = Some(github_release);
+            break 'gitee;
+        };
+        if github_available != available {
+            github_fallback_release = Some(github_release);
+            break 'gitee;
+        }
+
+        let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+        let github_asset = github_release
+            .assets
+            .iter()
+            .find(|asset| asset.name.eq_ignore_ascii_case(&expected_name))
+            .ok_or_else(|| format!("GitHub Release 缺少安装包 {}", expected_name))?;
+        validate_update_asset(github_asset, &version)?;
         record_update_check(app)?;
-        set_update_status(app, "current", None, "GitHub 暂无可用 Release");
-        return Ok(());
+        set_update_status(
+            app,
+            "downloading",
+            Some(version.clone()),
+            format!("发现新版本 {}，正在从 Gitee 下载...", version),
+        );
+        let msi_path = match download_update_asset(
+            github_asset,
+            &gitee_asset.browser_download_url,
+            &version,
+        ) {
+            Ok(path) => path,
+            Err(gitee_error) => {
+                set_update_status(
+                    app,
+                    "downloading",
+                    Some(version.clone()),
+                    format!("Gitee 下载失败，正在从 GitHub 下载 {}...", version),
+                );
+                download_update_asset(github_asset, &github_asset.browser_download_url, &version)
+                    .map_err(|github_error| {
+                        format!(
+                            "Gitee 下载失败: {}; GitHub 下载失败: {}",
+                            gitee_error, github_error
+                        )
+                    })?
+            }
+        };
+        set_update_status(
+            app,
+            "installing",
+            Some(version.clone()),
+            format!("正在安装 {}，程序即将重启...", version),
+        );
+        return launch_update_installer(app, &msi_path, &version);
     }
-    if response.status() == reqwest::StatusCode::FORBIDDEN {
-        return Err("GitHub 更新检查暂时受限，请稍后重试".to_string());
+
+    let gitee_error = gitee_release.err();
+    set_update_status(
+        app,
+        "checking",
+        None,
+        "Gitee 不可用，正在检查 GitHub 更新...",
+    );
+    let release = match github_fallback_release {
+        Some(release) => Some(release),
+        None => fetch_github_release(&client)?,
     }
-    let response = response
-        .error_for_status()
-        .map_err(|e| format!("检查更新失败: {}", e))?;
-    let mut raw = String::new();
-    response
-        .take(2 * 1024 * 1024)
-        .read_to_string(&mut raw)
-        .map_err(|e| format!("读取更新信息失败: {}", e))?;
-    let release: GitHubRelease =
-        serde_json::from_str(&raw).map_err(|e| format!("更新信息格式错误: {}", e))?;
+    .ok_or_else(|| {
+        gitee_error
+            .map(|error| format!("{}；GitHub 暂无可用 Release", error))
+            .unwrap_or_else(|| "暂无可用 Release".to_string())
+    })?;
     if release.draft || release.prerelease {
         return Err("GitHub 最新版本不是正式 Release".to_string());
     }
     let (available, version) = parse_release_version(&release.tag_name)
         .ok_or_else(|| "GitHub Release 版本号格式不正确".to_string())?;
-    let (current, _) = parse_release_version(env!("CARGO_PKG_VERSION"))
-        .ok_or_else(|| "当前版本号格式不正确".to_string())?;
     record_update_check(app)?;
     if available <= current {
         set_update_status(app, "current", None, "当前已是最新版本");
@@ -626,9 +816,9 @@ fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
         app,
         "downloading",
         Some(version.clone()),
-        format!("发现新版本 {}，正在下载...", version),
+        format!("发现新版本 {}，正在从 GitHub 下载...", version),
     );
-    let msi_path = download_update_asset(asset, &version)?;
+    let msi_path = download_update_asset(asset, &asset.browser_download_url, &version)?;
     set_update_status(
         app,
         "installing",
@@ -3951,6 +4141,27 @@ mod tests {
             ..asset
         };
         assert!(validate_update_asset(&untrusted, "1.2.3").is_err());
+
+        let gitee_release = GiteeRelease {
+            tag_name: "v1.2.3".to_string(),
+            prerelease: false,
+            assets: vec![GiteeAsset {
+                name: "OOPZ _1.2.3_x64_en-US.msi".to_string(),
+                browser_download_url:
+                    "https://gitee.com/M4rkzzz/oopz-plus/releases/download/v1.2.3/OOPZ%20_1.2.3_x64_en-US.msi"
+                        .to_string(),
+            }],
+        };
+        assert!(gitee_asset_for_version(&gitee_release, "1.2.3").is_ok());
+
+        let untrusted_gitee_release = GiteeRelease {
+            assets: vec![GiteeAsset {
+                name: "OOPZ _1.2.3_x64_en-US.msi".to_string(),
+                browser_download_url: "https://example.com/update.msi".to_string(),
+            }],
+            ..gitee_release
+        };
+        assert!(gitee_asset_for_version(&untrusted_gitee_release, "1.2.3").is_err());
     }
 
     #[test]
