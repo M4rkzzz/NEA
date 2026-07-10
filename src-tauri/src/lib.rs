@@ -3,9 +3,10 @@ use chrono::Utc;
 use keyring::Entry;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
@@ -15,15 +16,16 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{Signal, System};
+use sysinfo::{Pid, Signal, System};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
@@ -37,6 +39,10 @@ const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const EXPORT_FORMAT: &str = "oopz-plus-account-v1";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
+const GITHUB_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
+const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
+const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +55,14 @@ struct AppConfig {
     plugin_mode_enabled: bool,
     #[serde(default)]
     plugin_autostart_enabled: bool,
+    #[serde(default)]
+    overlay_offset_x: i32,
+    #[serde(default)]
+    overlay_offset_y: i32,
+    #[serde(default)]
+    overlay_vertical: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_update_check_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +197,34 @@ struct PluginStatus {
     overlay_visible: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus {
+    state: String,
+    current_version: String,
+    available_version: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
+}
+
 struct AppState {
     data: Mutex<AppData>,
     switch_operation: Mutex<()>,
@@ -191,6 +233,9 @@ struct AppState {
     plugin_operation: Mutex<()>,
     plugin_environment_running: AtomicBool,
     overlay_rebind_requested: AtomicBool,
+    overlay_dragging: AtomicBool,
+    update_running: AtomicBool,
+    update_status: Mutex<UpdateStatus>,
 }
 
 fn now() -> String {
@@ -218,6 +263,437 @@ fn accounts_dir() -> Result<PathBuf, String> {
 
 fn backups_dir() -> Result<PathBuf, String> {
     Ok(storage_dir()?.join("backups"))
+}
+
+fn update_marker_path() -> Result<PathBuf, String> {
+    Ok(storage_dir()?.join("update-completed.txt"))
+}
+
+fn update_error_path() -> Result<PathBuf, String> {
+    Ok(storage_dir()?.join("update-error.txt"))
+}
+
+fn initial_update_status() -> UpdateStatus {
+    UpdateStatus {
+        state: "idle".to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: None,
+        message: "自动更新已启用".to_string(),
+    }
+}
+
+fn set_update_status(
+    app: &AppHandle,
+    state_name: &str,
+    available_version: Option<String>,
+    message: impl Into<String>,
+) -> UpdateStatus {
+    let status = UpdateStatus {
+        state: state_name.to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version,
+        message: message.into(),
+    };
+    if let Ok(mut current) = app.state::<AppState>().update_status.lock() {
+        *current = status.clone();
+    }
+    let _ = app.emit("update-status", status.clone());
+    status
+}
+
+fn parse_release_version(value: &str) -> Option<([u64; 3], String)> {
+    let value = value.trim().trim_start_matches(['v', 'V']);
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let version = [
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ];
+    Some((
+        version,
+        format!("{}.{}.{}", version[0], version[1], version[2]),
+    ))
+}
+
+fn update_check_due(config: &AppConfig) -> bool {
+    let Some(last_check) = config.last_update_check_at.as_deref() else {
+        return true;
+    };
+    let Ok(last_check) = chrono::DateTime::parse_from_rfc3339(last_check) else {
+        return true;
+    };
+    Utc::now().signed_duration_since(last_check.with_timezone(&Utc))
+        >= chrono::Duration::minutes(UPDATE_CHECK_INTERVAL_MINUTES)
+}
+
+fn record_update_check(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    data.config.last_update_check_at = Some(now());
+    save_data(&data)
+}
+
+fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'a str, String> {
+    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    if !asset.name.eq_ignore_ascii_case(&expected_name) {
+        return Err(format!("Release 缺少安装包 {}", expected_name));
+    }
+    if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
+        return Err("更新安装包大小异常".to_string());
+    }
+    if !asset
+        .browser_download_url
+        .starts_with("https://github.com/M4rkzzz/oopz-plus/releases/download/")
+    {
+        return Err("更新下载地址不可信".to_string());
+    }
+    asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|value| {
+            value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| "Release 安装包缺少 SHA-256 摘要，已拒绝自动安装".to_string())
+}
+
+fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, String> {
+    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    let expected_digest = validate_update_asset(asset, version)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut response = client
+        .get(&asset.browser_download_url)
+        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .send()
+        .map_err(|e| format!("下载更新失败: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("下载更新失败: {}", e))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_UPDATE_BYTES)
+    {
+        return Err("更新下载内容过大".to_string());
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let partial = temp_dir.join(format!("oopz-plus-{}.msi.part", version));
+    let target = temp_dir.join(&expected_name);
+    let mut file = fs::File::create(&partial).map_err(|e| format!("创建更新文件失败: {}", e))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = response
+            .read(&mut buffer)
+            .map_err(|e| format!("读取更新失败: {}", e))?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_UPDATE_BYTES {
+            let _ = fs::remove_file(&partial);
+            return Err("更新下载内容过大".to_string());
+        }
+        file.write_all(&buffer[..count])
+            .map_err(|e| format!("保存更新失败: {}", e))?;
+        hasher.update(&buffer[..count]);
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    if total != asset.size {
+        let _ = fs::remove_file(&partial);
+        return Err("更新安装包大小校验失败".to_string());
+    }
+    let actual_digest = format!("{:x}", hasher.finalize());
+    if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+        let _ = fs::remove_file(&partial);
+        return Err("更新安装包 SHA-256 校验失败".to_string());
+    }
+    if target.exists() {
+        fs::remove_file(&target).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&partial, &target).map_err(|e| e.to_string())?;
+    Ok(target)
+}
+
+fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
+    let program_files_exe = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .map(|path| path.join("OOPZ+").join("oopz-plus.exe"));
+    if original_exe
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("program files")
+        && original_exe.exists()
+    {
+        original_exe.to_path_buf()
+    } else if program_files_exe.as_ref().is_some_and(|path| path.exists()) {
+        program_files_exe.unwrap()
+    } else {
+        original_exe.to_path_buf()
+    }
+}
+
+fn apply_update_helper(args: &[String]) {
+    let Some(msi_path) = args.get(2).map(PathBuf::from) else {
+        return;
+    };
+    let Some(parent_pid) = args.get(3).and_then(|value| value.parse::<u32>().ok()) else {
+        return;
+    };
+    let Some(original_exe) = args.get(4).map(PathBuf::from) else {
+        return;
+    };
+    let Some(version) = args.get(5) else {
+        return;
+    };
+
+    let mut parent_exited = false;
+    for _ in 0..120 {
+        let mut system = System::new();
+        system.refresh_processes();
+        if system.process(Pid::from_u32(parent_pid)).is_none() {
+            parent_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    if !parent_exited {
+        if let Ok(error_path) = update_error_path() {
+            let _ = fs::write(error_path, "自动安装失败：主程序未能及时退出");
+        }
+        return;
+    }
+    stop_watcher();
+    stop_plugin_runtime();
+    thread::sleep(Duration::from_millis(500));
+
+    let msiexec = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|path| path.join("System32").join("msiexec.exe"))
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows\\System32\\msiexec.exe"));
+    let status = Command::new(msiexec)
+        .arg("/i")
+        .arg(&msi_path)
+        .arg("/passive")
+        .arg("/norestart")
+        .status();
+    let exit_code = status.ok().and_then(|status| status.code()).unwrap_or(-1);
+    let install_succeeded = matches!(exit_code, 0 | 1641 | 3010);
+    let launch_exe = preferred_installed_exe(&original_exe);
+    if install_succeeded {
+        if let Ok(marker) = update_marker_path() {
+            let _ = fs::write(marker, version);
+        }
+    } else if let Ok(error_path) = update_error_path() {
+        let _ = fs::write(error_path, format!("自动安装失败，错误码 {}", exit_code));
+    }
+    let helper_path = std::env::current_exe().ok();
+    let mut command = Command::new(launch_exe);
+    if let Some(helper_path) = helper_path {
+        command.arg("--cleanup-updater").arg(helper_path);
+    }
+    let _ = command.spawn();
+    let _ = fs::remove_file(msi_path);
+}
+
+fn launch_update_installer(app: &AppHandle, msi_path: &Path, version: &str) -> Result<(), String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let helper = std::env::temp_dir().join(format!("oopz-plus-updater-{}.exe", Uuid::new_v4()));
+    fs::copy(&current_exe, &helper).map_err(|e| format!("准备更新程序失败: {}", e))?;
+    if let Err(error) = Command::new(&helper)
+        .arg("--apply-update")
+        .arg(msi_path)
+        .arg(std::process::id().to_string())
+        .arg(&current_exe)
+        .arg(version)
+        .spawn()
+    {
+        let _ = fs::remove_file(&helper);
+        return Err(format!("启动更新安装失败: {}", error));
+    }
+    app.exit(0);
+    Ok(())
+}
+
+fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
+    if !manual {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|e| e.to_string())?;
+        if !update_check_due(&data.config) {
+            return Ok(());
+        }
+    }
+    set_update_status(app, "checking", None, "正在检查 GitHub 更新...");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("检查更新失败: {}", e))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        record_update_check(app)?;
+        set_update_status(app, "current", None, "GitHub 暂无可用 Release");
+        return Ok(());
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("GitHub 更新检查暂时受限，请稍后重试".to_string());
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|e| format!("检查更新失败: {}", e))?;
+    let mut raw = String::new();
+    response
+        .take(2 * 1024 * 1024)
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("读取更新信息失败: {}", e))?;
+    let release: GitHubRelease =
+        serde_json::from_str(&raw).map_err(|e| format!("更新信息格式错误: {}", e))?;
+    if release.draft || release.prerelease {
+        return Err("GitHub 最新版本不是正式 Release".to_string());
+    }
+    let (available, version) = parse_release_version(&release.tag_name)
+        .ok_or_else(|| "GitHub Release 版本号格式不正确".to_string())?;
+    let (current, _) = parse_release_version(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| "当前版本号格式不正确".to_string())?;
+    record_update_check(app)?;
+    if available <= current {
+        set_update_status(app, "current", None, "当前已是最新版本");
+        return Ok(());
+    }
+    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(&expected_name))
+        .ok_or_else(|| format!("Release 缺少安装包 {}", expected_name))?;
+    set_update_status(
+        app,
+        "downloading",
+        Some(version.clone()),
+        format!("发现新版本 {}，正在下载...", version),
+    );
+    let msi_path = download_update_asset(asset, &version)?;
+    set_update_status(
+        app,
+        "installing",
+        Some(version.clone()),
+        format!("正在安装 {}，程序即将重启...", version),
+    );
+    launch_update_installer(app, &msi_path, &version)
+}
+
+fn schedule_update_check(app: AppHandle, manual: bool) {
+    let state = app.state::<AppState>();
+    if state.update_running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        if !manual {
+            thread::sleep(Duration::from_secs(3));
+        }
+        if let Err(error) = perform_update_check(&app, manual) {
+            set_update_status(&app, "error", None, error);
+        }
+        app.state::<AppState>()
+            .update_running
+            .store(false, Ordering::SeqCst);
+    });
+}
+
+fn start_auto_update_checks(app: AppHandle) {
+    schedule_update_check(app.clone(), false);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(
+            UPDATE_CHECK_INTERVAL_MINUTES as u64 * 60,
+        ));
+        schedule_update_check(app.clone(), false);
+    });
+}
+
+#[tauri::command]
+fn get_update_status(state: State<AppState>) -> Result<UpdateStatus, String> {
+    state
+        .update_status
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn check_for_updates(app: AppHandle) -> UpdateStatus {
+    schedule_update_check(app.clone(), true);
+    app.state::<AppState>()
+        .update_status
+        .lock()
+        .map(|status| status.clone())
+        .unwrap_or_else(|_| initial_update_status())
+}
+
+fn process_update_result(app: &AppHandle) {
+    if let Ok(error_path) = update_error_path() {
+        if let Ok(error) = fs::read_to_string(&error_path) {
+            let _ = fs::remove_file(error_path);
+            set_update_status(app, "error", None, error);
+            return;
+        }
+    }
+    let Ok(marker_path) = update_marker_path() else {
+        return;
+    };
+    let Ok(version) = fs::read_to_string(&marker_path) else {
+        return;
+    };
+    let Some(marker_version) = parse_release_version(version.trim()).map(|value| value.0) else {
+        let _ = fs::remove_file(marker_path);
+        return;
+    };
+    let Some(current_version) =
+        parse_release_version(env!("CARGO_PKG_VERSION")).map(|value| value.0)
+    else {
+        return;
+    };
+    if marker_version > current_version {
+        return;
+    }
+    let _ = fs::remove_file(marker_path);
+    let plugin_enabled = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map(|data| data.config.plugin_mode_enabled)
+        .unwrap_or(false);
+    schedule_plugin_environment(app.clone(), plugin_enabled, true);
+    set_update_status(
+        app,
+        "updated",
+        None,
+        format!("已更新到 {}，插件环境正在修复", env!("CARGO_PKG_VERSION")),
+    );
+}
+
+fn schedule_updater_cleanup(path: PathBuf) {
+    thread::spawn(move || {
+        for _ in 0..10 {
+            thread::sleep(Duration::from_secs(1));
+            if !path.exists() || fs::remove_file(&path).is_ok() {
+                break;
+            }
+        }
+    });
 }
 
 fn ensure_storage() -> Result<(), String> {
@@ -296,11 +772,11 @@ fn migrate_current_login_state(data: &mut AppData) {
         return;
     };
     for account in &mut data.accounts {
-        if account.uid.as_deref() == Some(uid.as_str()) {
-            if store_oopz_login(&account.id, &login).is_ok() {
-                account.has_login_state = true;
-                account.has_session_snapshot = true;
-            }
+        if account.uid.as_deref() == Some(uid.as_str())
+            && store_oopz_login(&account.id, &login).is_ok()
+        {
+            account.has_login_state = true;
+            account.has_session_snapshot = true;
         }
     }
 }
@@ -609,13 +1085,142 @@ fn oopz_window_info() -> Option<(HWND, RECT)> {
     search.hwnd.zip(search.rect)
 }
 
-fn overlay_geometry(rect: RECT) -> (i32, i32, u32, u32) {
-    let width = rect.right - rect.left;
-    if width < 1000 {
-        (rect.left + 70, rect.top + 275, 220, 46)
-    } else {
-        (rect.left + 720, rect.top + 15, 300, 48)
+fn overlay_dimensions(account_count: usize, vertical: bool) -> (u32, u32) {
+    if account_count == 0 {
+        return if vertical { (54, 52) } else { (52, 52) };
     }
+    let count = account_count as u32;
+    if vertical {
+        (
+            54,
+            (18 + count * 32 + count.saturating_sub(1) * 6 + 8 + 4).max(52),
+        )
+    } else {
+        (
+            (8 + count * 32 + count.saturating_sub(1) * 6 + 18 + 4).max(52),
+            52,
+        )
+    }
+}
+
+fn overlay_geometry(rect: RECT, config: &AppConfig, account_count: usize) -> (i32, i32, u32, u32) {
+    let width = rect.right - rect.left;
+    let (overlay_width, overlay_height) =
+        overlay_dimensions(account_count, config.overlay_vertical);
+    if width < 1000 {
+        (
+            rect.left + 70 + config.overlay_offset_x,
+            rect.top + 275 + config.overlay_offset_y,
+            overlay_width,
+            overlay_height,
+        )
+    } else {
+        (
+            rect.left + 720 + config.overlay_offset_x,
+            rect.top + 15 + config.overlay_offset_y,
+            overlay_width,
+            overlay_height,
+        )
+    }
+}
+
+fn overlay_offset_for_position(
+    rect: RECT,
+    config: &AppConfig,
+    account_count: usize,
+    position: PhysicalPosition<i32>,
+) -> (i32, i32) {
+    let (base_x, base_y, _, _) = overlay_geometry(
+        rect,
+        &AppConfig {
+            overlay_offset_x: 0,
+            overlay_offset_y: 0,
+            ..config.clone()
+        },
+        account_count,
+    );
+    (
+        (position.x - base_x).clamp(-4000, 4000),
+        (position.y - base_y).clamp(-4000, 4000),
+    )
+}
+
+#[tauri::command]
+fn drag_overlay(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.overlay_dragging.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let Some(window) = app.get_webview_window("plugin-overlay") else {
+        state.overlay_dragging.store(false, Ordering::SeqCst);
+        return Err("未找到插件浮层".to_string());
+    };
+    if let Err(error) = window.start_dragging() {
+        state.overlay_dragging.store(false, Ordering::SeqCst);
+        return Err(error.to_string());
+    }
+
+    thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(30) {
+            let left_button_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+            if started.elapsed() >= Duration::from_millis(100) && !left_button_down {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let result = persist_overlay_position(&app);
+        app.state::<AppState>()
+            .overlay_dragging
+            .store(false, Ordering::SeqCst);
+        if let Err(error) = result {
+            let _ = app.emit("overlay-drag-error", error);
+        }
+    });
+    Ok(())
+}
+
+fn persist_overlay_position(app: &AppHandle) -> Result<(), String> {
+    let (_, rect) = oopz_window_info().ok_or_else(|| "未找到 OOPZ 窗口".to_string())?;
+    let window = app
+        .get_webview_window("plugin-overlay")
+        .ok_or_else(|| "未找到插件浮层".to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let (offset_x, offset_y) =
+        overlay_offset_for_position(rect, &data.config, data.accounts.len(), position);
+    data.config.overlay_offset_x = offset_x;
+    data.config.overlay_offset_y = offset_y;
+    save_data(&data)
+}
+
+#[tauri::command]
+fn reset_overlay_position(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    data.config.overlay_offset_x = 0;
+    data.config.overlay_offset_y = 0;
+    save_data(&data)?;
+    drop(data);
+    state.overlay_dragging.store(false, Ordering::SeqCst);
+    state.overlay_rebind_requested.store(true, Ordering::SeqCst);
+    let _ = app.emit("app-data-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn set_overlay_layout(
+    app: AppHandle,
+    state: State<AppState>,
+    vertical: bool,
+) -> Result<(), String> {
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    data.config.overlay_vertical = vertical;
+    save_data(&data)?;
+    drop(data);
+    state.overlay_rebind_requested.store(true, Ordering::SeqCst);
+    let _ = app.emit("app-data-changed", ());
+    Ok(())
 }
 
 fn visible_window_rect(hwnd: HWND) -> Option<RECT> {
@@ -662,12 +1267,19 @@ fn sync_overlay_loop(app: AppHandle) {
         let mut attached_owner: Option<isize> = None;
         let mut last_geometry: Option<(i32, i32, u32, u32)> = None;
         let mut overlay_visible = false;
+        let mut owner_missing_since: Option<Instant> = None;
         let mut overlay_window = app.get_webview_window("plugin-overlay");
 
         loop {
-            if last_config_refresh.elapsed() >= Duration::from_secs(1) {
+            if last_config_refresh.elapsed() >= Duration::from_millis(500) {
                 last_config_refresh = Instant::now();
-                if !load_data().config.plugin_mode_enabled {
+                let plugin_enabled = app
+                    .state::<AppState>()
+                    .data
+                    .lock()
+                    .map(|data| data.config.plugin_mode_enabled)
+                    .unwrap_or(false);
+                if !plugin_enabled {
                     hide_overlay_window(&app);
                     app.exit(0);
                     break;
@@ -691,6 +1303,7 @@ fn sync_overlay_loop(app: AppHandle) {
                 attached_owner = None;
                 last_geometry = None;
                 overlay_visible = false;
+                owner_missing_since = None;
                 last_window_search = Instant::now() - Duration::from_secs(2);
                 detach_overlay_window(window);
             }
@@ -698,8 +1311,7 @@ fn sync_overlay_loop(app: AppHandle) {
             let mut current =
                 owner.and_then(|hwnd| visible_window_rect(hwnd).map(|rect| (hwnd, rect)));
             if current.is_none() {
-                owner = None;
-                last_geometry = None;
+                owner_missing_since.get_or_insert_with(Instant::now);
             }
 
             if current.is_none() && last_window_search.elapsed() >= Duration::from_secs(1) {
@@ -708,6 +1320,7 @@ fn sync_overlay_loop(app: AppHandle) {
             }
 
             if let Some((next_owner, rect)) = current {
+                owner_missing_since = None;
                 owner = Some(next_owner);
                 if attached_owner != Some(next_owner.0) {
                     if let Ok(handle) = window.hwnd() {
@@ -722,17 +1335,44 @@ fn sync_overlay_loop(app: AppHandle) {
                     attached_owner = Some(next_owner.0);
                 }
 
-                let geometry = overlay_geometry(rect);
-                if last_geometry != Some(geometry) || !overlay_visible {
-                    let (x, y, w, h) = geometry;
+                if app
+                    .state::<AppState>()
+                    .overlay_dragging
+                    .load(Ordering::SeqCst)
+                {
+                    last_geometry = None;
+                    thread::sleep(Duration::from_millis(33));
+                    continue;
+                }
+                let (config, account_count) = app
+                    .state::<AppState>()
+                    .data
+                    .lock()
+                    .map(|data| (data.config.clone(), data.accounts.len()))
+                    .unwrap_or_default();
+                let geometry = overlay_geometry(rect, &config, account_count);
+                let (x, y, w, h) = geometry;
+                if last_geometry.map(|value| (value.0, value.1)) != Some((x, y)) {
                     let _ = window.set_position(PhysicalPosition::new(x, y));
-                    let _ = window.set_size(PhysicalSize::new(w, h));
+                }
+                if last_geometry.map(|value| (value.2, value.3)) != Some((w, h)) {
+                    let _ = window.set_size(LogicalSize::new(w as f64, h as f64));
+                }
+                if !overlay_visible {
                     let _ = window.show();
-                    last_geometry = Some(geometry);
                     overlay_visible = true;
                 }
+                last_geometry = Some(geometry);
                 thread::sleep(Duration::from_millis(33));
             } else {
+                if owner_missing_since
+                    .is_some_and(|started| started.elapsed() < Duration::from_secs(2))
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                owner = None;
+                last_geometry = None;
                 if overlay_visible {
                     let _ = window.hide();
                     overlay_visible = false;
@@ -1505,7 +2145,7 @@ fn schedule_plugin_environment(app: AppHandle, enabled: bool, repair: bool) {
             .store(false, Ordering::SeqCst);
         let _ = app.emit(
             "plugin-environment-finished",
-            result.err().unwrap_or_else(|| "".to_string()),
+            result.err().unwrap_or_default(),
         );
     });
 }
@@ -2273,13 +2913,29 @@ fn switch_account_inner(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--apply-update") {
+        apply_update_helper(&args);
+        return;
+    }
     if args.iter().any(|arg| arg == "--watcher") {
         watcher_loop();
         return;
     }
     let plugin_runtime = args.iter().any(|arg| arg == "--plugin-runtime");
+    let updater_cleanup = args
+        .iter()
+        .position(|arg| arg == "--cleanup-updater")
+        .and_then(|index| args.get(index + 1))
+        .map(PathBuf::from);
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    if !plugin_runtime {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -2290,6 +2946,9 @@ pub fn run() {
             plugin_operation: Mutex::new(()),
             plugin_environment_running: AtomicBool::new(false),
             overlay_rebind_requested: AtomicBool::new(false),
+            overlay_dragging: AtomicBool::new(false),
+            update_running: AtomicBool::new(false),
+            update_status: Mutex::new(initial_update_status()),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
@@ -2310,7 +2969,12 @@ pub fn run() {
             delete_account,
             open_oopz,
             switch_account,
-            restore_latest_backup
+            restore_latest_backup,
+            drag_overlay,
+            reset_overlay_position,
+            set_overlay_layout,
+            get_update_status,
+            check_for_updates
         ])
         .setup(move |app| {
             watch_config_changes(app.handle().clone());
@@ -2400,6 +3064,12 @@ pub fn run() {
                 });
             }
 
+            if let Some(path) = updater_cleanup.clone() {
+                schedule_updater_cleanup(path);
+            }
+            process_update_result(app.handle());
+            start_auto_update_checks(app.handle().clone());
+
             let _tray = tray;
             Ok(())
         })
@@ -2462,5 +3132,85 @@ mod tests {
             Some("image/png")
         );
         assert_eq!(avatar_mime(b"not-an-image", Some("text/plain")), None);
+    }
+
+    #[test]
+    fn release_versions_are_compared_numerically() {
+        assert_eq!(
+            parse_release_version("v1.10.2"),
+            Some(([1, 10, 2], "1.10.2".to_string()))
+        );
+        assert!(parse_release_version("1.2").is_none());
+        assert!(parse_release_version("1.2.3-beta").is_none());
+
+        let recent = AppConfig {
+            last_update_check_at: Some(Utc::now().to_rfc3339()),
+            ..AppConfig::default()
+        };
+        assert!(!update_check_due(&recent));
+        let expired = AppConfig {
+            last_update_check_at: Some((Utc::now() - chrono::Duration::minutes(31)).to_rfc3339()),
+            ..AppConfig::default()
+        };
+        assert!(update_check_due(&expired));
+    }
+
+    #[test]
+    fn update_assets_require_expected_origin_name_and_digest() {
+        let digest = "a".repeat(64);
+        let asset = GitHubAsset {
+            name: "OOPZ+_1.2.3_x64_en-US.msi".to_string(),
+            browser_download_url:
+                "https://github.com/M4rkzzz/oopz-plus/releases/download/v1.2.3/OOPZ%2B_1.2.3_x64_en-US.msi"
+                    .to_string(),
+            size: 1024,
+            digest: Some(format!("sha256:{}", digest)),
+        };
+        assert_eq!(validate_update_asset(&asset, "1.2.3"), Ok(digest.as_str()));
+
+        let untrusted = GitHubAsset {
+            browser_download_url: "https://example.com/update.msi".to_string(),
+            ..asset
+        };
+        assert!(validate_update_asset(&untrusted, "1.2.3").is_err());
+    }
+
+    #[test]
+    fn overlay_geometry_applies_saved_relative_offset() {
+        let rect = RECT {
+            left: 100,
+            top: 200,
+            right: 1300,
+            bottom: 900,
+        };
+        let config = AppConfig {
+            overlay_offset_x: 12,
+            overlay_offset_y: -8,
+            ..AppConfig::default()
+        };
+        assert_eq!(overlay_geometry(rect, &config, 6), (832, 207, 252, 52));
+        let compact_rect = RECT {
+            left: 50,
+            top: 75,
+            right: 850,
+            bottom: 700,
+        };
+        assert_eq!(
+            overlay_geometry(compact_rect, &config, 6),
+            (132, 342, 252, 52)
+        );
+        assert_eq!(
+            overlay_offset_for_position(compact_rect, &config, 6, PhysicalPosition::new(210, 390),),
+            (90, 40)
+        );
+        let vertical = AppConfig {
+            overlay_vertical: true,
+            ..config
+        };
+        assert_eq!(
+            overlay_geometry(compact_rect, &vertical, 6),
+            (132, 342, 54, 252)
+        );
+        assert_eq!(overlay_dimensions(0, false), (52, 52));
     }
 }

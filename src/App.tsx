@@ -11,6 +11,7 @@ type AppConfig = {
   localSandboxDir?: string;
   pluginModeEnabled?: boolean;
   pluginAutostartEnabled?: boolean;
+  overlayVertical?: boolean;
 };
 
 type SavedAccount = {
@@ -72,6 +73,13 @@ type PluginStatus = {
   pluginRuntimeRunning: boolean;
   oopzRunning: boolean;
   overlayVisible: boolean;
+};
+
+type UpdateStatus = {
+  state: "idle" | "checking" | "current" | "downloading" | "installing" | "updated" | "error";
+  currentVersion: string;
+  availableVersion?: string;
+  message: string;
 };
 
 type FeatureKey = "overview" | "switcher" | "plugin";
@@ -146,6 +154,7 @@ function App() {
   const [searchPath, setSearchPath] = useState("");
   const [activeFeature, setActiveFeature] = useState<FeatureKey>("overview");
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -157,6 +166,7 @@ function App() {
 
   const sessionCount = data.accounts.filter((account) => account.hasLoginState).length;
   const credentialCount = data.accounts.filter((account) => account.hasCredential).length;
+  const updateActive = updateStatus?.state === "checking" || updateStatus?.state === "downloading" || updateStatus?.state === "installing";
 
   async function refresh() {
     const next = await invoke<AppData>("get_app_data");
@@ -396,10 +406,30 @@ function App() {
     setMessage(status.pluginModeEnabled ? "插件环境已修复" : "插件环境已清理");
   }
 
+  async function resetOverlayPosition() {
+    await runTask("正在重置浮层位置...", () => invoke("reset_overlay_position"));
+    setMessage("浮层位置已恢复默认");
+  }
+
+  async function setOverlayLayout(vertical: boolean) {
+    await runTask("正在切换浮层排列...", () => invoke("set_overlay_layout", { vertical }));
+    setMessage(vertical ? "浮层已切换为竖排" : "浮层已切换为横排");
+  }
+
+  async function checkForUpdates() {
+    const status = await invoke<UpdateStatus>("check_for_updates");
+    setUpdateStatus(status);
+    setMessage(status.message);
+  }
+
   useEffect(() => {
     refresh()
       .then(() => validate())
       .catch(() => setMessage("未找到 OOPZ，请在概览里手动选择目录"));
+    invoke<UpdateStatus>("get_update_status").then((status) => {
+      setUpdateStatus(status);
+      if (status.state === "updated" || status.state === "error") setMessage(status.message);
+    }).catch(() => undefined);
 
     let disposed = false;
     const unsubs: Array<() => void> = [];
@@ -432,6 +462,10 @@ function App() {
     keepListener(listen<string>("plugin-environment-finished", (event) => {
       refreshPluginStatus().catch(() => undefined);
       if (event.payload) setMessage(event.payload);
+    }));
+    keepListener(listen<UpdateStatus>("update-status", (event) => {
+      setUpdateStatus(event.payload);
+      setMessage(event.payload.message);
     }));
     return () => {
       disposed = true;
@@ -488,6 +522,7 @@ function App() {
           <button onClick={() => handleAction(chooseDir)} disabled={busy}>手动选择目录</button>
           <button onClick={() => handleAction(validate)} disabled={busy}>重新校验</button>
           <button onClick={() => handleAction(restoreBackup)} disabled={busy}>恢复最近备份</button>
+          <button onClick={() => handleAction(checkForUpdates)} disabled={busy || updateActive}>检查更新</button>
         </div>
       </div>
 
@@ -607,7 +642,12 @@ function App() {
             <p>开启后只打开 OOPZ 也会自动显示账号头像浮层。</p>
           </div>
           <div className="actions">
+            <div className="segmented-control" aria-label="浮层排列方式">
+              <button data-active={!data.config.overlayVertical} onClick={() => handleAction(() => setOverlayLayout(false))} disabled={busy}>横排</button>
+              <button data-active={Boolean(data.config.overlayVertical)} onClick={() => handleAction(() => setOverlayLayout(true))} disabled={busy}>竖排</button>
+            </div>
             <button onClick={() => handleAction(repairPluginEnvironment)} disabled={busy}>修复环境</button>
+            <button onClick={() => handleAction(resetOverlayPosition)} disabled={busy}>重置浮层位置</button>
             <button className={pluginStatus?.pluginModeEnabled ? "" : "primary"} onClick={() => handleAction(() => togglePluginMode(!pluginStatus?.pluginModeEnabled))} disabled={busy}>{pluginStatus?.pluginModeEnabled ? "关闭" : "开启"}</button>
           </div>
         </div>
