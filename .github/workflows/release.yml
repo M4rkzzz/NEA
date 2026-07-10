@@ -50,9 +50,3 @@ jobs:
           name: OOPZ+ ${{ github.ref_name }}
           body_path: .github/releases/${{ github.ref_name }}.md
           files: src-tauri/target/release/bundle/msi/*.msi
-
-      - name: Publish Gitee release
-        shell: pwsh
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-        run: ./scripts/publish-gitee-release.ps1 -SkipBuild
