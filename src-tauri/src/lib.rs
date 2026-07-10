@@ -5,7 +5,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
@@ -36,6 +36,7 @@ const WATCHER_FILE_NAME: &str = "oopz-plus-watcher.exe";
 const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const EXPORT_FORMAT: &str = "oopz-plus-account-v1";
+const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +61,8 @@ struct SavedAccount {
     user_common_id: Option<String>,
     masked_phone: Option<String>,
     avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar_source_url: Option<String>,
     login_name: Option<String>,
     note: Option<String>,
     has_session_snapshot: bool,
@@ -182,6 +185,7 @@ struct PluginStatus {
 
 struct AppState {
     data: Mutex<AppData>,
+    switch_operation: Mutex<()>,
     discovery_cancelled: AtomicBool,
     auto_import_running: AtomicBool,
     plugin_operation: Mutex<()>,
@@ -234,6 +238,7 @@ fn load_data() -> AppData {
     };
     let mut data: AppData = serde_json::from_str(&raw).unwrap_or_default();
     migrate_current_login_state(&mut data);
+    migrate_avatar_sources(&mut data);
     reconcile_account_readiness(&mut data);
     if let Ok(next_raw) = serde_json::to_string_pretty(&data) {
         if next_raw != raw {
@@ -243,10 +248,44 @@ fn load_data() -> AppData {
     data
 }
 
+fn migrate_avatar_sources(data: &mut AppData) {
+    for account in &mut data.accounts {
+        if account.avatar_source_url.is_none()
+            && account
+                .avatar_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
+        {
+            account.avatar_source_url = account.avatar_url.clone();
+        }
+    }
+}
+
 fn save_data(data: &AppData) -> Result<(), String> {
     ensure_storage()?;
     let raw = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    fs::write(config_path()?, raw).map_err(|e| e.to_string())
+    let path = config_path()?;
+    let temp = path.with_extension("json.tmp");
+    let backup = path.with_extension("json.bak");
+    fs::write(&temp, raw).map_err(|e| format!("写入配置失败: {}", e))?;
+
+    if backup.exists() {
+        let _ = fs::remove_file(&backup);
+    }
+    if path.exists() {
+        fs::rename(&path, &backup).map_err(|e| format!("备份原配置失败: {}", e))?;
+    }
+    if let Err(error) = fs::rename(&temp, &path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &path);
+        }
+        let _ = fs::remove_file(&temp);
+        return Err(format!("保存配置失败: {}", error));
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
 }
 
 fn migrate_current_login_state(data: &mut AppData) {
@@ -826,12 +865,9 @@ fn apply_paths_to_config(config: &mut AppConfig, paths: &OopzPaths) {
     config.local_sandbox_dir = Some(paths.local_sandbox_dir.clone());
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
-    }
-    if dst.exists() {
-        fs::remove_dir_all(dst).map_err(|e| format!("清理目录失败 {}: {}", dst.display(), e))?;
     }
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
@@ -839,10 +875,49 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         let target = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
+            copy_dir_contents(&entry.path(), &target)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
         }
+    }
+    Ok(())
+}
+
+fn commit_prepared_dir(prepared: &Path, dst: &Path) -> Result<(), String> {
+    let parent = dst.parent().ok_or_else(|| "目标目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let old = parent.join(format!(".oopzplus-old-{}", Uuid::new_v4()));
+    let had_dst = dst.exists();
+
+    if had_dst {
+        fs::rename(dst, &old).map_err(|e| format!("暂存原目录失败 {}: {}", dst.display(), e))?;
+    }
+    if let Err(error) = fs::rename(prepared, dst) {
+        if had_dst {
+            let _ = fs::rename(&old, dst);
+        }
+        return Err(format!("替换目录失败 {}: {}", dst.display(), error));
+    }
+    if had_dst {
+        let _ = fs::remove_dir_all(old);
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.exists() {
+        return Ok(());
+    }
+    let parent = dst.parent().ok_or_else(|| "目标目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!(".oopzplus-copy-{}", Uuid::new_v4()));
+    if let Err(error) = copy_dir_contents(src, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = commit_prepared_dir(&staging, dst) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
     Ok(())
 }
@@ -905,6 +980,133 @@ fn read_user_detail(path: &Path) -> Option<ImportedCandidate> {
         has_current_login: false,
         can_switch: false,
     })
+}
+
+fn avatar_mime(bytes: &[u8], content_type: Option<&str>) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    match content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+    {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        "image/avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+fn download_avatar_data_url(url: &str) -> Option<String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let response = client.get(url).send().ok()?.error_for_status().ok()?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_AVATAR_BYTES)
+    {
+        return None;
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_AVATAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_AVATAR_BYTES {
+        return None;
+    }
+    let mime = avatar_mime(&bytes, content_type.as_deref())?;
+    Some(format!(
+        "data:{};base64,{}",
+        mime,
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn refresh_account_avatar(app: &AppHandle, uid: &str) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let (roaming_dir, account_id, saved_source, has_cached_avatar) = {
+        let data = state.data.lock().map_err(|e| e.to_string())?;
+        let paths = paths_from_config(&data.config)?;
+        let Some(account) = data
+            .accounts
+            .iter()
+            .find(|account| account.uid.as_deref() == Some(uid))
+        else {
+            return Ok(false);
+        };
+        (
+            paths.roaming_data_dir,
+            account.id.clone(),
+            account.avatar_source_url.clone(),
+            account
+                .avatar_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/")),
+        )
+    };
+    let Some(source_url) = read_user_detail(&PathBuf::from(roaming_dir).join(uid))
+        .and_then(|candidate| candidate.avatar_url)
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    if has_cached_avatar && saved_source.as_deref() == Some(source_url.as_str()) {
+        return Ok(false);
+    }
+    let Some(cached_avatar) = download_avatar_data_url(&source_url) else {
+        return Ok(false);
+    };
+
+    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let Some(account) = data
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+    else {
+        return Ok(false);
+    };
+    account.avatar_url = Some(cached_avatar);
+    account.avatar_source_url = Some(source_url);
+    account.updated_at = now();
+    save_data(&data)?;
+    drop(data);
+    let _ = app.emit("app-data-changed", ());
+    Ok(true)
+}
+
+fn schedule_avatar_refresh(app: AppHandle, uid: String) {
+    thread::spawn(move || {
+        for delay in [Duration::from_secs(5), Duration::from_secs(10)] {
+            thread::sleep(delay);
+            if refresh_account_avatar(&app, &uid).unwrap_or(false) {
+                break;
+            }
+        }
+    });
 }
 
 fn credential_entry(account_id: &str) -> Result<Entry, String> {
@@ -1006,20 +1208,31 @@ fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
 }
 
 fn write_export_files(root: &Path, files: &[ExportedFile]) -> Result<(), String> {
-    if root.exists() {
-        fs::remove_dir_all(root).map_err(|e| e.to_string())?;
-    }
-    fs::create_dir_all(root).map_err(|e| e.to_string())?;
-    for file in files {
-        let relative = safe_relative_path(&file.path)?;
-        let target = root.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let parent = root.parent().ok_or_else(|| "账号目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!(".oopzplus-import-{}", Uuid::new_v4()));
+    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    let write_result = (|| -> Result<(), String> {
+        for file in files {
+            let relative = safe_relative_path(&file.path)?;
+            let target = staging.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let bytes = general_purpose::STANDARD
+                .decode(&file.data_base64)
+                .map_err(|e| e.to_string())?;
+            fs::write(target, bytes).map_err(|e| e.to_string())?;
         }
-        let bytes = general_purpose::STANDARD
-            .decode(&file.data_base64)
-            .map_err(|e| e.to_string())?;
-        fs::write(target, bytes).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = commit_prepared_dir(&staging, root) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
     Ok(())
 }
@@ -1197,6 +1410,11 @@ fn auto_import_current_login(app: AppHandle) -> Result<(), String> {
     let state = app_for_state.state::<AppState>();
     let should_import = {
         let data = state.data.lock().map_err(|e| e.to_string())?;
+        let current_avatar_url = paths_from_config(&data.config)
+            .ok()
+            .and_then(|paths| read_user_detail(&PathBuf::from(paths.roaming_data_dir).join(&uid)))
+            .and_then(|candidate| candidate.avatar_url)
+            .filter(|url| !url.trim().is_empty());
         match data
             .accounts
             .iter()
@@ -1207,6 +1425,9 @@ fn auto_import_current_login(app: AppHandle) -> Result<(), String> {
                     || !saved_snapshot_exists(account)
                     || read_oopz_login(&account.id).is_none()
                     || account.avatar_url.as_deref().unwrap_or("").is_empty()
+                    || current_avatar_url
+                        .as_deref()
+                        .is_some_and(|url| account.avatar_source_url.as_deref() != Some(url))
             }
             None => true,
         }
@@ -1501,6 +1722,13 @@ fn import_account_inner(
         .as_ref()
         .and_then(|existing_id| data.accounts.iter().find(|a| a.id == *existing_id))
         .cloned();
+    let candidate_avatar_url = candidate
+        .avatar_url
+        .clone()
+        .filter(|url| !url.trim().is_empty());
+    let cached_avatar_url = candidate_avatar_url
+        .as_deref()
+        .and_then(download_avatar_data_url);
     let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let snapshot = account_snapshot_dir(&id)?;
     copy_dir_recursive(&roaming_src, &snapshot.join("roaming").join(&uid))?;
@@ -1519,7 +1747,18 @@ fn import_account_inner(
         pid: candidate.pid,
         user_common_id: candidate.user_common_id,
         masked_phone: candidate.masked_phone,
-        avatar_url: candidate.avatar_url,
+        avatar_url: cached_avatar_url
+            .or_else(|| {
+                existing_account
+                    .as_ref()
+                    .and_then(|account| account.avatar_url.clone())
+            })
+            .or_else(|| candidate_avatar_url.clone()),
+        avatar_source_url: candidate_avatar_url.or_else(|| {
+            existing_account
+                .as_ref()
+                .and_then(|account| account.avatar_source_url.clone())
+        }),
         login_name: existing_account.as_ref().and_then(|a| a.login_name.clone()),
         note: existing_account.as_ref().and_then(|a| a.note.clone()),
         has_session_snapshot: true,
@@ -1634,6 +1873,9 @@ fn import_account_package(app: AppHandle, path: String) -> Result<SavedAccount, 
         user_common_id: package.account.user_common_id,
         masked_phone: package.account.masked_phone,
         avatar_url: package.account.avatar_url,
+        avatar_source_url: existing_account
+            .as_ref()
+            .and_then(|account| account.avatar_source_url.clone()),
         login_name: existing_account
             .as_ref()
             .and_then(|account| account.login_name.clone()),
@@ -1685,9 +1927,23 @@ async fn save_manual_credential(
 fn save_manual_credential_inner(
     app: AppHandle,
     state: State<AppState>,
-    input: CredentialInput,
+    mut input: CredentialInput,
 ) -> Result<SavedAccount, String> {
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    input.display_name = input.display_name.trim().to_string();
+    input.login_name = input.login_name.trim().to_string();
+    input.note = input.note.and_then(|note| {
+        let trimmed = note.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+    if input.display_name.is_empty() || input.login_name.is_empty() || input.password.is_empty() {
+        return Err("名称、账号和密码不能为空".to_string());
+    }
+    if let Some(account_id) = input.account_id.as_deref() {
+        if !data.accounts.iter().any(|account| account.id == account_id) {
+            return Err("要更新的账号不存在，请刷新后重试".to_string());
+        }
+    }
     let timestamp = now();
     let id = input
         .account_id
@@ -1707,6 +1963,7 @@ fn save_manual_credential_inner(
             user_common_id: None,
             masked_phone: None,
             avatar_url: None,
+            avatar_source_url: None,
             login_name: None,
             note: None,
             has_session_snapshot: false,
@@ -1825,23 +2082,34 @@ fn close_oopz_if_running() -> Result<(), String> {
 
 fn backup_current(paths: &OopzPaths) -> Result<(), String> {
     let backup = backups_dir()?.join("latest-before-switch");
-    if backup.exists() {
-        fs::remove_dir_all(&backup).map_err(|e| e.to_string())?;
-    }
-    fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
+    let backup_parent = backup.parent().ok_or_else(|| "备份目录无效".to_string())?;
+    fs::create_dir_all(backup_parent).map_err(|e| e.to_string())?;
+    let staging = backup_parent.join(format!(".oopzplus-backup-{}", Uuid::new_v4()));
+    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     let Some(login) = current_registry_login() else {
-        return Ok(());
+        return commit_prepared_dir(&staging, &backup);
     };
-    fs::write(backup.join("registry_login.txt"), &login).map_err(|e| e.to_string())?;
-    if let Some(uid) = uid_from_registry_login(&login) {
-        copy_dir_recursive(
-            &PathBuf::from(&paths.roaming_data_dir).join(&uid),
-            &backup.join("roaming").join(&uid),
-        )?;
-        copy_dir_recursive(
-            &PathBuf::from(&paths.local_sandbox_dir).join(&uid),
-            &backup.join("local_sandbox").join(&uid),
-        )?;
+    let write_result = (|| -> Result<(), String> {
+        fs::write(staging.join("registry_login.txt"), &login).map_err(|e| e.to_string())?;
+        if let Some(uid) = uid_from_registry_login(&login) {
+            copy_dir_contents(
+                &PathBuf::from(&paths.roaming_data_dir).join(&uid),
+                &staging.join("roaming").join(&uid),
+            )?;
+            copy_dir_contents(
+                &PathBuf::from(&paths.local_sandbox_dir).join(&uid),
+                &staging.join("local_sandbox").join(&uid),
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = commit_prepared_dir(&staging, &backup) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
     Ok(())
 }
@@ -1901,6 +2169,10 @@ fn switch_account_inner(
     state: State<AppState>,
     account_id: String,
 ) -> Result<SwitchResult, String> {
+    let _operation = state
+        .switch_operation
+        .try_lock()
+        .map_err(|_| "另一项切号操作正在进行，请稍候".to_string())?;
     let (paths, account, config) = {
         let data = state.data.lock().map_err(|e| e.to_string())?;
         let paths = paths_from_config(&data.config)?;
@@ -1921,6 +2193,9 @@ fn switch_account_inner(
         Command::new(paths.oopz_exe_path)
             .spawn()
             .map_err(|e| e.to_string())?;
+        if let Some(uid) = account.uid.clone() {
+            schedule_avatar_refresh(app.clone(), uid);
+        }
         ensure_plugin_runtime_after_oopz_start(config);
         return Ok(SwitchResult {
             ok: true,
@@ -1940,6 +2215,9 @@ fn switch_account_inner(
         Command::new(paths.oopz_exe_path)
             .spawn()
             .map_err(|e| e.to_string())?;
+        if let Some(uid) = account.uid.clone() {
+            schedule_avatar_refresh(app.clone(), uid);
+        }
         ensure_plugin_runtime_after_oopz_start(config);
         return Ok(SwitchResult {
             ok: false,
@@ -1975,6 +2253,7 @@ fn switch_account_inner(
     Command::new(paths.oopz_exe_path)
         .spawn()
         .map_err(|e| e.to_string())?;
+    schedule_avatar_refresh(app.clone(), uid.clone());
     ensure_plugin_runtime_after_oopz_start(config);
 
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
@@ -2005,6 +2284,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             data: Mutex::new(load_data()),
+            switch_operation: Mutex::new(()),
             discovery_cancelled: AtomicBool::new(false),
             auto_import_running: AtomicBool::new(false),
             plugin_operation: Mutex::new(()),
@@ -2142,4 +2422,45 @@ fn spawn_watcher() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("启动守护进程失败: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_dir_recursive_replaces_complete_directory() {
+        let root = std::env::temp_dir().join(format!("oopz-plus-test-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("nested").join("new.txt"), "new").unwrap();
+        fs::write(destination.join("old.txt"), "old").unwrap();
+
+        copy_dir_recursive(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("nested").join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!destination.join("old.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imported_paths_cannot_escape_snapshot_directory() {
+        assert!(safe_relative_path("roaming/user/data.json").is_ok());
+        assert!(safe_relative_path("../config.json").is_err());
+        assert!(safe_relative_path("C:\\Windows\\system.ini").is_err());
+    }
+
+    #[test]
+    fn avatar_format_is_verified_from_file_signature() {
+        assert_eq!(
+            avatar_mime(b"\x89PNG\r\n\x1a\nrest", None),
+            Some("image/png")
+        );
+        assert_eq!(avatar_mime(b"not-an-image", Some("text/plain")), None);
+    }
 }

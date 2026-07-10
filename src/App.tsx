@@ -106,6 +106,34 @@ function accountStatus(account: SavedAccount, currentLoginUid?: string) {
   return account.hasLoginState ? "可快速切换" : "需要登录一次";
 }
 
+function accountInitial(account: SavedAccount) {
+  return account.displayName.trim().slice(0, 1).toUpperCase() || "?";
+}
+
+function AccountAvatar({ account, className = "", ready = false }: { account: SavedAccount; className?: string; ready?: boolean }) {
+  const src = account.avatarUrl?.trim() || "";
+  const [failedSrc, setFailedSrc] = useState("");
+
+  useEffect(() => setFailedSrc(""), [src]);
+
+  return (
+    <div className={`avatar-wrap ${className}`.trim()} data-ready={ready} aria-hidden="true">
+      <span className="avatar-fallback">{accountInitial(account)}</span>
+      {src && failedSrc !== src && <img src={src} alt="" onError={() => setFailedSrc(src)} />}
+    </div>
+  );
+}
+
+function errorMessage(error: unknown) {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "操作失败，请稍后重试";
+  }
+}
+
 function App() {
   const [data, setData] = useState<AppData>({ config: {}, accounts: [] });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
@@ -120,6 +148,7 @@ function App() {
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
+  const busyRef = useRef(false);
 
   const selected = useMemo(
     () => data.accounts.find((account) => account.id === selectedId) || data.accounts[0],
@@ -136,13 +165,17 @@ function App() {
       dataSignatureRef.current = nextSignature;
       setData(next);
     }
-    if (!selectedId && next.accounts.length > 0) {
-      setSelectedId(next.accounts[0].id);
-    }
+    setSelectedId((current) =>
+      current && next.accounts.some((account) => account.id === current)
+        ? current
+        : next.accounts[0]?.id ?? null,
+    );
     return next;
   }
 
   async function runTask<T>(label: string, task: () => Promise<T>) {
+    if (busyRef.current) throw new Error("已有操作正在进行，请稍候");
+    busyRef.current = true;
     setBusy(true);
     setMessage(label);
     await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
@@ -151,14 +184,24 @@ function App() {
       await refresh();
       return result;
     } catch (error) {
-      setMessage(String(error));
+      setMessage(errorMessage(error));
       throw error;
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
 
+  function handleAction(action: () => Promise<unknown>) {
+    void action().catch((error) => setMessage(errorMessage(error)));
+  }
+
   async function discover() {
+    if (busyRef.current) {
+      setMessage("已有操作正在进行，请稍候");
+      return;
+    }
+    busyRef.current = true;
     setBusy(true);
     setSearchingOopz(true);
     setSearchPath("");
@@ -170,16 +213,21 @@ function App() {
       await refresh();
       setMessage(`已识别 OOPZ：${found.oopzInstallDir}`);
     } catch (error) {
-      setMessage(String(error));
+      setMessage(errorMessage(error));
     } finally {
+      busyRef.current = false;
       setSearchingOopz(false);
       setBusy(false);
     }
   }
 
   async function stopDiscover() {
-    await invoke("cancel_oopz_discovery");
-    setMessage("正在停止搜索...");
+    try {
+      await invoke("cancel_oopz_discovery");
+      setMessage("正在停止搜索...");
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
   }
 
   async function validate() {
@@ -207,10 +255,10 @@ function App() {
     const latest = await invoke<AppData>("get_app_data");
     const current = scanned.find((candidate) => candidate.hasCurrentLogin);
     const savedCurrent = current ? latest.accounts.find((account) => account.uid === current.uid) : undefined;
-    if (current && !savedCurrent?.hasLoginState) {
+    if (current && (manual || !savedCurrent?.hasLoginState)) {
       const account = await runTask("正在保存当前账号...", () => invoke<SavedAccount>("import_account", { uid: current.uid }));
       setSelectedId(account.id);
-      setMessage(`${account.displayName} 已可快速切换`);
+      setMessage(`${account.displayName} 的账号数据和头像已更新`);
       return;
     }
 
@@ -258,7 +306,7 @@ function App() {
     const account = await runTask("正在保存账号密码...", () =>
       invoke<SavedAccount>("save_manual_credential", {
         input: {
-          accountId: selected?.id && selected.displayName === credential.displayName ? selected.id : null,
+          accountId: selected?.id ?? null,
           displayName: credential.displayName.trim(),
           loginName: credential.loginName.trim(),
           password: credential.password,
@@ -267,7 +315,7 @@ function App() {
       }),
     );
     setSelectedId(account.id);
-    setCredential(emptyCredential);
+    setCredential((current) => ({ ...current, password: "" }));
     setMessage("账号密码已保存");
   }
 
@@ -280,9 +328,16 @@ function App() {
   }
 
   async function copyText(value?: string) {
-    if (!value) return;
-    await navigator.clipboard.writeText(value);
-    setMessage("已复制到剪贴板");
+    if (!value) {
+      setMessage("没有可复制的内容");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      setMessage("已复制到剪贴板");
+    } catch (error) {
+      setMessage(`复制失败：${errorMessage(error)}`);
+    }
   }
 
   async function switchAccount(account: SavedAccount) {
@@ -346,31 +401,42 @@ function App() {
       .then(() => validate())
       .catch(() => setMessage("未找到 OOPZ，请在概览里手动选择目录"));
 
+    let disposed = false;
     const unsubs: Array<() => void> = [];
-    listen<string>("tray-action", (event) => {
+    const keepListener = (promise: Promise<() => void>) => {
+      void promise
+        .then((unlisten) => disposed ? unlisten() : unsubs.push(unlisten))
+        .catch((error) => {
+          if (!disposed) setMessage(`事件监听失败：${errorMessage(error)}`);
+        });
+    };
+    keepListener(listen<string>("tray-action", (event) => {
       if (event.payload === "rediscover") discover().catch(() => undefined);
       if (event.payload === "import") refreshAccounts().catch(() => undefined);
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen<unknown>("switch-finished", (event) => {
+    }));
+    keepListener(listen<unknown>("switch-finished", (event) => {
       refresh().catch(() => undefined);
       const payload = event.payload as { Ok?: { message?: string }; Err?: string } | string;
       if (typeof payload === "string") setMessage(payload);
       else if (payload?.Ok?.message) setMessage(payload.Ok.message);
       else if (payload?.Err) setMessage(payload.Err);
       else setMessage("托盘操作已完成");
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen<string>("oopz-discovery-progress", (event) => {
+    }));
+    keepListener(listen<string>("oopz-discovery-progress", (event) => {
       setSearchPath(event.payload);
       setMessage(`正在搜索：${event.payload}`);
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen("app-data-changed", () => {
+    }));
+    keepListener(listen("app-data-changed", () => {
       refresh().catch(() => undefined);
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen<string>("plugin-environment-finished", (event) => {
+    }));
+    keepListener(listen<string>("plugin-environment-finished", (event) => {
       refreshPluginStatus().catch(() => undefined);
       if (event.payload) setMessage(event.payload);
-    }).then((unlisten) => unsubs.push(unlisten));
-    return () => unsubs.forEach((unsub) => unsub());
+    }));
+    return () => {
+      disposed = true;
+      unsubs.forEach((unsub) => unsub());
+    };
   }, []);
 
   useEffect(() => {
@@ -394,6 +460,16 @@ function App() {
     }
   }, [activeFeature]);
 
+  useEffect(() => {
+    if (!revealed) return;
+    const timer = window.setTimeout(() => setRevealed(null), 30000);
+    return () => window.clearTimeout(timer);
+  }, [revealed]);
+
+  useEffect(() => {
+    setRevealed(null);
+  }, [activeFeature]);
+
   const overview = (
     <section className="content-stack">
       <div className="panel">
@@ -408,10 +484,10 @@ function App() {
         </dl>
         {searchingOopz && <div className="notice">正在搜索：{searchPath || "准备中"}</div>}
         <div className="actions">
-          {searchingOopz ? <button onClick={stopDiscover}>停止搜索</button> : <button onClick={discover} disabled={busy}>自动搜索</button>}
-          <button onClick={chooseDir} disabled={busy}>手动选择目录</button>
-          <button onClick={validate} disabled={busy}>重新校验</button>
-          <button onClick={restoreBackup} disabled={busy}>恢复最近备份</button>
+          {searchingOopz ? <button onClick={() => handleAction(stopDiscover)}>停止搜索</button> : <button onClick={() => handleAction(discover)} disabled={busy}>自动搜索</button>}
+          <button onClick={() => handleAction(chooseDir)} disabled={busy}>手动选择目录</button>
+          <button onClick={() => handleAction(validate)} disabled={busy}>重新校验</button>
+          <button onClick={() => handleAction(restoreBackup)} disabled={busy}>恢复最近备份</button>
         </div>
       </div>
 
@@ -429,7 +505,7 @@ function App() {
         {!selected && <div className="empty">还没有保存账号。</div>}
         {selected && (
           <div className="profile profile-inline">
-            <img src={selected.avatarUrl || ""} alt="" onError={(event) => (event.currentTarget.style.display = "none")} />
+            <AccountAvatar account={selected} className="profile-avatar" />
             <div>
               <h3>{selected.displayName}</h3>
               <p>{accountLabel(selected)}</p>
@@ -448,8 +524,8 @@ function App() {
           <div className="panel-title">
             <h2>账号列表</h2>
             <div className="actions">
-              <button onClick={importAccountPackage} disabled={busy}>导入</button>
-              <button onClick={() => refreshAccounts()} disabled={busy}>刷新</button>
+              <button onClick={() => handleAction(importAccountPackage)} disabled={busy}>导入</button>
+              <button onClick={() => handleAction(() => refreshAccounts())} disabled={busy}>刷新</button>
             </div>
           </div>
           <div className="account-list account-list-compact">
@@ -457,10 +533,10 @@ function App() {
             {data.accounts.map((account) => (
               <div className="account-row" data-selected={selected?.id === account.id} key={account.id}>
                 <button className="account-main" onClick={() => setSelectedId(account.id)}>
-                  <div className="avatar-wrap" data-ready={account.hasLoginState}><img src={account.avatarUrl || ""} alt="" onError={(event) => (event.currentTarget.style.display = "none")} /></div>
+                  <AccountAvatar account={account} ready={account.hasLoginState} />
                   <span><strong>{account.displayName}</strong><small>{accountStatus(account, data.currentLoginUid)}</small></span>
                 </button>
-                <button className={account.hasLoginState ? "primary" : ""} onClick={() => quickSwitch(account)} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
+                <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
               </div>
             ))}
           </div>
@@ -477,7 +553,7 @@ function App() {
           {selected && (
             <>
               <div className="profile">
-                <div className="avatar-wrap profile-avatar" data-ready={selected.hasLoginState}><img src={selected.avatarUrl || ""} alt="" onError={(event) => (event.currentTarget.style.display = "none")} /></div>
+                <AccountAvatar account={selected} className="profile-avatar" ready={selected.hasLoginState} />
                 <div><h3>{selected.displayName}</h3><p>{accountLabel(selected)}</p></div>
               </div>
               <dl className="meta">
@@ -489,15 +565,16 @@ function App() {
               </dl>
               {!selected.hasLoginState && <div className="notice">这个账号还不能快速切换。请先在 OOPZ 里登录一次，然后回到这里点刷新。</div>}
               <div className="actions">
-                <button className="primary" onClick={() => switchAccount(selected)} disabled={busy}>{selected.hasLoginState ? "切换并重启 OOPZ" : "打开 OOPZ 登录"}</button>
-                {selected.hasLoginState && <button onClick={() => exportSelectedAccount(selected)} disabled={busy}>导出</button>}
-                {selected.hasCredential && <button onClick={() => revealCredential(selected)} disabled={busy}>显示账号密码</button>}
-                <button onClick={() => deleteSelected(selected)} disabled={busy}>删除</button>
+                <button className="primary" onClick={() => handleAction(() => switchAccount(selected))} disabled={busy || selected.uid === data.currentLoginUid}>{selected.uid === data.currentLoginUid ? "当前已登录" : selected.hasLoginState ? "切换并重启 OOPZ" : "打开 OOPZ 登录"}</button>
+                {selected.hasLoginState && <button onClick={() => handleAction(() => exportSelectedAccount(selected))} disabled={busy}>导出</button>}
+                {selected.hasCredential && <button onClick={() => handleAction(() => revealCredential(selected))} disabled={busy}>显示账号密码</button>}
+                <button onClick={() => handleAction(() => deleteSelected(selected))} disabled={busy}>删除</button>
               </div>
               {revealed && (
                 <div className="secret-box">
                   <button onClick={() => copyText(revealed.loginName)}>复制账号</button>
                   <button onClick={() => copyText(revealed.password)}>复制密码</button>
+                  <button onClick={() => setRevealed(null)}>隐藏</button>
                   <code>{revealed.loginName || ""}</code>
                   <code>{revealed.password || ""}</code>
                 </div>
@@ -513,7 +590,7 @@ function App() {
             <label>账号<input value={credential.loginName} onChange={(e) => setCredential({ ...credential, loginName: e.target.value })} /></label>
             <label>密码<input type="password" value={credential.password} onChange={(e) => setCredential({ ...credential, password: e.target.value })} /></label>
             <label>备注<input value={credential.note} onChange={(e) => setCredential({ ...credential, note: e.target.value })} /></label>
-            <button className="primary" onClick={saveCredential} disabled={busy}>保存账号密码</button>
+            <button className="primary" onClick={() => handleAction(saveCredential)} disabled={busy}>保存账号密码</button>
           </div>
         </div>
       </div>
@@ -530,8 +607,8 @@ function App() {
             <p>开启后只打开 OOPZ 也会自动显示账号头像浮层。</p>
           </div>
           <div className="actions">
-            <button onClick={repairPluginEnvironment} disabled={busy}>修复环境</button>
-            <button className={pluginStatus?.pluginModeEnabled ? "" : "primary"} onClick={() => togglePluginMode(!pluginStatus?.pluginModeEnabled)} disabled={busy}>{pluginStatus?.pluginModeEnabled ? "关闭" : "开启"}</button>
+            <button onClick={() => handleAction(repairPluginEnvironment)} disabled={busy}>修复环境</button>
+            <button className={pluginStatus?.pluginModeEnabled ? "" : "primary"} onClick={() => handleAction(() => togglePluginMode(!pluginStatus?.pluginModeEnabled))} disabled={busy}>{pluginStatus?.pluginModeEnabled ? "关闭" : "开启"}</button>
           </div>
         </div>
       </div>

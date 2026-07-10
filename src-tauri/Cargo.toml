@@ -1,6 +1,6 @@
 [package]
 name = "oopz-plus"
-version = "1.0.0"
+version = "1.0.1"
 description = "OOPZ+ account switcher"
 authors = ["you"]
 edition = "2021"
@@ -31,3 +31,4 @@ winreg = "0.52"
 sysinfo = "0.30"
 windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 notify = "6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
