@@ -3643,7 +3643,7 @@ pub fn run() {
             watch_config_changes(app.handle().clone());
             if plugin_runtime {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    window.destroy()?;
                 }
                 WebviewWindowBuilder::new(
                     app,
