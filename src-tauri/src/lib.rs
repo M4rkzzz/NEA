@@ -27,6 +27,7 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
+use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -1382,22 +1383,6 @@ fn sync_overlay_loop(app: AppHandle) {
                 detach_overlay_window(window);
             }
 
-            if owner
-                .is_some_and(|hwnd| unsafe { IsWindow(hwnd).as_bool() && IsIconic(hwnd).as_bool() })
-            {
-                if overlay_visible {
-                    let _ = window.hide();
-                    overlay_visible = false;
-                }
-                if attached_owner.is_some() {
-                    detach_overlay_window(window);
-                    attached_owner = None;
-                }
-                last_geometry = None;
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-
             let mut current =
                 owner.and_then(|hwnd| visible_window_rect(hwnd).map(|rect| (hwnd, rect)));
             if current.is_none() {
@@ -1412,17 +1397,6 @@ fn sync_overlay_loop(app: AppHandle) {
             if let Some((next_owner, rect)) = current {
                 owner_missing_since = None;
                 owner = Some(next_owner);
-                if unsafe { IsIconic(next_owner).as_bool() } {
-                    let _ = window.hide();
-                    overlay_visible = false;
-                    if attached_owner.is_some() {
-                        detach_overlay_window(window);
-                        attached_owner = None;
-                    }
-                    last_geometry = None;
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
                 if attached_owner != Some(next_owner.0) {
                     if let Ok(handle) = window.hwnd() {
                         unsafe {
@@ -2049,11 +2023,20 @@ fn watch_config_changes(app: AppHandle) {
     });
 }
 
+fn focus_main_webview(window: &WebviewWindow) {
+    let _ = window.with_webview(|webview| unsafe {
+        let _ = webview
+            .controller()
+            .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    });
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        focus_main_webview(&window);
     }
 }
 
@@ -3750,6 +3733,8 @@ pub fn run() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = window_for_close.hide();
+                    } else if let WindowEvent::Focused(true) = event {
+                        focus_main_webview(&window_for_close);
                     }
                 });
             }
