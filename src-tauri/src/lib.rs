@@ -31,8 +31,7 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, SwitchToThisWindow, GA_ROOTOWNER,
-    GWLP_HWNDPARENT,
+    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
 };
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
@@ -1339,10 +1338,8 @@ fn sync_overlay_loop(app: AppHandle) {
         let mut last_config_refresh = Instant::now() - Duration::from_secs(2);
         let mut last_window_search = Instant::now() - Duration::from_secs(2);
         let mut owner: Option<HWND> = None;
-        let mut attached_owner: Option<isize> = None;
         let mut last_geometry: Option<(i32, i32, u32, u32)> = None;
         let mut overlay_visible = false;
-        let mut owner_missing_since: Option<Instant> = None;
         let mut overlay_window = app.get_webview_window("plugin-overlay");
 
         loop {
@@ -1375,19 +1372,14 @@ fn sync_overlay_loop(app: AppHandle) {
                 .swap(false, Ordering::SeqCst);
             if rebind_requested {
                 owner = None;
-                attached_owner = None;
                 last_geometry = None;
                 overlay_visible = false;
-                owner_missing_since = None;
                 last_window_search = Instant::now() - Duration::from_secs(2);
                 detach_overlay_window(window);
             }
 
             let mut current =
                 owner.and_then(|hwnd| visible_window_rect(hwnd).map(|rect| (hwnd, rect)));
-            if current.is_none() {
-                owner_missing_since.get_or_insert_with(Instant::now);
-            }
 
             if current.is_none() && last_window_search.elapsed() >= Duration::from_secs(1) {
                 last_window_search = Instant::now();
@@ -1395,19 +1387,21 @@ fn sync_overlay_loop(app: AppHandle) {
             }
 
             if let Some((next_owner, rect)) = current {
-                owner_missing_since = None;
                 owner = Some(next_owner);
-                if attached_owner != Some(next_owner.0) {
-                    if let Ok(handle) = window.hwnd() {
-                        unsafe {
-                            let _ = SetWindowLongPtrW(
-                                HWND(handle.0 as isize),
-                                GWLP_HWNDPARENT,
-                                next_owner.0,
-                            );
-                        }
+                let foreground = unsafe { GetForegroundWindow() };
+                let oopz_is_foreground = foreground == next_owner
+                    || unsafe { GetAncestor(foreground, GA_ROOTOWNER) } == next_owner;
+                let overlay_is_foreground = window
+                    .hwnd()
+                    .is_ok_and(|handle| foreground.0 == handle.0 as isize);
+                if !oopz_is_foreground && !overlay_is_foreground {
+                    if overlay_visible {
+                        let _ = window.hide();
+                        let _ = window.set_always_on_top(false);
+                        overlay_visible = false;
                     }
-                    attached_owner = Some(next_owner.0);
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
 
                 if app
@@ -1434,29 +1428,20 @@ fn sync_overlay_loop(app: AppHandle) {
                     let _ = window.set_size(LogicalSize::new(w as f64, h as f64));
                 }
                 if !overlay_visible {
+                    let _ = window.set_always_on_top(true);
                     let _ = window.show();
                     overlay_visible = true;
                 }
                 last_geometry = Some(geometry);
                 thread::sleep(Duration::from_millis(33));
             } else {
-                if owner_missing_since
-                    .is_some_and(|started| started.elapsed() < Duration::from_secs(2))
-                {
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                owner = None;
                 last_geometry = None;
                 if overlay_visible {
                     let _ = window.hide();
+                    let _ = window.set_always_on_top(false);
                     overlay_visible = false;
                 }
-                if attached_owner.is_some() {
-                    detach_overlay_window(window);
-                    attached_owner = None;
-                }
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(100));
             }
         }
     });
@@ -2029,37 +2014,6 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
-}
-
-fn restore_main_activation_after_oopz_minimize(app: AppHandle) {
-    thread::spawn(move || {
-        let mut tracked_window: Option<HWND> = None;
-
-        loop {
-            if tracked_window.is_some_and(|hwnd| unsafe { !IsWindow(hwnd).as_bool() }) {
-                tracked_window = None;
-            }
-            if tracked_window.is_none() {
-                tracked_window = oopz_window_info().map(|(hwnd, _)| hwnd);
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-
-            if let Some(oopz_hwnd) = tracked_window {
-                let minimized = unsafe { IsIconic(oopz_hwnd).as_bool() };
-                if minimized && unsafe { GetForegroundWindow() } == oopz_hwnd {
-                    if let Some(main) = app.get_webview_window("main") {
-                        if let Ok(main_handle) = main.hwnd() {
-                            unsafe {
-                                SwitchToThisWindow(HWND(main_handle.0 as isize), true);
-                            }
-                        }
-                    }
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
 }
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -3764,7 +3718,6 @@ pub fn run() {
             }
             process_update_result(app.handle());
             start_auto_update_checks(app.handle().clone());
-            restore_main_activation_after_oopz_minimize(app.handle().clone());
 
             let _tray = tray;
             Ok(())
