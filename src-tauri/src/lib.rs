@@ -28,7 +28,7 @@ use tauri::{
 };
 use uuid::Uuid;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, SetActiveWindow, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
     IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, SwitchToThisWindow, GA_ROOTOWNER,
@@ -2034,48 +2034,30 @@ fn show_main_window(app: &AppHandle) {
 fn restore_main_activation_after_oopz_minimize(app: AppHandle) {
     thread::spawn(move || {
         let mut tracked_window: Option<HWND> = None;
-        let mut was_minimized = false;
 
         loop {
             if tracked_window.is_some_and(|hwnd| unsafe { !IsWindow(hwnd).as_bool() }) {
                 tracked_window = None;
-                was_minimized = false;
             }
             if tracked_window.is_none() {
                 tracked_window = oopz_window_info().map(|(hwnd, _)| hwnd);
-                was_minimized = tracked_window
-                    .is_some_and(|hwnd| unsafe { IsIconic(hwnd).as_bool() });
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
 
             if let Some(oopz_hwnd) = tracked_window {
                 let minimized = unsafe { IsIconic(oopz_hwnd).as_bool() };
-                if minimized && !was_minimized {
-                    for delay in [100, 150, 250] {
-                        thread::sleep(Duration::from_millis(delay));
-                        if !unsafe { IsIconic(oopz_hwnd).as_bool() } {
-                            break;
-                        }
-                        let foreground = unsafe { GetForegroundWindow() };
-                        if foreground != oopz_hwnd && foreground.0 != 0 {
-                            break;
-                        }
-                        if let Some(main) = app.get_webview_window("main") {
-                            if let Ok(main_handle) = main.hwnd() {
-                                let main_hwnd = main_handle.0 as isize;
-                                let _ = app.run_on_main_thread(move || unsafe {
-                                    let hwnd = HWND(main_hwnd);
-                                    SwitchToThisWindow(hwnd, true);
-                                    let _ = SetActiveWindow(hwnd);
-                                });
+                if minimized && unsafe { GetForegroundWindow() } == oopz_hwnd {
+                    if let Some(main) = app.get_webview_window("main") {
+                        if let Ok(main_handle) = main.hwnd() {
+                            unsafe {
+                                SwitchToThisWindow(HWND(main_handle.0 as isize), true);
                             }
                         }
                     }
                 }
-                was_minimized = minimized;
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(100));
         }
     });
 }
