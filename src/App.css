@@ -91,21 +91,16 @@ button.primary {
   overflow-y: auto;
 }
 
-.brand {
-  margin-bottom: 16px;
+.brand-mark {
+  height: 30px;
+  margin-bottom: 12px;
 }
 
-.brand h1 {
-  margin: 0;
-  font-size: 26px;
-  line-height: 30px;
-  letter-spacing: 0;
-}
-
-.brand p {
-  margin: 4px 0 0;
-  color: #2563eb;
-  font-weight: 600;
+.brand-mark img {
+  display: block;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
 }
 
 .feature-list {
@@ -145,6 +140,13 @@ button.primary {
   margin-bottom: 12px;
 }
 
+.topbar-main {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  min-width: 0;
+}
+
 .topbar h2 {
   margin: 0;
   font-size: 20px;
@@ -152,22 +154,14 @@ button.primary {
   letter-spacing: 0;
 }
 
-.topbar p {
-  margin: 2px 0 0;
-  color: #6b7280;
-}
-
 .status {
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 420px;
-  min-height: 30px;
-  border: 1px solid #d7dde7;
-  border-radius: 6px;
-  padding: 5px 9px;
-  background: #fff;
-  color: #374151;
+  max-width: min(420px, 48vw);
+  min-height: 20px;
+  padding: 0;
+  color: #6b7280;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -193,7 +187,7 @@ button.primary {
 }
 
 .status[data-busy="true"] {
-  border-color: #2563eb;
+  color: #1d4ed8;
 }
 
 .content-stack {
@@ -824,15 +818,6 @@ button.primary {
     padding: 14px;
   }
 
-  .brand {
-    margin-bottom: 14px;
-  }
-
-  .brand h1 {
-    font-size: 26px;
-    line-height: 30px;
-  }
-
   .feature-list button {
     height: 46px;
     padding: 7px 9px;
@@ -843,14 +828,14 @@ button.primary {
   }
 
   .topbar {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 10px;
+    align-items: center;
+    gap: 8px;
   }
 
-  .status {
-    width: 100%;
-    max-width: none;
+  .topbar-main {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 }
 
@@ -873,19 +858,14 @@ button.primary {
     overflow-y: auto;
   }
 
-  .brand {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 10px;
+  .brand-mark {
+    height: 24px;
+    margin-bottom: 8px;
   }
 
-  .brand p {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .brand-mark img {
+    width: 24px;
+    height: 24px;
   }
 
   .feature-list {
@@ -921,10 +901,6 @@ button.primary {
   .sidebar {
     padding-top: 10px;
     padding-bottom: 10px;
-  }
-
-  .brand {
-    margin-bottom: 8px;
   }
 
   .workspace {

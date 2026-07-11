@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Trash2 } from "lucide-react";
+import appIcon from "../src-tauri/icons/32x32.png";
 import "./App.css";
 
 type AppConfig = {
@@ -675,7 +676,7 @@ function App() {
   return (
     <main className="shell app-layout">
       <aside className="sidebar">
-        <div className="brand"><h1>OOPZ+</h1><p>{paths?.valid || data.config.oopzExePath ? "OOPZ 已配置" : "OOPZ 未配置"}</p></div>
+        <div className="brand-mark"><img src={appIcon} alt="" aria-hidden="true" /></div>
         <nav className="feature-list">
           <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
           <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
@@ -684,8 +685,10 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2></div>
-          <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
+          <div className="topbar-main">
+            <h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2>
+            <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
+          </div>
         </header>
         {activeFeature === "overview" ? overview : switcher}
       </section>
