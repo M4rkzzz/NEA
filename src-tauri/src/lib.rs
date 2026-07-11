@@ -730,8 +730,8 @@ fn launch_update_installer(app: &AppHandle, msi_path: &Path, version: &str) -> R
     Ok(())
 }
 
-fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
-    if !manual {
+fn perform_update_check(app: &AppHandle, force: bool) -> Result<(), String> {
+    if !force {
         let state = app.state::<AppState>();
         let data = state.data.lock().map_err(|e| e.to_string())?;
         if !update_check_due(&data.config) {
@@ -802,16 +802,16 @@ fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
     launch_update_installer(app, &msi_path, &version)
 }
 
-fn schedule_update_check(app: AppHandle, manual: bool) {
+fn schedule_update_check(app: AppHandle, force: bool, delay: bool) {
     let state = app.state::<AppState>();
     if state.update_running.swap(true, Ordering::SeqCst) {
         return;
     }
     thread::spawn(move || {
-        if !manual {
+        if delay {
             thread::sleep(Duration::from_secs(3));
         }
-        if let Err(error) = perform_update_check(&app, manual) {
+        if let Err(error) = perform_update_check(&app, force) {
             set_update_status(&app, "error", None, error);
         }
         app.state::<AppState>()
@@ -821,12 +821,12 @@ fn schedule_update_check(app: AppHandle, manual: bool) {
 }
 
 fn start_auto_update_checks(app: AppHandle) {
-    schedule_update_check(app.clone(), false);
+    schedule_update_check(app.clone(), true, true);
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(
             UPDATE_CHECK_INTERVAL_MINUTES as u64 * 60,
         ));
-        schedule_update_check(app.clone(), false);
+        schedule_update_check(app.clone(), false, false);
     });
 }
 
@@ -841,7 +841,7 @@ fn get_update_status(state: State<AppState>) -> Result<UpdateStatus, String> {
 
 #[tauri::command]
 fn check_for_updates(app: AppHandle) -> UpdateStatus {
-    schedule_update_check(app.clone(), true);
+    schedule_update_check(app.clone(), true, false);
     app.state::<AppState>()
         .update_status
         .lock()
