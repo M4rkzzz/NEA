@@ -143,6 +143,44 @@ button.primary {
   color: #fff;
 }
 
+.confirm-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(25, 31, 35, 0.32);
+}
+
+.confirm-dialog {
+  width: min(360px, 100%);
+  border: 1px solid #d8dde2;
+  border-radius: 8px;
+  padding: 20px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(20, 28, 34, 0.22);
+}
+
+.confirm-dialog p {
+  margin: 0 0 20px;
+  color: #20272b;
+  font-size: 14px;
+  line-height: 22px;
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+button.primary.danger-confirm {
+  border-color: #c42b1c;
+  background: #c42b1c;
+}
+
 .sidebar {
   height: 100%;
   border-right: 0;

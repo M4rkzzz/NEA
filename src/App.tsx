@@ -172,6 +172,7 @@ function App() {
   const [wormholeStatus, setWormholeStatus] = useState<WormholeStatus | null>(null);
   const [quickCode, setQuickCode] = useState("");
   const [receiveCode, setReceiveCode] = useState("");
+  const [pendingDeleteAccount, setPendingDeleteAccount] = useState<SavedAccount | null>(null);
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -415,11 +416,15 @@ function App() {
   }
 
   async function deleteSelected(account: SavedAccount) {
-    const ok = window.confirm(`确定删除账号“${account.displayName}”吗？`);
-    if (!ok) return;
     await runTask("正在删除账号...", () => invoke("delete_account", { accountId: account.id }));
+    setPendingDeleteAccount(null);
     setSelectedId(null);
     setMessage("账号已删除");
+  }
+
+  function confirmDeleteSelected() {
+    if (!pendingDeleteAccount || busy) return;
+    void handleAction(() => deleteSelected(pendingDeleteAccount));
   }
 
   async function restoreBackup() {
@@ -553,6 +558,15 @@ function App() {
     }
   }, [activeFeature]);
 
+  useEffect(() => {
+    if (!pendingDeleteAccount) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) setPendingDeleteAccount(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [pendingDeleteAccount, busy]);
+
   const overview = (
     <section className="content-stack">
       <div className="panel">
@@ -624,7 +638,7 @@ function App() {
                     <span><strong>{account.displayName}</strong><small>{accountLabel(account)}</small></span>
                   </button>
                   <div className="account-actions">
-                    <button className="icon-button danger" onClick={() => handleAction(() => deleteSelected(account))} disabled={busy} aria-label={`删除 ${account.displayName} 的登录态`} title="删除登录态"><Trash2 size={16} strokeWidth={2} /></button>
+                    <button className="icon-button danger" onClick={() => setPendingDeleteAccount(account)} disabled={busy} aria-label={`删除 ${account.displayName} 的登录态`} title="删除登录态"><Trash2 size={16} strokeWidth={2} /></button>
                     <button onClick={() => handleAction(() => exportSelectedAccount(account))} disabled={busy || !account.hasLoginState}>导出</button>
                     <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
                   </div>
@@ -717,6 +731,17 @@ function App() {
           {activeFeature === "overview" ? overview : switcher}
         </section>
       </div>
+      {pendingDeleteAccount && (
+        <div className="confirm-backdrop" onMouseDown={() => !busy && setPendingDeleteAccount(null)}>
+          <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
+            <p id="delete-confirm-title">确定删除账号“{pendingDeleteAccount.displayName}”吗？</p>
+            <div className="confirm-actions">
+              <button className="primary danger-confirm" onClick={confirmDeleteSelected} disabled={busy} autoFocus>确定</button>
+              <button onClick={() => setPendingDeleteAccount(null)} disabled={busy}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
