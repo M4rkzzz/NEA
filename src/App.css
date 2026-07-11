@@ -288,10 +288,7 @@ button.primary {
 }
 
 .account-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
+  display: block;
   width: 100%;
   min-height: 52px;
   padding: 6px;
@@ -467,6 +464,57 @@ button.primary {
 .plugin-toggle-row p {
   margin: 4px 0 0;
   color: #6b7280;
+}
+
+.account-row-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 30px;
+  min-width: 30px;
+  place-items: center;
+  padding: 0;
+}
+
+.icon-button.danger {
+  color: #b42318;
+}
+
+.icon-button.danger:hover:not(:disabled) {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+
+.account-details {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 6px 10px;
+  margin: 7px 0 0 44px;
+  padding: 8px 10px;
+  border-top: 1px solid #dbe6f5;
+  color: #374151;
+}
+
+.account-details dt {
+  color: #6b7280;
+}
+
+.account-details dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .plugin-controls {
@@ -833,6 +881,19 @@ button.primary {
   .workspace {
     height: auto;
     min-height: 0;
+  }
+
+  .account-row-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .account-actions {
+    justify-content: flex-end;
+    padding-left: 44px;
+  }
+
+  .account-details {
+    margin-left: 0;
   }
 }
 

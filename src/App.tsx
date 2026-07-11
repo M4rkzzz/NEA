@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { Trash2 } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -107,11 +108,6 @@ function fmtDate(value?: string) {
 
 function accountLabel(account: SavedAccount) {
   return account.userCommonId || account.pid || account.uid || account.loginName || "未绑定标识";
-}
-
-function accountStatus(account: SavedAccount, currentLoginUid?: string) {
-  if (account.uid && account.uid === currentLoginUid) return "当前登录";
-  return account.hasLoginState ? "可快速切换" : "需要登录一次";
 }
 
 function accountInitial(account: SavedAccount) {
@@ -604,11 +600,24 @@ function App() {
             {data.accounts.length === 0 && <div className="empty">暂无账号。先打开 OOPZ 登录一次，再点刷新。</div>}
             {data.accounts.map((account) => (
               <div className="account-row" data-selected={selected?.id === account.id} key={account.id}>
-                <button className="account-main" onClick={() => setSelectedId(account.id)}>
-                  <AccountAvatar account={account} ready={account.hasLoginState} />
-                  <span><strong>{account.displayName}</strong><small>{accountStatus(account, data.currentLoginUid)}</small></span>
-                </button>
-                <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
+                <div className="account-row-main">
+                  <button className="account-main" onClick={() => setSelectedId(account.id)} aria-expanded={selected?.id === account.id}>
+                    <AccountAvatar account={account} ready={account.hasLoginState} />
+                    <span><strong>{account.displayName}</strong><small>{accountLabel(account)}</small></span>
+                  </button>
+                  <div className="account-actions">
+                    <button className="icon-button danger" onClick={() => handleAction(() => deleteSelected(account))} disabled={busy} aria-label={`删除 ${account.displayName}`} title="删除账号"><Trash2 size={16} strokeWidth={2} /></button>
+                    <button onClick={() => handleAction(() => exportSelectedAccount(account))} disabled={busy || !account.hasLoginState}>导出</button>
+                    <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
+                  </div>
+                </div>
+                {selected?.id === account.id && (
+                  <dl className="account-details">
+                    <dt>手机号</dt><dd>{account.maskedPhone || "-"}</dd>
+                    <dt>账号 ID</dt><dd>{account.uid || "-"}</dd>
+                    <dt>最近切换</dt><dd>{fmtDate(account.lastUsedAt)}</dd>
+                  </dl>
+                )}
               </div>
             ))}
           </div>
@@ -636,33 +645,6 @@ function App() {
       </div>
 
       <div className="content-stack">
-        <div className="panel detail-panel">
-          <div className="panel-title">
-            <h2>当前账号</h2>
-          </div>
-          {!selected && <div className="empty">选择一个账号查看详情。</div>}
-          {selected && (
-            <>
-              <div className="profile">
-                <AccountAvatar account={selected} className="profile-avatar" ready={selected.hasLoginState} />
-                <div><h3>{selected.displayName}</h3><p>{accountLabel(selected)}</p></div>
-              </div>
-              <dl className="meta">
-                <dt>手机号</dt><dd>{selected.maskedPhone || "-"}</dd>
-                <dt>账号ID</dt><dd>{selected.uid || "-"}</dd>
-                <dt>最近切换</dt><dd>{fmtDate(selected.lastUsedAt)}</dd>
-                <dt>状态</dt><dd>{accountStatus(selected, data.currentLoginUid)}</dd>
-              </dl>
-              {!selected.hasLoginState && <div className="notice">这个账号还不能快速切换。请先在 OOPZ 里登录一次，然后回到这里点刷新。</div>}
-              <div className="actions">
-                <button className="primary" onClick={() => handleAction(() => switchAccount(selected))} disabled={busy || selected.uid === data.currentLoginUid}>{selected.uid === data.currentLoginUid ? "当前已登录" : selected.hasLoginState ? "切换并重启 OOPZ" : "打开 OOPZ 登录"}</button>
-                {selected.hasLoginState && <button onClick={() => handleAction(() => exportSelectedAccount(selected))} disabled={busy}>导出</button>}
-                <button onClick={() => handleAction(() => deleteSelected(selected))} disabled={busy}>删除</button>
-              </div>
-            </>
-          )}
-        </div>
-
         <div className="panel">
           <div className="panel-title"><h2>插件模式</h2></div>
           <div className="plugin-toggle-row">
