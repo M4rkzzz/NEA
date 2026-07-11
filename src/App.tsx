@@ -415,7 +415,7 @@ function App() {
   }
 
   async function deleteSelected(account: SavedAccount) {
-    const ok = window.confirm(`删除 OOPZ+ 中保存的 ${account.displayName}？不会删除 OOPZ 本体数据。`);
+    const ok = window.confirm(`确定删除账号“${account.displayName}”吗？`);
     if (!ok) return;
     await runTask("正在删除账号...", () => invoke("delete_account", { accountId: account.id }));
     setSelectedId(null);
@@ -624,7 +624,7 @@ function App() {
                     <span><strong>{account.displayName}</strong><small>{accountLabel(account)}</small></span>
                   </button>
                   <div className="account-actions">
-                    <button className="icon-button danger" onClick={() => handleAction(() => deleteSelected(account))} disabled={busy} aria-label={`删除 ${account.displayName}`} title="删除账号"><Trash2 size={16} strokeWidth={2} /></button>
+                    <button className="icon-button danger" onClick={() => handleAction(() => deleteSelected(account))} disabled={busy} aria-label={`删除 ${account.displayName} 的登录态`} title="删除登录态"><Trash2 size={16} strokeWidth={2} /></button>
                     <button onClick={() => handleAction(() => exportSelectedAccount(account))} disabled={busy || !account.hasLoginState}>导出</button>
                     <button className={account.hasLoginState ? "primary" : ""} onClick={() => handleAction(() => quickSwitch(account))} disabled={busy || account.uid === data.currentLoginUid}>{account.uid === data.currentLoginUid ? "当前登录" : account.hasLoginState ? "快速切号" : "登录一次"}</button>
                   </div>
