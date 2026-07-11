@@ -14,8 +14,8 @@
 
 body {
   margin: 0;
-  min-width: 860px;
-  min-height: 600px;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -755,5 +755,110 @@ button.primary {
   .hero-panel {
     align-items: flex-start;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-layout {
+    grid-template-columns: 210px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    padding: 14px;
+  }
+
+  .brand {
+    margin-bottom: 14px;
+  }
+
+  .brand h1 {
+    font-size: 26px;
+    line-height: 30px;
+  }
+
+  .feature-list button {
+    height: 46px;
+    padding: 7px 9px;
+  }
+
+  .workspace {
+    padding: 14px;
+  }
+
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .status {
+    width: 100%;
+    max-width: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .shell,
+  .app-layout {
+    height: 100dvh;
+  }
+
+  .app-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .sidebar {
+    height: auto;
+    max-height: 152px;
+    border-right: 0;
+    border-bottom: 1px solid #d7dde7;
+    overflow-y: auto;
+  }
+
+  .brand {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+
+  .brand p {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .feature-list {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .feature-list button {
+    height: 42px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .workspace {
+    height: auto;
+    min-height: 0;
+  }
+}
+
+@media (max-height: 520px) {
+  .sidebar {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .brand {
+    margin-bottom: 8px;
+  }
+
+  .workspace {
+    padding-top: 10px;
+    padding-bottom: 10px;
   }
 }

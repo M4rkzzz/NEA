@@ -28,6 +28,7 @@ use tauri::{
 };
 use uuid::Uuid;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
@@ -1177,21 +1178,35 @@ fn overlay_dimensions(account_count: usize, vertical: bool) -> (u32, u32) {
     }
 }
 
-fn overlay_geometry(rect: RECT, config: &AppConfig, account_count: usize) -> (i32, i32, u32, u32) {
-    let width = rect.right - rect.left;
+fn scaled_pixels(value: i32, scale_factor: f64) -> i32 {
+    (f64::from(value) * scale_factor).round() as i32
+}
+
+fn window_scale_factor(hwnd: HWND) -> f64 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 }
+}
+
+fn overlay_geometry(
+    rect: RECT,
+    config: &AppConfig,
+    account_count: usize,
+    scale_factor: f64,
+) -> (i32, i32, u32, u32) {
+    let logical_width = f64::from(rect.right - rect.left) / scale_factor;
     let (overlay_width, overlay_height) =
         overlay_dimensions(account_count, config.overlay_vertical);
-    if width < 1000 {
+    if logical_width < 1000.0 {
         (
-            rect.left + 70 + config.overlay_offset_x,
-            rect.top + 275 + config.overlay_offset_y,
+            rect.left + scaled_pixels(70 + config.overlay_offset_x, scale_factor),
+            rect.top + scaled_pixels(275 + config.overlay_offset_y, scale_factor),
             overlay_width,
             overlay_height,
         )
     } else {
         (
-            rect.left + 720 + config.overlay_offset_x,
-            rect.top + 15 + config.overlay_offset_y,
+            rect.left + scaled_pixels(720 + config.overlay_offset_x, scale_factor),
+            rect.top + scaled_pixels(15 + config.overlay_offset_y, scale_factor),
             overlay_width,
             overlay_height,
         )
@@ -1203,6 +1218,7 @@ fn overlay_offset_for_position(
     config: &AppConfig,
     account_count: usize,
     position: PhysicalPosition<i32>,
+    scale_factor: f64,
 ) -> (i32, i32) {
     let (base_x, base_y, _, _) = overlay_geometry(
         rect,
@@ -1212,10 +1228,11 @@ fn overlay_offset_for_position(
             ..config.clone()
         },
         account_count,
+        scale_factor,
     );
     (
-        (position.x - base_x).clamp(-4000, 4000),
-        (position.y - base_y).clamp(-4000, 4000),
+        ((f64::from(position.x - base_x) / scale_factor).round() as i32).clamp(-4000, 4000),
+        ((f64::from(position.y - base_y) / scale_factor).round() as i32).clamp(-4000, 4000),
     )
 }
 
@@ -1255,7 +1272,7 @@ fn drag_overlay(app: AppHandle) -> Result<(), String> {
 }
 
 fn persist_overlay_position(app: &AppHandle) -> Result<(), String> {
-    let (_, rect) = oopz_window_info().ok_or_else(|| "未找到 OOPZ 窗口".to_string())?;
+    let (oopz_hwnd, rect) = oopz_window_info().ok_or_else(|| "未找到 OOPZ 窗口".to_string())?;
     let window = app
         .get_webview_window("plugin-overlay")
         .ok_or_else(|| "未找到插件浮层".to_string())?;
@@ -1263,7 +1280,13 @@ fn persist_overlay_position(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
     let (offset_x, offset_y) =
-        overlay_offset_for_position(rect, &data.config, data.accounts.len(), position);
+        overlay_offset_for_position(
+            rect,
+            &data.config,
+            data.accounts.len(),
+            position,
+            window_scale_factor(oopz_hwnd),
+        );
     data.config.overlay_offset_x = offset_x;
     data.config.overlay_offset_y = offset_y;
     save_data(&data)
@@ -1419,7 +1442,12 @@ fn sync_overlay_loop(app: AppHandle) {
                     .lock()
                     .map(|data| (data.config.clone(), data.accounts.len()))
                     .unwrap_or_default();
-                let geometry = overlay_geometry(rect, &config, account_count);
+                let geometry = overlay_geometry(
+                    rect,
+                    &config,
+                    account_count,
+                    window_scale_factor(next_owner),
+                );
                 let (x, y, w, h) = geometry;
                 if last_geometry.map(|value| (value.0, value.1)) != Some((x, y)) {
                     let _ = window.set_position(PhysicalPosition::new(x, y));
@@ -2013,6 +2041,33 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+fn fit_main_window_to_monitor(window: &WebviewWindow, prefer_default_size: bool) {
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let scale_factor = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let available_width = (f64::from(work_area.size.width) / scale_factor - 24.0).max(480.0);
+    let available_height = (f64::from(work_area.size.height) / scale_factor - 24.0).max(360.0);
+    let min_width = 560.0_f64.min(available_width);
+    let min_height = 420.0_f64.min(available_height);
+    let _ = window.set_min_size(Some(LogicalSize::new(min_width, min_height)));
+
+    let current = window
+        .inner_size()
+        .map(|size| size.to_logical::<f64>(scale_factor))
+        .unwrap_or_else(|_| LogicalSize::new(980.0, 680.0));
+    let requested_width = if prefer_default_size { 980.0 } else { current.width };
+    let requested_height = if prefer_default_size { 680.0 } else { current.height };
+    let target_width = requested_width.min(available_width).max(min_width);
+    let target_height = requested_height.min(available_height).max(min_height);
+    if (target_width - current.width).abs() >= 1.0
+        || (target_height - current.height).abs() >= 1.0
+    {
+        let _ = window.set_size(LogicalSize::new(target_width, target_height));
     }
 }
 
@@ -3704,11 +3759,14 @@ pub fn run() {
                 .build(app)?;
 
             if let Some(window) = app.get_webview_window("main") {
+                fit_main_window_to_monitor(&window, true);
                 let window_for_close = window.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = window_for_close.hide();
+                    } else if let WindowEvent::ScaleFactorChanged { .. } = event {
+                        fit_main_window_to_monitor(&window_for_close, false);
                     }
                 });
             }
@@ -3970,7 +4028,7 @@ mod tests {
             overlay_offset_y: -8,
             ..AppConfig::default()
         };
-        assert_eq!(overlay_geometry(rect, &config, 6), (832, 207, 252, 52));
+        assert_eq!(overlay_geometry(rect, &config, 6, 1.0), (832, 207, 252, 52));
         let compact_rect = RECT {
             left: 50,
             top: 75,
@@ -3978,21 +4036,48 @@ mod tests {
             bottom: 700,
         };
         assert_eq!(
-            overlay_geometry(compact_rect, &config, 6),
+            overlay_geometry(compact_rect, &config, 6, 1.0),
             (132, 342, 252, 52)
         );
         assert_eq!(
-            overlay_offset_for_position(compact_rect, &config, 6, PhysicalPosition::new(210, 390),),
+            overlay_offset_for_position(
+                compact_rect,
+                &config,
+                6,
+                PhysicalPosition::new(210, 390),
+                1.0,
+            ),
             (90, 40)
         );
         let vertical = AppConfig {
             overlay_vertical: true,
-            ..config
+            ..config.clone()
         };
         assert_eq!(
-            overlay_geometry(compact_rect, &vertical, 6),
+            overlay_geometry(compact_rect, &vertical, 6, 1.0),
             (132, 342, 54, 252)
         );
         assert_eq!(overlay_dimensions(0, false), (52, 52));
+
+        let scaled_rect = RECT {
+            left: 75,
+            top: 113,
+            right: 1275,
+            bottom: 1050,
+        };
+        assert_eq!(
+            overlay_geometry(scaled_rect, &config, 6, 1.5),
+            (198, 514, 252, 52)
+        );
+        assert_eq!(
+            overlay_offset_for_position(
+                scaled_rect,
+                &config,
+                6,
+                PhysicalPosition::new(315, 586),
+                1.5,
+            ),
+            (90, 40)
+        );
     }
 }
