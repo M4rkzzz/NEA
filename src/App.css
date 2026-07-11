@@ -281,6 +281,26 @@ button.primary {
 .account-list {
   display: grid;
   gap: 8px;
+  max-height: min(292px, 42vh);
+  padding-right: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.account-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.account-list::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: #c3cad5;
+  background-clip: padding-box;
+}
+
+.account-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .account-list-compact {
