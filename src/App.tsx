@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Trash2 } from "lucide-react";
+import { Minus, Square, Trash2, X } from "lucide-react";
 import appIcon from "../src-tauri/icons/32x32.png";
 import "./App.css";
 
@@ -469,6 +470,18 @@ function App() {
     setMessage(status.message);
   }
 
+  function minimizeWindow() {
+    void getCurrentWindow().minimize().catch((error) => setMessage(errorMessage(error)));
+  }
+
+  function toggleMaximizeWindow() {
+    void getCurrentWindow().toggleMaximize().catch((error) => setMessage(errorMessage(error)));
+  }
+
+  function closeWindow() {
+    void getCurrentWindow().close().catch((error) => setMessage(errorMessage(error)));
+  }
+
   useEffect(() => {
     refresh()
       .then(() => validate())
@@ -674,24 +687,32 @@ function App() {
   );
 
   return (
-    <main className="shell app-layout">
-      <aside className="sidebar">
-        <div className="brand-mark"><img src={appIcon} alt="" aria-hidden="true" /></div>
-        <nav className="feature-list">
-          <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
-          <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
-        </nav>
-      </aside>
+    <main className="shell">
+      <header className="window-titlebar" data-tauri-drag-region onDoubleClick={toggleMaximizeWindow}>
+        <div className="window-titlebar-status" data-tauri-drag-region>
+          <img src={appIcon} alt="" aria-hidden="true" data-tauri-drag-region />
+          <div className="status" data-busy={busy} data-tauri-drag-region>{busy && <span className="spinner" />}<span data-tauri-drag-region>{message}</span></div>
+        </div>
+        <div className="window-controls">
+          <button onClick={minimizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最小化" title="最小化"><Minus size={15} /></button>
+          <button onClick={toggleMaximizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最大化或还原" title="最大化或还原"><Square size={13} /></button>
+          <button className="window-close" onClick={closeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="关闭" title="关闭"><X size={16} /></button>
+        </div>
+      </header>
 
-      <section className="workspace">
-        <header className="topbar">
-          <div className="topbar-main">
-            <h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2>
-            <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
-          </div>
-        </header>
-        {activeFeature === "overview" ? overview : switcher}
-      </section>
+      <div className="app-layout">
+        <aside className="sidebar">
+          <nav className="feature-list">
+            <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
+            <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
+          </nav>
+        </aside>
+
+        <section className="workspace">
+          <header className="topbar"><h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2></header>
+          {activeFeature === "overview" ? overview : switcher}
+        </section>
+      </div>
     </main>
   );
 }

@@ -74,6 +74,9 @@ button.primary {
 
 .shell {
   height: 100vh;
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .app-layout {
@@ -81,26 +84,69 @@ button.primary {
   grid-template-columns: 220px minmax(520px, 1fr);
   gap: 0;
   overflow: hidden;
+  min-height: 0;
+}
+
+.window-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 38px;
+  border-bottom: 1px solid #d7dde7;
+  background: #eef1f5;
+  user-select: none;
+}
+
+.window-titlebar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-left: 12px;
+}
+
+.window-titlebar-status > img {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  flex: 0 0 auto;
+}
+
+.window-controls button {
+  display: grid;
+  width: 46px;
+  height: 37px;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  color: #202124;
+}
+
+.window-controls button:hover:not(:disabled) {
+  border-color: transparent;
+  background: #dfe4ea;
+  color: #111827;
+}
+
+.window-controls .window-close:hover:not(:disabled) {
+  background: #c42b1c;
+  color: #fff;
 }
 
 .sidebar {
-  height: 100vh;
+  height: 100%;
   border-right: 1px solid #d7dde7;
   background: #f8fafc;
   padding: 16px;
   overflow-y: auto;
-}
-
-.brand-mark {
-  height: 30px;
-  margin-bottom: 12px;
-}
-
-.brand-mark img {
-  display: block;
-  width: 28px;
-  height: 28px;
-  object-fit: contain;
 }
 
 .feature-list {
@@ -127,7 +173,7 @@ button.primary {
 
 .workspace {
   min-width: 0;
-  height: 100vh;
+  height: 100%;
   padding: 16px;
   overflow-y: auto;
 }
@@ -138,13 +184,6 @@ button.primary {
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 12px;
-}
-
-.topbar-main {
-  display: flex;
-  align-items: baseline;
-  gap: 14px;
-  min-width: 0;
 }
 
 .topbar h2 {
@@ -158,7 +197,7 @@ button.primary {
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: min(420px, 48vw);
+  max-width: min(520px, 55vw);
   min-height: 20px;
   padding: 0;
   color: #6b7280;
@@ -827,21 +866,13 @@ button.primary {
     padding: 14px;
   }
 
-  .topbar {
-    align-items: center;
-    gap: 8px;
-  }
-
-  .topbar-main {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 2px;
+  .status {
+    max-width: 48vw;
   }
 }
 
 @media (max-width: 640px) {
-  .shell,
-  .app-layout {
+  .shell {
     height: 100dvh;
   }
 
@@ -856,16 +887,6 @@ button.primary {
     border-right: 0;
     border-bottom: 1px solid #d7dde7;
     overflow-y: auto;
-  }
-
-  .brand-mark {
-    height: 24px;
-    margin-bottom: 8px;
-  }
-
-  .brand-mark img {
-    width: 24px;
-    height: 24px;
   }
 
   .feature-list {
