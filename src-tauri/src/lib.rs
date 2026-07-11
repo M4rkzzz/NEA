@@ -269,6 +269,7 @@ struct GitHubAsset {
 
 struct AppState {
     data: Mutex<AppData>,
+    account_operation: Mutex<()>,
     switch_operation: Mutex<()>,
     discovery_cancelled: AtomicBool,
     auto_import_running: AtomicBool,
@@ -1184,7 +1185,11 @@ fn scaled_pixels(value: i32, scale_factor: f64) -> i32 {
 
 fn window_scale_factor(hwnd: HWND) -> f64 {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 }
+    if dpi == 0 {
+        1.0
+    } else {
+        f64::from(dpi) / 96.0
+    }
 }
 
 fn overlay_geometry(
@@ -1279,21 +1284,19 @@ fn persist_overlay_position(app: &AppHandle) -> Result<(), String> {
     let position = window.outer_position().map_err(|e| e.to_string())?;
     let state = app.state::<AppState>();
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
-    let (offset_x, offset_y) =
-        overlay_offset_for_position(
-            rect,
-            &data.config,
-            data.accounts.len(),
-            position,
-            window_scale_factor(oopz_hwnd),
-        );
+    let (offset_x, offset_y) = overlay_offset_for_position(
+        rect,
+        &data.config,
+        data.accounts.len(),
+        position,
+        window_scale_factor(oopz_hwnd),
+    );
     data.config.overlay_offset_x = offset_x;
     data.config.overlay_offset_y = offset_y;
     save_data(&data)
 }
 
-#[tauri::command]
-fn reset_overlay_position(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn reset_overlay_position_inner(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
     data.config.overlay_offset_x = 0;
     data.config.overlay_offset_y = 0;
@@ -1306,7 +1309,17 @@ fn reset_overlay_position(app: AppHandle, state: State<AppState>) -> Result<(), 
 }
 
 #[tauri::command]
-fn set_overlay_layout(
+async fn reset_overlay_position(app: AppHandle) -> Result<(), String> {
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_task.state::<AppState>();
+        reset_overlay_position_inner(app_for_task.clone(), state)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn set_overlay_layout_inner(
     app: AppHandle,
     state: State<AppState>,
     vertical: bool,
@@ -1318,6 +1331,17 @@ fn set_overlay_layout(
     state.overlay_rebind_requested.store(true, Ordering::SeqCst);
     let _ = app.emit("app-data-changed", ());
     Ok(())
+}
+
+#[tauri::command]
+async fn set_overlay_layout(app: AppHandle, vertical: bool) -> Result<(), String> {
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_task.state::<AppState>();
+        set_overlay_layout_inner(app_for_task.clone(), state, vertical)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn visible_window_rect(hwnd: HWND) -> Option<RECT> {
@@ -2060,12 +2084,19 @@ fn fit_main_window_to_monitor(window: &WebviewWindow, prefer_default_size: bool)
         .inner_size()
         .map(|size| size.to_logical::<f64>(scale_factor))
         .unwrap_or_else(|_| LogicalSize::new(980.0, 680.0));
-    let requested_width = if prefer_default_size { 980.0 } else { current.width };
-    let requested_height = if prefer_default_size { 680.0 } else { current.height };
+    let requested_width = if prefer_default_size {
+        980.0
+    } else {
+        current.width
+    };
+    let requested_height = if prefer_default_size {
+        680.0
+    } else {
+        current.height
+    };
     let target_width = requested_width.min(available_width).max(min_width);
     let target_height = requested_height.min(available_height).max(min_height);
-    if (target_width - current.width).abs() >= 1.0
-        || (target_height - current.height).abs() >= 1.0
+    if (target_width - current.width).abs() >= 1.0 || (target_height - current.height).abs() >= 1.0
     {
         let _ = window.set_size(LogicalSize::new(target_width, target_height));
     }
@@ -2073,7 +2104,7 @@ fn fit_main_window_to_monitor(window: &WebviewWindow, prefer_default_size: bool)
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<AppState>();
-    let data = state.data.lock().expect("state poisoned");
+    let data = state.data.lock().expect("state poisoned").clone();
     let current_uid = current_registry_login().and_then(|login| uid_from_registry_login(&login));
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(
@@ -2172,29 +2203,27 @@ fn auto_import_current_login(app: AppHandle) -> Result<(), String> {
     };
     let app_for_state = app.clone();
     let state = app_for_state.state::<AppState>();
-    let should_import = {
-        let data = state.data.lock().map_err(|e| e.to_string())?;
-        let current_avatar_url = paths_from_config(&data.config)
-            .ok()
-            .and_then(|paths| read_user_detail(&PathBuf::from(paths.roaming_data_dir).join(&uid)))
-            .and_then(|candidate| candidate.avatar_url)
-            .filter(|url| !url.trim().is_empty());
-        match data
-            .accounts
-            .iter()
-            .find(|account| account.uid.as_deref() == Some(uid.as_str()))
-        {
-            Some(account) => {
-                !account.has_login_state
-                    || !saved_snapshot_exists(account)
-                    || read_oopz_login(&account.id).is_none()
-                    || account.avatar_url.as_deref().unwrap_or("").is_empty()
-                    || current_avatar_url
-                        .as_deref()
-                        .is_some_and(|url| account.avatar_source_url.as_deref() != Some(url))
-            }
-            None => true,
+    let data = state.data.lock().map_err(|e| e.to_string())?.clone();
+    let current_avatar_url = paths_from_config(&data.config)
+        .ok()
+        .and_then(|paths| read_user_detail(&PathBuf::from(paths.roaming_data_dir).join(&uid)))
+        .and_then(|candidate| candidate.avatar_url)
+        .filter(|url| !url.trim().is_empty());
+    let should_import = match data
+        .accounts
+        .iter()
+        .find(|account| account.uid.as_deref() == Some(uid.as_str()))
+    {
+        Some(account) => {
+            !account.has_login_state
+                || !saved_snapshot_exists(account)
+                || read_oopz_login(&account.id).is_none()
+                || account.avatar_url.as_deref().unwrap_or("").is_empty()
+                || current_avatar_url
+                    .as_deref()
+                    .is_some_and(|url| account.avatar_source_url.as_deref() != Some(url))
         }
+        None => true,
     };
     if should_import {
         let _ = import_account_inner(app, state, uid);
@@ -2203,9 +2232,14 @@ fn auto_import_current_login(app: AppHandle) -> Result<(), String> {
 }
 
 fn plugin_status_inner(state: &AppState) -> Result<PluginStatus, String> {
-    let data = state.data.lock().map_err(|e| e.to_string())?;
+    let plugin_mode_enabled = state
+        .data
+        .lock()
+        .map_err(|e| e.to_string())?
+        .config
+        .plugin_mode_enabled;
     Ok(PluginStatus {
-        plugin_mode_enabled: data.config.plugin_mode_enabled,
+        plugin_mode_enabled,
         watcher_installed: watcher_installed(),
         watcher_running: is_watcher_running(),
         plugin_runtime_running: is_plugin_runtime_running(),
@@ -2342,10 +2376,14 @@ fn repair_plugin_environment_inner(
 }
 
 #[tauri::command]
-fn plugin_account_action(app: AppHandle, account_id: String) -> Result<SwitchResult, String> {
-    let app_for_state = app.clone();
-    let state = app_for_state.state::<AppState>();
-    switch_account_inner(app, state, account_id)
+async fn plugin_account_action(app: AppHandle, account_id: String) -> Result<SwitchResult, String> {
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_task.state::<AppState>();
+        switch_account_inner(app_for_task.clone(), state, account_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2365,6 +2403,7 @@ fn discover_oopz_inner(app: AppHandle, state: State<AppState>) -> Result<OopzPat
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
     apply_paths_to_config(&mut data.config, &paths);
     save_data(&data)?;
+    drop(data);
     update_tray(&app);
     Ok(paths)
 }
@@ -2395,6 +2434,7 @@ fn set_oopz_directory_inner(
     let mut data = state.data.lock().map_err(|e| e.to_string())?;
     apply_paths_to_config(&mut data.config, &paths);
     save_data(&data)?;
+    drop(data);
     update_tray(&app);
     Ok(paths)
 }
@@ -2468,7 +2508,8 @@ fn import_account_inner(
     state: State<AppState>,
     uid: String,
 ) -> Result<SavedAccount, String> {
-    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
+    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
     let paths = paths_from_config(&data.config)?;
     let roaming_src = PathBuf::from(&paths.roaming_data_dir).join(&uid);
     let local_src = PathBuf::from(&paths.local_sandbox_dir).join(&uid);
@@ -2551,7 +2592,7 @@ fn import_account_inner(
         data.accounts.push(account.clone());
     }
     save_data(&data)?;
-    drop(data);
+    *state.data.lock().map_err(|e| e.to_string())? = data;
     update_tray(&app);
     Ok(account)
 }
@@ -2627,8 +2668,9 @@ fn export_account_package_inner(
     account_id: Option<&str>,
     path: &Path,
 ) -> Result<usize, String> {
+    let state = app.state::<AppState>();
+    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
     let accounts = {
-        let state = app.state::<AppState>();
         let data = state.data.lock().map_err(|e| e.to_string())?;
         match account_id {
             Some(account_id) => vec![data
@@ -2811,6 +2853,7 @@ fn import_export_entry(
 fn import_account_package_inner(app: &AppHandle, path: &Path) -> Result<Vec<SavedAccount>, String> {
     let packages = read_export_package(path)?;
     let state = app.state::<AppState>();
+    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
     let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
     let mut imported = Vec::with_capacity(packages.len());
     for package in packages {
@@ -3278,7 +3321,8 @@ fn save_manual_credential_inner(
     state: State<AppState>,
     mut input: CredentialInput,
 ) -> Result<SavedAccount, String> {
-    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
+    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
     input.display_name = input.display_name.trim().to_string();
     input.login_name = input.login_name.trim().to_string();
     input.note = input.note.and_then(|note| {
@@ -3335,7 +3379,7 @@ fn save_manual_credential_inner(
         data.accounts.push(account.clone());
     }
     save_data(&data)?;
-    drop(data);
+    *state.data.lock().map_err(|e| e.to_string())? = data;
     update_tray(&app);
     Ok(account)
 }
@@ -3363,10 +3407,11 @@ fn delete_account_inner(
     state: State<AppState>,
     account_id: String,
 ) -> Result<(), String> {
-    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
+    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
     data.accounts.retain(|a| a.id != account_id);
     save_data(&data)?;
-    drop(data);
+    *state.data.lock().map_err(|e| e.to_string())? = data;
     delete_credential(&account_id);
     let dir = accounts_dir()?.join(&account_id);
     if dir.exists() {
@@ -3387,8 +3432,10 @@ async fn open_oopz(app: AppHandle) -> Result<(), String> {
 }
 
 fn open_oopz_inner(state: State<AppState>) -> Result<(), String> {
-    let data = state.data.lock().map_err(|e| e.to_string())?;
-    let paths = paths_from_config(&data.config)?;
+    let paths = {
+        let data = state.data.lock().map_err(|e| e.to_string())?;
+        paths_from_config(&data.config)?
+    };
     Command::new(paths.oopz_exe_path)
         .spawn()
         .map_err(|e| format!("启动 OOPZ 失败: {}", e))?;
@@ -3522,6 +3569,7 @@ fn switch_account_inner(
         .switch_operation
         .try_lock()
         .map_err(|_| "另一项切号操作正在进行，请稍候".to_string())?;
+    let _account_operation = state.account_operation.lock().map_err(|e| e.to_string())?;
     let (paths, account, config) = {
         let data = state.data.lock().map_err(|e| e.to_string())?;
         let paths = paths_from_config(&data.config)?;
@@ -3649,6 +3697,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             data: Mutex::new(load_data()),
+            account_operation: Mutex::new(()),
             switch_operation: Mutex::new(()),
             discovery_cancelled: AtomicBool::new(false),
             auto_import_running: AtomicBool::new(false),
