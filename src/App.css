@@ -104,11 +104,11 @@ button.primary {
 
 .window-brand {
   position: absolute;
-  top: 24px;
-  left: 18px;
+  top: 20px;
+  left: 20px;
   color: #20272b;
-  font-size: 22px;
-  line-height: 28px;
+  font-size: 28px;
+  line-height: 34px;
   font-weight: 700;
   letter-spacing: 0;
 }
@@ -117,6 +117,7 @@ button.primary {
   display: flex;
   align-self: stretch;
   flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .window-controls button {
@@ -146,7 +147,7 @@ button.primary {
   height: 100%;
   border-right: 0;
   background: #eaf4f8;
-  padding: 18px 12px;
+  padding: 52px 12px 18px;
   overflow-y: auto;
 }
 
@@ -860,7 +861,7 @@ button.primary {
   }
 
   .sidebar {
-    padding: 14px;
+    padding: 52px 14px 14px;
   }
 
   .feature-list button {
@@ -927,7 +928,7 @@ button.primary {
 
 @media (max-height: 520px) {
   .sidebar {
-    padding-top: 10px;
+    padding-top: 52px;
     padding-bottom: 10px;
   }
 
