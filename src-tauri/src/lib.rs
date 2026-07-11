@@ -19,7 +19,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{Pid, Signal, System};
+use sysinfo::{Pid, ProcessRefreshKind, Signal, System, UpdateKind};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -27,6 +27,10 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+};
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -36,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
     IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
 };
+use windows_core::Interface;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
@@ -43,6 +48,22 @@ const APP_DIR_NAME: &str = "OOPZ+";
 const CREDENTIAL_SERVICE: &str = "OOPZ+";
 const WATCHER_FILE_NAME: &str = "oopz-plus-watcher.exe";
 const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new()
+        .with_cmd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always)
+}
+
+fn process_system() -> System {
+    let mut system = System::new();
+    system.refresh_processes_specifics(process_refresh_kind());
+    system
+}
+
+fn refresh_process_system(system: &mut System) {
+    system.refresh_processes_specifics(process_refresh_kind());
+}
 const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const LEGACY_EXPORT_FORMAT: &str = "oopz-plus-account-v1";
 const EXPORT_FORMAT: &str = "oopz-plus-package-v2";
@@ -312,6 +333,7 @@ struct AppState {
     update_status: Mutex<UpdateStatus>,
     wormhole_running: AtomicBool,
     wormhole_cancelled: AtomicBool,
+    main_webview_low_memory: AtomicBool,
 }
 
 struct NamedMutex(HANDLE);
@@ -663,8 +685,7 @@ fn apply_update_helper(args: &[String]) {
 
     let mut parent_exited = false;
     for _ in 0..120 {
-        let mut system = System::new();
-        system.refresh_processes();
+        let system = process_system();
         if system.process(Pid::from_u32(parent_pid)).is_none() {
             parent_exited = true;
             break;
@@ -1074,7 +1095,7 @@ fn running_oopz_exe_in(system: &System) -> Option<PathBuf> {
 }
 
 fn running_oopz_exe() -> Option<PathBuf> {
-    running_oopz_exe_in(&System::new_all())
+    running_oopz_exe_in(&process_system())
 }
 
 fn is_plugin_runtime_running_in(system: &System) -> bool {
@@ -1086,7 +1107,7 @@ fn is_plugin_runtime_running_in(system: &System) -> bool {
 }
 
 fn is_plugin_runtime_running() -> bool {
-    is_plugin_runtime_running_in(&System::new_all())
+    is_plugin_runtime_running_in(&process_system())
 }
 
 fn is_watcher_running_in(system: &System) -> bool {
@@ -1098,11 +1119,11 @@ fn is_watcher_running_in(system: &System) -> bool {
 }
 
 fn is_watcher_running() -> bool {
-    is_watcher_running_in(&System::new_all())
+    is_watcher_running_in(&process_system())
 }
 
 fn stop_watcher() {
-    let system = System::new_all();
+    let system = process_system();
     for process in system.processes().values() {
         if (process.name().eq_ignore_ascii_case("oopz-plus.exe")
             || process.name().eq_ignore_ascii_case(WATCHER_FILE_NAME))
@@ -1117,7 +1138,7 @@ fn stop_watcher() {
 }
 
 fn stop_plugin_runtime() {
-    let system = System::new_all();
+    let system = process_system();
     for process in system.processes().values() {
         if (process.name().eq_ignore_ascii_case("oopz-plus.exe")
             || process.name().eq_ignore_ascii_case(WATCHER_FILE_NAME))
@@ -1232,7 +1253,7 @@ fn ensure_plugin_runtime_after_oopz_start(config: AppConfig) {
 }
 
 fn watcher_loop() {
-    let mut system = System::new_all();
+    let mut system = process_system();
     let mut config_modified = None;
     let mut plugin_enabled = false;
     loop {
@@ -1248,7 +1269,7 @@ fn watcher_loop() {
             thread::sleep(Duration::from_secs(3));
             continue;
         }
-        system.refresh_processes();
+        refresh_process_system(&mut system);
         if running_oopz_exe_in(&system).is_some() && !is_plugin_runtime_running_in(&system) {
             let _ = spawn_plugin_runtime();
         }
@@ -1292,7 +1313,7 @@ fn oopz_process_ids_in(system: &System) -> Vec<u32> {
 }
 
 fn oopz_process_ids() -> Vec<u32> {
-    oopz_process_ids_in(&System::new_all())
+    oopz_process_ids_in(&process_system())
 }
 
 fn oopz_window_info_for_pids(pids: Vec<u32>) -> Option<(HWND, RECT)> {
@@ -1616,12 +1637,25 @@ fn sync_overlay_loop(app: AppHandle) {
                     thread::sleep(Duration::from_millis(33));
                     continue;
                 }
-                let (config, account_count) = app
+                let (overlay_vertical, overlay_offset_x, overlay_offset_y, account_count) = app
                     .state::<AppState>()
                     .data
                     .lock()
-                    .map(|data| (data.config.clone(), data.accounts.len()))
+                    .map(|data| {
+                        (
+                            data.config.overlay_vertical,
+                            data.config.overlay_offset_x,
+                            data.config.overlay_offset_y,
+                            data.accounts.len(),
+                        )
+                    })
                     .unwrap_or_default();
+                let config = AppConfig {
+                    overlay_vertical,
+                    overlay_offset_x,
+                    overlay_offset_y,
+                    ..AppConfig::default()
+                };
                 let geometry = overlay_geometry(
                     rect,
                     &config,
@@ -2183,10 +2217,36 @@ fn watch_config_changes(app: AppHandle) {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        set_webview_low_memory(&window, false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn set_webview_low_memory(window: &WebviewWindow, low_memory: bool) {
+    let state = window.app_handle().state::<AppState>();
+    if state
+        .main_webview_low_memory
+        .swap(low_memory, Ordering::SeqCst)
+        == low_memory
+    {
+        return;
+    }
+    let target = if low_memory {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+    } else {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+    };
+    let _ = window.with_webview(move |webview| unsafe {
+        let Ok(core_webview) = webview.controller().CoreWebView2() else {
+            return;
+        };
+        let Ok(core_webview_19) = core_webview.cast::<ICoreWebView2_19>() else {
+            return;
+        };
+        let _ = core_webview_19.SetMemoryUsageTargetLevel(target);
+    });
 }
 
 fn fit_main_window_to_monitor(window: &WebviewWindow, prefer_default_size: bool) {
@@ -2359,7 +2419,7 @@ fn plugin_status_inner(state: &AppState) -> Result<PluginStatus, String> {
         .map_err(|e| e.to_string())?
         .config
         .plugin_mode_enabled;
-    let system = System::new_all();
+    let system = process_system();
     let watcher_running = is_watcher_running_in(&system);
     let plugin_runtime_running = is_plugin_runtime_running_in(&system);
     let oopz_pids = oopz_process_ids_in(&system);
@@ -3950,7 +4010,7 @@ fn open_oopz_inner(state: State<AppState>) -> Result<(), String> {
 }
 
 fn close_oopz_if_running() -> Result<(), String> {
-    let mut system = System::new_all();
+    let mut system = process_system();
     let pids: Vec<_> = system
         .processes()
         .iter()
@@ -3970,7 +4030,7 @@ fn close_oopz_if_running() -> Result<(), String> {
     }
 
     thread::sleep(Duration::from_millis(1200));
-    system.refresh_processes();
+    refresh_process_system(&mut system);
 
     for pid in pids {
         if let Some(process) = system.process(pid) {
@@ -4231,6 +4291,7 @@ pub fn run() {
             update_status: Mutex::new(initial_update_status()),
             wormhole_running: AtomicBool::new(false),
             wormhole_cancelled: AtomicBool::new(false),
+            main_webview_low_memory: AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
@@ -4344,7 +4405,11 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
+                        set_webview_low_memory(&window_for_close, true);
                         let _ = window_for_close.hide();
+                    } else if let WindowEvent::Resized(_) = event {
+                        let minimized = window_for_close.is_minimized().unwrap_or(false);
+                        set_webview_low_memory(&window_for_close, minimized);
                     } else if let WindowEvent::ScaleFactorChanged { .. } = event {
                         fit_main_window_to_monitor(&window_for_close, false);
                     }
