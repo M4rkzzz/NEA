@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Minus, Square, Trash2, X } from "lucide-react";
+import { LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -736,8 +736,8 @@ function App() {
       <div className="app-layout">
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <nav className="feature-list">
-            <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
-            <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
+            <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
+            <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
           </nav>
         </aside>
 
