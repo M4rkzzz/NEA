@@ -58,7 +58,7 @@ const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
-const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://ghproxy.net/";
+const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
 
@@ -4812,7 +4812,7 @@ mod tests {
         assert_eq!(validate_update_asset(&asset, "1.2.3"), Ok(digest.as_str()));
         assert_eq!(
             github_proxy_url(&asset),
-            "https://ghproxy.net/https://github.com/M4rkzzz/oopz-plus/releases/download/v1.2.3/OOPZ%2B_1.2.3_x64_en-US.msi"
+            "https://gh-proxy.com/https://github.com/M4rkzzz/oopz-plus/releases/download/v1.2.3/OOPZ%2B_1.2.3_x64_en-US.msi"
         );
 
         let untrusted = GitHubAsset {
