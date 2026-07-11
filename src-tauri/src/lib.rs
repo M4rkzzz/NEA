@@ -2131,13 +2131,24 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     Ok(menu)
 }
 
-#[tauri::command]
-fn get_app_data(app: AppHandle) -> Result<AppData, String> {
-    let mut data = refresh_app_data_from_disk(&app);
+fn get_app_data_inner(app: &AppHandle) -> Result<AppData, String> {
+    let mut data = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
     schedule_auto_import_current_login(app.clone());
     data.current_login_uid =
         current_registry_login().and_then(|login| uid_from_registry_login(&login));
     Ok(data)
+}
+
+#[tauri::command]
+async fn get_app_data(app: AppHandle) -> Result<AppData, String> {
+    tauri::async_runtime::spawn_blocking(move || get_app_data_inner(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn schedule_auto_import_current_login(app: AppHandle) {
@@ -2800,14 +2811,14 @@ fn import_export_entry(
 fn import_account_package_inner(app: &AppHandle, path: &Path) -> Result<Vec<SavedAccount>, String> {
     let packages = read_export_package(path)?;
     let state = app.state::<AppState>();
-    let mut data = state.data.lock().map_err(|e| e.to_string())?;
+    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
     let mut imported = Vec::with_capacity(packages.len());
     for package in packages {
         imported.push(import_export_entry(&mut data, package)?);
     }
     let config = data.config.clone();
     save_data(&data)?;
-    drop(data);
+    *state.data.lock().map_err(|e| e.to_string())? = data;
     update_tray(app);
     ensure_plugin_runtime_for_oopz(&config);
     let _ = app.emit("app-data-changed", ());
