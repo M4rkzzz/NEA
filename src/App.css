@@ -181,6 +181,44 @@ button.primary.danger-confirm {
   background: #c42b1c;
 }
 
+.auto-hide-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.auto-hide-scrollbar.is-scrolling {
+  scrollbar-color: rgba(104, 116, 124, 0.52) transparent;
+}
+
+.auto-hide-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.auto-hide-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.auto-hide-scrollbar::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  background-clip: padding-box;
+  transition: background-color 180ms ease;
+}
+
+.auto-hide-scrollbar.is-scrolling::-webkit-scrollbar-thumb {
+  background-color: rgba(104, 116, 124, 0.52);
+}
+
+.auto-hide-scrollbar::-webkit-scrollbar-button,
+.auto-hide-scrollbar::-webkit-scrollbar-corner {
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
 .sidebar {
   height: 100%;
   border-right: 0;
@@ -364,21 +402,6 @@ button.primary.danger-confirm {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
-}
-
-.account-list::-webkit-scrollbar {
-  width: 8px;
-}
-
-.account-list::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 8px;
-  background: #c3cad5;
-  background-clip: padding-box;
-}
-
-.account-list::-webkit-scrollbar-track {
-  background: transparent;
 }
 
 .account-list-compact {

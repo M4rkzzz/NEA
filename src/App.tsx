@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type UIEvent as ReactUIEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -176,6 +176,7 @@ function App() {
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
+  const scrollTimersRef = useRef(new Map<HTMLElement, ReturnType<typeof setTimeout>>());
 
   const selected = useMemo(
     () => data.accounts.find((account) => account.id === selectedId) || data.accounts[0],
@@ -491,6 +492,18 @@ function App() {
     void getCurrentWindow().startDragging().catch((error) => setMessage(errorMessage(error)));
   }
 
+  function showScrollbarWhileScrolling(event: ReactUIEvent<HTMLElement>) {
+    const element = event.currentTarget;
+    element.classList.add("is-scrolling");
+    const previousTimer = scrollTimersRef.current.get(element);
+    if (previousTimer) clearTimeout(previousTimer);
+    const timer = setTimeout(() => {
+      element.classList.remove("is-scrolling");
+      scrollTimersRef.current.delete(element);
+    }, 800);
+    scrollTimersRef.current.set(element, timer);
+  }
+
   useEffect(() => {
     refresh()
       .then(() => validate())
@@ -567,6 +580,11 @@ function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [pendingDeleteAccount, busy]);
 
+  useEffect(() => () => {
+    scrollTimersRef.current.forEach((timer) => clearTimeout(timer));
+    scrollTimersRef.current.clear();
+  }, []);
+
   const overview = (
     <section className="content-stack">
       <div className="panel">
@@ -628,7 +646,7 @@ function App() {
               <button onClick={() => handleAction(() => refreshAccounts())} disabled={busy}>刷新</button>
             </div>
           </div>
-          <div className="account-list account-list-compact">
+          <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
             {data.accounts.length === 0 && <div className="empty">暂无账号。先打开 OOPZ 登录一次，再点刷新。</div>}
             {data.accounts.map((account) => (
               <div className="account-row" data-selected={selected?.id === account.id} key={account.id}>
@@ -716,14 +734,14 @@ function App() {
       </header>
 
       <div className="app-layout">
-        <aside className="sidebar">
+        <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <nav className="feature-list">
             <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
             <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
           </nav>
         </aside>
 
-        <section className="workspace">
+        <section className="workspace auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
             <h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2>
             <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
