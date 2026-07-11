@@ -61,11 +61,6 @@ type ImportedCandidate = {
   canSwitch: boolean;
 };
 
-type CredentialView = {
-  loginName?: string;
-  password?: string;
-};
-
 type PluginStatus = {
   pluginModeEnabled: boolean;
   watcherInstalled: boolean;
@@ -94,14 +89,7 @@ type WormholeStatus = {
   total?: number;
 };
 
-type FeatureKey = "overview" | "switcher" | "plugin";
-
-const emptyCredential = {
-  displayName: "",
-  loginName: "",
-  password: "",
-  note: "",
-};
+type FeatureKey = "overview" | "switcher";
 
 function fmtDate(value?: string) {
   if (!value) return "-";
@@ -177,8 +165,6 @@ function App() {
   const [data, setData] = useState<AppData>({ config: {}, accounts: [] });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [credential, setCredential] = useState(emptyCredential);
-  const [revealed, setRevealed] = useState<CredentialView | null>(null);
   const [message, setMessage] = useState("正在初始化...");
   const [busy, setBusy] = useState(false);
   const [searchingOopz, setSearchingOopz] = useState(false);
@@ -199,7 +185,6 @@ function App() {
   );
 
   const sessionCount = data.accounts.filter((account) => account.hasLoginState).length;
-  const credentialCount = data.accounts.filter((account) => account.hasCredential).length;
   const updateActive = updateStatus?.state === "checking" || updateStatus?.state === "downloading" || updateStatus?.state === "installing";
   const wormholeActive = Boolean(wormholeStatus && !["cancelled", "complete", "error"].includes(wormholeStatus.state));
 
@@ -403,35 +388,6 @@ function App() {
     setMessage(`快捷导入完成，共 ${accounts.length} 个账号`);
   }
 
-  async function saveCredential() {
-    if (!credential.displayName.trim() || !credential.loginName.trim() || !credential.password) {
-      setMessage("请填写名称、账号和密码");
-      return;
-    }
-    const account = await runTask("正在保存账号密码...", () =>
-      invoke<SavedAccount>("save_manual_credential", {
-        input: {
-          accountId: selected?.id ?? null,
-          displayName: credential.displayName.trim(),
-          loginName: credential.loginName.trim(),
-          password: credential.password,
-          note: credential.note.trim() || null,
-        },
-      }),
-    );
-    setSelectedId(account.id);
-    setCredential((current) => ({ ...current, password: "" }));
-    setMessage("账号密码已保存");
-  }
-
-  async function revealCredential(account: SavedAccount) {
-    const secret = await runTask("正在读取账号密码...", () =>
-      invoke<CredentialView>("reveal_credential", { accountId: account.id }),
-    );
-    setRevealed(secret);
-    setMessage("账号密码已显示，可复制使用");
-  }
-
   async function copyText(value?: string) {
     if (!value) {
       setMessage("没有可复制的内容");
@@ -466,7 +422,6 @@ function App() {
     if (!ok) return;
     await runTask("正在删除账号...", () => invoke("delete_account", { accountId: account.id }));
     setSelectedId(null);
-    setRevealed(null);
     setMessage("账号已删除");
   }
 
@@ -525,6 +480,7 @@ function App() {
       setUpdateStatus(status);
       if (status.state === "updated" || status.state === "error") setMessage(status.message);
     }).catch(() => undefined);
+    refreshPluginStatus().catch(() => undefined);
 
     let disposed = false;
     const unsubs: Array<() => void> = [];
@@ -575,34 +531,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (selected) {
-      setCredential({
-        displayName: selected.displayName,
-        loginName: selected.loginName || "",
-        password: "",
-        note: selected.note || "",
-      });
-      setRevealed(null);
-    }
-  }, [selected?.id]);
-
-  useEffect(() => {
     if (activeFeature === "switcher" && !scannedOnceRef.current) {
       refreshAccounts(false).catch(() => undefined);
     }
-    if (activeFeature === "plugin") {
+    if (activeFeature === "switcher") {
       refreshPluginStatus().catch(() => undefined);
     }
-  }, [activeFeature]);
-
-  useEffect(() => {
-    if (!revealed) return;
-    const timer = window.setTimeout(() => setRevealed(null), 30000);
-    return () => window.clearTimeout(timer);
-  }, [revealed]);
-
-  useEffect(() => {
-    setRevealed(null);
   }, [activeFeature]);
 
   const overview = (
@@ -610,7 +544,6 @@ function App() {
       <div className="panel">
         <div className="panel-title">
           <h2>OOPZ 状态</h2>
-          <span>{paths?.source || "未校验"}</span>
         </div>
         <dl className="paths">
           <dt>程序</dt><dd>{paths?.oopzExePath || data.config.oopzExePath || "未设置"}</dd>
@@ -633,13 +566,12 @@ function App() {
       <div className="summary-grid">
         <div className="metric"><strong>{data.accounts.length}</strong><span>已保存账号</span></div>
         <div className="metric"><strong>{sessionCount}</strong><span>可快速切换</span></div>
-        <div className="metric"><strong>{credentialCount}</strong><span>已存账号密码</span></div>
+        <div className="metric"><strong>{pluginStatus?.pluginModeEnabled ? "已开启" : "未开启"}</strong><span>插件模式</span></div>
       </div>
 
       <div className="panel">
         <div className="panel-title">
           <h2>最近账号</h2>
-          <span>{selected ? fmtDate(selected.lastUsedAt) : "-"}</span>
         </div>
         {!selected && <div className="empty">还没有保存账号。</div>}
         {selected && (
@@ -685,7 +617,6 @@ function App() {
         <div className="panel">
           <div className="panel-title">
             <h2>快捷分享</h2>
-            {wormholeStatus && <span>{wormholeStatus.direction === "send" ? "分享" : "接收"}</span>}
           </div>
           <div className="quick-transfer">
             <div className="quick-transfer-row">
@@ -708,7 +639,6 @@ function App() {
         <div className="panel detail-panel">
           <div className="panel-title">
             <h2>当前账号</h2>
-            {selected && <span>{selected.hasLoginState ? "可切号" : "需要登录一次"}</span>}
           </div>
           {!selected && <div className="empty">选择一个账号查看详情。</div>}
           {selected && (
@@ -721,67 +651,41 @@ function App() {
                 <dt>手机号</dt><dd>{selected.maskedPhone || "-"}</dd>
                 <dt>账号ID</dt><dd>{selected.uid || "-"}</dd>
                 <dt>最近切换</dt><dd>{fmtDate(selected.lastUsedAt)}</dd>
-                <dt>账号密码</dt><dd>{selected.hasCredential ? "已保存" : "未保存"}</dd>
                 <dt>状态</dt><dd>{accountStatus(selected, data.currentLoginUid)}</dd>
               </dl>
               {!selected.hasLoginState && <div className="notice">这个账号还不能快速切换。请先在 OOPZ 里登录一次，然后回到这里点刷新。</div>}
               <div className="actions">
                 <button className="primary" onClick={() => handleAction(() => switchAccount(selected))} disabled={busy || selected.uid === data.currentLoginUid}>{selected.uid === data.currentLoginUid ? "当前已登录" : selected.hasLoginState ? "切换并重启 OOPZ" : "打开 OOPZ 登录"}</button>
                 {selected.hasLoginState && <button onClick={() => handleAction(() => exportSelectedAccount(selected))} disabled={busy}>导出</button>}
-                {selected.hasCredential && <button onClick={() => handleAction(() => revealCredential(selected))} disabled={busy}>显示账号密码</button>}
                 <button onClick={() => handleAction(() => deleteSelected(selected))} disabled={busy}>删除</button>
               </div>
-              {revealed && (
-                <div className="secret-box">
-                  <button onClick={() => copyText(revealed.loginName)}>复制账号</button>
-                  <button onClick={() => copyText(revealed.password)}>复制密码</button>
-                  <button onClick={() => setRevealed(null)}>隐藏</button>
-                  <code>{revealed.loginName || ""}</code>
-                  <code>{revealed.password || ""}</code>
-                </div>
-              )}
             </>
           )}
         </div>
 
         <div className="panel">
-          <div className="panel-title"><h2>账号密码</h2><span>本机安全保存</span></div>
-          <div className="form">
-            <label>名称<input value={credential.displayName} onChange={(e) => setCredential({ ...credential, displayName: e.target.value })} /></label>
-            <label>账号<input value={credential.loginName} onChange={(e) => setCredential({ ...credential, loginName: e.target.value })} /></label>
-            <label>密码<input type="password" value={credential.password} onChange={(e) => setCredential({ ...credential, password: e.target.value })} /></label>
-            <label>备注<input value={credential.note} onChange={(e) => setCredential({ ...credential, note: e.target.value })} /></label>
-            <button className="primary" onClick={() => handleAction(saveCredential)} disabled={busy}>保存账号密码</button>
+          <div className="panel-title"><h2>插件模式</h2></div>
+          <div className="plugin-toggle-row">
+            <div>
+              <strong>{pluginStatus?.pluginModeEnabled ? "已开启" : "未开启"}</strong>
+              <p>随 OOPZ 显示账号头像浮层</p>
+            </div>
+            <button className={pluginStatus?.pluginModeEnabled ? "" : "primary"} onClick={() => handleAction(() => togglePluginMode(!pluginStatus?.pluginModeEnabled))} disabled={busy}>{pluginStatus?.pluginModeEnabled ? "关闭" : "开启"}</button>
           </div>
-        </div>
-      </div>
-    </section>
-  );
-
-  const plugin = (
-    <section className="content-stack">
-      <div className="panel">
-        <div className="panel-title"><h2>插件模式</h2><span>{pluginStatus?.pluginModeEnabled ? "已开启" : "已关闭"}</span></div>
-        <div className="plugin-toggle-row">
-          <div>
-            <strong>{pluginStatus?.pluginModeEnabled ? "插件模式已开启" : "插件模式未开启"}</strong>
-            <p>开启后只打开 OOPZ 也会自动显示账号头像浮层。</p>
-          </div>
-          <div className="actions">
+          <div className="plugin-controls">
             <div className="segmented-control" aria-label="浮层排列方式">
               <button data-active={!data.config.overlayVertical} onClick={() => handleAction(() => setOverlayLayout(false))} disabled={busy}>横排</button>
               <button data-active={Boolean(data.config.overlayVertical)} onClick={() => handleAction(() => setOverlayLayout(true))} disabled={busy}>竖排</button>
             </div>
             <button onClick={() => handleAction(repairPluginEnvironment)} disabled={busy}>修复环境</button>
-            <button onClick={() => handleAction(resetOverlayPosition)} disabled={busy}>重置浮层位置</button>
-            <button className={pluginStatus?.pluginModeEnabled ? "" : "primary"} onClick={() => handleAction(() => togglePluginMode(!pluginStatus?.pluginModeEnabled))} disabled={busy}>{pluginStatus?.pluginModeEnabled ? "关闭" : "开启"}</button>
+            <button onClick={() => handleAction(resetOverlayPosition)} disabled={busy}>重置位置</button>
+          </div>
+          <div className="plugin-health">
+            <span>守护进程 {pluginStatus?.watcherInstalled ? "已安装" : "未安装"}</span>
+            <span>OOPZ {pluginStatus?.oopzRunning ? "运行中" : "未运行"}</span>
+            <span>浮层 {pluginStatus?.overlayVisible ? "已显示" : "等待中"}</span>
           </div>
         </div>
-      </div>
-      <div className="summary-grid">
-        <div className="metric"><strong>{pluginStatus?.watcherInstalled ? "已安装" : "未安装"}</strong><span>守护进程</span></div>
-        <div className="metric"><strong>{pluginStatus?.oopzRunning ? "运行中" : "未运行"}</strong><span>OOPZ</span></div>
-        <div className="metric"><strong>{pluginStatus?.overlayVisible ? "已显示" : "等待中"}</strong><span>浮层</span></div>
       </div>
     </section>
   );
@@ -793,16 +697,15 @@ function App() {
         <nav className="feature-list">
           <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><strong>概览</strong></button>
           <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><strong>账号切换</strong></button>
-          <button data-active={activeFeature === "plugin"} onClick={() => setActiveFeature("plugin")}><strong>插件模式</strong></button>
         </nav>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <div><h2>{activeFeature === "overview" ? "概览" : activeFeature === "switcher" ? "账号切换" : "插件模式"}</h2></div>
+          <div><h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2></div>
           <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
         </header>
-        {activeFeature === "overview" ? overview : activeFeature === "switcher" ? switcher : plugin}
+        {activeFeature === "overview" ? overview : switcher}
       </section>
     </main>
   );

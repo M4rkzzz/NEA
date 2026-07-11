@@ -224,23 +224,6 @@ struct ImportedCandidate {
     can_switch: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CredentialInput {
-    account_id: Option<String>,
-    display_name: String,
-    login_name: String,
-    password: String,
-    note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CredentialView {
-    login_name: Option<String>,
-    password: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct SecretPayload {
@@ -2064,13 +2047,6 @@ fn write_secret(account_id: &str, payload: &SecretPayload) -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
-fn store_credential(account_id: &str, login_name: &str, password: &str) -> Result<(), String> {
-    let mut payload = read_secret(account_id);
-    payload.login_name = Some(login_name.to_string());
-    payload.password = Some(password.to_string());
-    write_secret(account_id, &payload)
-}
-
 fn store_oopz_login(account_id: &str, login: &str) -> Result<(), String> {
     let mut payload = read_secret(account_id);
     payload.oopz_login = Some(login.to_string());
@@ -2079,14 +2055,6 @@ fn store_oopz_login(account_id: &str, login: &str) -> Result<(), String> {
 
 fn read_oopz_login(account_id: &str) -> Option<String> {
     read_secret(account_id).oopz_login
-}
-
-fn read_credential(account_id: &str) -> Result<CredentialView, String> {
-    let value = read_secret(account_id);
-    Ok(CredentialView {
-        login_name: value.login_name,
-        password: value.password,
-    })
 }
 
 fn delete_credential(account_id: &str) {
@@ -3931,95 +3899,6 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
 }
 
 #[tauri::command]
-async fn save_manual_credential(
-    app: AppHandle,
-    input: CredentialInput,
-) -> Result<SavedAccount, String> {
-    let app_for_task = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_for_task.state::<AppState>();
-        save_manual_credential_inner(app_for_task.clone(), state, input)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-fn save_manual_credential_inner(
-    app: AppHandle,
-    state: State<AppState>,
-    mut input: CredentialInput,
-) -> Result<SavedAccount, String> {
-    let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
-    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
-    input.display_name = input.display_name.trim().to_string();
-    input.login_name = input.login_name.trim().to_string();
-    input.note = input.note.and_then(|note| {
-        let trimmed = note.trim().to_string();
-        (!trimmed.is_empty()).then_some(trimmed)
-    });
-    if input.display_name.is_empty() || input.login_name.is_empty() || input.password.is_empty() {
-        return Err("名称、账号和密码不能为空".to_string());
-    }
-    if let Some(account_id) = input.account_id.as_deref() {
-        if !data.accounts.iter().any(|account| account.id == account_id) {
-            return Err("要更新的账号不存在，请刷新后重试".to_string());
-        }
-    }
-    let timestamp = now();
-    let id = input
-        .account_id
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    store_credential(&id, &input.login_name, &input.password)?;
-
-    let mut account = data
-        .accounts
-        .iter()
-        .find(|a| a.id == id)
-        .cloned()
-        .unwrap_or_else(|| SavedAccount {
-            id: id.clone(),
-            display_name: input.display_name.clone(),
-            uid: None,
-            pid: None,
-            user_common_id: None,
-            masked_phone: None,
-            avatar_url: None,
-            avatar_source_url: None,
-            login_name: None,
-            note: None,
-            has_session_snapshot: false,
-            has_credential: false,
-            has_login_state: false,
-            created_at: timestamp.clone(),
-            updated_at: timestamp.clone(),
-            last_used_at: None,
-        });
-
-    account.display_name = input.display_name;
-    account.login_name = Some(input.login_name);
-    account.note = input.note;
-    account.has_credential = true;
-    account.updated_at = timestamp;
-
-    if let Some(pos) = data.accounts.iter().position(|a| a.id == id) {
-        data.accounts[pos] = account.clone();
-    } else {
-        data.accounts.push(account.clone());
-    }
-    save_data(&data)?;
-    *state.data.lock().map_err(|e| e.to_string())? = data;
-    update_tray(&app);
-    Ok(account)
-}
-
-#[tauri::command]
-async fn reveal_credential(account_id: String) -> Result<CredentialView, String> {
-    tauri::async_runtime::spawn_blocking(move || read_credential(&account_id))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
 async fn delete_account(app: AppHandle, account_id: String) -> Result<(), String> {
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -4370,9 +4249,7 @@ pub fn run() {
             start_quick_export,
             cancel_quick_share,
             quick_import,
-            save_manual_credential,
             cancel_oopz_discovery,
-            reveal_credential,
             delete_account,
             open_oopz,
             switch_account,
