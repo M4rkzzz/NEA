@@ -569,6 +569,17 @@ button.primary {
   accent-color: #2563eb;
 }
 
+.update-percent {
+  margin-top: 12px;
+  color: #4b5563;
+  font-size: 12px;
+}
+
+.update-percent strong {
+  color: #1d4ed8;
+  font-variant-numeric: tabular-nums;
+}
+
 .segmented-control {
   display: inline-flex;
   height: 34px;

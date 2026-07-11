@@ -80,6 +80,9 @@ type UpdateStatus = {
   currentVersion: string;
   availableVersion?: string;
   message: string;
+  transferred?: number;
+  total?: number;
+  percent?: number;
 };
 
 type WormholeStatus = {
@@ -622,6 +625,9 @@ function App() {
           <button onClick={() => handleAction(restoreBackup)} disabled={busy}>恢复最近备份</button>
           <button onClick={() => handleAction(checkForUpdates)} disabled={busy || updateActive}>检查更新</button>
         </div>
+        {updateStatus?.state === "downloading" && typeof updateStatus.percent === "number" && (
+          <div className="update-percent" aria-live="polite">下载进度 <strong>{updateStatus.percent}%</strong></div>
+        )}
       </div>
 
       <div className="summary-grid">

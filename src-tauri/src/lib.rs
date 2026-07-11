@@ -274,6 +274,12 @@ struct UpdateStatus {
     current_version: String,
     available_version: Option<String>,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -389,6 +395,9 @@ fn initial_update_status() -> UpdateStatus {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         available_version: None,
         message: "自动更新已启用".to_string(),
+        transferred: None,
+        total: None,
+        percent: None,
     }
 }
 
@@ -403,12 +412,44 @@ fn set_update_status(
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         available_version,
         message: message.into(),
+        transferred: None,
+        total: None,
+        percent: None,
     };
     if let Ok(mut current) = app.state::<AppState>().update_status.lock() {
         *current = status.clone();
     }
     let _ = app.emit("update-status", status.clone());
     status
+}
+
+fn download_percent(transferred: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    ((u128::from(transferred) * 100) / u128::from(total)).min(100) as u64
+}
+
+fn set_update_progress(
+    app: &AppHandle,
+    version: &str,
+    transferred: u64,
+    total: u64,
+    message: impl Into<String>,
+) {
+    let status = UpdateStatus {
+        state: "downloading".to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        available_version: Some(version.to_string()),
+        message: message.into(),
+        transferred: Some(transferred),
+        total: Some(total),
+        percent: Some(download_percent(transferred, total)),
+    };
+    if let Ok(mut current) = app.state::<AppState>().update_status.lock() {
+        *current = status.clone();
+    }
+    let _ = app.emit("update-status", status);
 }
 
 fn parse_release_version(value: &str) -> Option<([u64; 3], String)> {
@@ -478,6 +519,7 @@ fn github_proxy_url(asset: &GitHubAsset) -> String {
 }
 
 fn download_update_asset_from_url(
+    app: &AppHandle,
     asset: &GitHubAsset,
     download_url: &str,
     version: &str,
@@ -509,6 +551,7 @@ fn download_update_asset_from_url(
     let mut file = fs::File::create(&partial).map_err(|e| format!("创建更新文件失败: {}", e))?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
+    let mut last_percent = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = response
@@ -525,6 +568,17 @@ fn download_update_asset_from_url(
         file.write_all(&buffer[..count])
             .map_err(|e| format!("保存更新失败: {}", e))?;
         hasher.update(&buffer[..count]);
+        let percent = download_percent(total, asset.size).min(99);
+        if percent > last_percent {
+            last_percent = percent;
+            set_update_progress(
+                app,
+                version,
+                total.min(asset.size),
+                asset.size,
+                format!("正在下载 {}... {}%", version, percent),
+            );
+        }
     }
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
@@ -541,26 +595,54 @@ fn download_update_asset_from_url(
         fs::remove_file(&target).map_err(|e| e.to_string())?;
     }
     fs::rename(&partial, &target).map_err(|e| e.to_string())?;
+    set_update_progress(
+        app,
+        version,
+        asset.size,
+        asset.size,
+        format!("更新安装包 {} 下载并校验完成 100%", version),
+    );
     Ok(target)
 }
 
-fn download_update_asset(asset: &GitHubAsset, version: &str) -> Result<PathBuf, String> {
+fn download_update_asset(
+    app: &AppHandle,
+    asset: &GitHubAsset,
+    version: &str,
+) -> Result<PathBuf, String> {
     let expected_digest = validate_update_asset(asset, version)?;
     let proxy_url = github_proxy_url(asset);
-    match download_update_asset_from_url(asset, &proxy_url, version, expected_digest) {
+    set_update_progress(
+        app,
+        version,
+        0,
+        asset.size,
+        format!("正在通过加速线路下载 {}... 0%", version),
+    );
+    match download_update_asset_from_url(app, asset, &proxy_url, version, expected_digest) {
         Ok(path) => Ok(path),
-        Err(proxy_error) => download_update_asset_from_url(
-            asset,
-            &asset.browser_download_url,
-            version,
-            expected_digest,
-        )
-        .map_err(|github_error| {
-            format!(
-                "下载加速线路失败: {}; GitHub 直链失败: {}",
-                proxy_error, github_error
+        Err(proxy_error) => {
+            set_update_progress(
+                app,
+                version,
+                0,
+                asset.size,
+                format!("加速线路不可用，正在通过 GitHub 下载 {}... 0%", version),
+            );
+            download_update_asset_from_url(
+                app,
+                asset,
+                &asset.browser_download_url,
+                version,
+                expected_digest,
             )
-        }),
+            .map_err(|github_error| {
+                format!(
+                    "下载加速线路失败: {}; GitHub 直链失败: {}",
+                    proxy_error, github_error
+                )
+            })
+        }
     }
 }
 
@@ -727,7 +809,7 @@ fn perform_update_check(app: &AppHandle, manual: bool) -> Result<(), String> {
         Some(version.clone()),
         format!("发现新版本 {}，正在通过加速线路下载...", version),
     );
-    let msi_path = download_update_asset(asset, &version)?;
+    let msi_path = download_update_asset(app, asset, &version)?;
     set_update_status(
         app,
         "installing",
@@ -4705,6 +4787,15 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(update_check_due(&expired));
+    }
+
+    #[test]
+    fn update_download_percent_is_bounded() {
+        assert_eq!(download_percent(0, 100), 0);
+        assert_eq!(download_percent(50, 100), 50);
+        assert_eq!(download_percent(150, 100), 100);
+        assert_eq!(download_percent(50, 0), 0);
+        assert_eq!(download_percent(u64::MAX, u64::MAX), 100);
     }
 
     #[test]
