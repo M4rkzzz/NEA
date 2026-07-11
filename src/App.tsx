@@ -377,8 +377,8 @@ function App() {
       await invoke("cancel_quick_share");
       setWormholeStatus((current) => ({
         state: "cancelling",
-        direction: "send",
-        message: "正在取消分享...",
+        direction: current?.direction || "send",
+        message: current?.direction === "receive" ? "正在取消导入..." : "正在取消分享...",
         code: current?.code,
       }));
     } catch (error) {
@@ -686,7 +686,7 @@ function App() {
               <button onClick={() => void startQuickShare()} disabled={busy || wormholeActive || sessionCount === 0}>快捷分享</button>
               {quickCode && <code className="quick-code">{quickCode}</code>}
               {quickCode && <button onClick={() => copyText(quickCode)} disabled={wormholeActive && wormholeStatus?.direction === "receive"}>复制代码</button>}
-              {wormholeActive && wormholeStatus?.direction === "send" && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus.state === "cancelling"}>取消分享</button>}
+              {wormholeActive && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus?.state === "cancelling"}>{wormholeStatus?.direction === "receive" ? "取消导入" : "取消分享"}</button>}
             </div>
             <div className="quick-transfer-row">
               <input value={receiveCode} onChange={(event) => setReceiveCode(event.target.value)} placeholder="输入快捷码" disabled={busy || wormholeActive} />

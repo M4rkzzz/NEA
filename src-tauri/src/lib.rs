@@ -7,7 +7,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
@@ -27,7 +27,9 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::core::w;
+use windows::Win32::Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, HWND, LPARAM, RECT};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -35,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
 };
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const APP_DIR_NAME: &str = "OOPZ+";
 const CREDENTIAL_SERVICE: &str = "OOPZ+";
@@ -43,7 +46,10 @@ const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const LEGACY_EXPORT_FORMAT: &str = "oopz-plus-account-v1";
 const EXPORT_FORMAT: &str = "oopz-plus-package-v2";
+const EXPORT_FORMAT_V3: &str = "oopz-plus-package-v3";
 const MAX_EXPORT_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_V3_ARCHIVE_BYTES: u64 = 528 * 1024 * 1024;
+const MAX_LEGACY_EXPORT_PACKAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXPORT_ACCOUNTS: usize = 100;
 const MAX_EXPORT_FILES: usize = 100_000;
 const WORMHOLE_TIMEOUT_SECONDS: u64 = 10 * 60;
@@ -106,6 +112,42 @@ struct AccountExportPackage {
     format: String,
     exported_at: String,
     accounts: Vec<ExportedAccountEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct V3AccountManifest {
+    directory: String,
+    account: ExportedAccount,
+    oopz_login: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct V3ExportManifest {
+    format: String,
+    exported_at: String,
+    accounts: Vec<V3AccountManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImportJournalEntry {
+    account_id: String,
+    had_snapshot: bool,
+    credential_backup_id: String,
+    phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImportJournal {
+    id: String,
+    status: String,
+    config_existed: bool,
+    entries: Vec<ImportJournalEntry>,
+}
+
+struct PreparedImportAccount {
+    account: SavedAccount,
+    oopz_login: String,
+    staged_snapshot: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +323,29 @@ struct AppState {
     update_status: Mutex<UpdateStatus>,
     wormhole_running: AtomicBool,
     wormhole_cancelled: AtomicBool,
+}
+
+struct NamedMutex(HANDLE);
+
+impl Drop for NamedMutex {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn acquire_plugin_runtime_mutex() -> Result<Option<NamedMutex>, String> {
+    unsafe {
+        let handle = CreateMutexW(None, false, w!("Local\\OOPZPlus.PluginRuntime"))
+            .map_err(|e| format!("创建插件单实例锁失败: {}", e))?;
+        if GetLastError().is_err() {
+            let _ = CloseHandle(handle);
+            Ok(None)
+        } else {
+            Ok(Some(NamedMutex(handle)))
+        }
+    }
 }
 
 fn now() -> String {
@@ -930,8 +995,7 @@ fn is_oopz_process_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("oopz.exe") || name.eq_ignore_ascii_case("oopz")
 }
 
-fn running_oopz_exe() -> Option<PathBuf> {
-    let system = System::new_all();
+fn running_oopz_exe_in(system: &System) -> Option<PathBuf> {
     system
         .processes()
         .values()
@@ -944,8 +1008,11 @@ fn running_oopz_exe() -> Option<PathBuf> {
         })
 }
 
-fn is_plugin_runtime_running() -> bool {
-    let system = System::new_all();
+fn running_oopz_exe() -> Option<PathBuf> {
+    running_oopz_exe_in(&System::new_all())
+}
+
+fn is_plugin_runtime_running_in(system: &System) -> bool {
     system.processes().values().any(|process| {
         (process.name().eq_ignore_ascii_case("oopz-plus.exe")
             || process.name().eq_ignore_ascii_case(WATCHER_FILE_NAME))
@@ -953,13 +1020,20 @@ fn is_plugin_runtime_running() -> bool {
     })
 }
 
-fn is_watcher_running() -> bool {
-    let system = System::new_all();
+fn is_plugin_runtime_running() -> bool {
+    is_plugin_runtime_running_in(&System::new_all())
+}
+
+fn is_watcher_running_in(system: &System) -> bool {
     system.processes().values().any(|process| {
         (process.name().eq_ignore_ascii_case("oopz-plus.exe")
             || process.name().eq_ignore_ascii_case(WATCHER_FILE_NAME))
             && process.cmd().iter().any(|arg| arg == "--watcher")
     })
+}
+
+fn is_watcher_running() -> bool {
+    is_watcher_running_in(&System::new_all())
 }
 
 fn stop_watcher() {
@@ -1093,13 +1167,24 @@ fn ensure_plugin_runtime_after_oopz_start(config: AppConfig) {
 }
 
 fn watcher_loop() {
+    let mut system = System::new_all();
+    let mut config_modified = None;
+    let mut plugin_enabled = false;
     loop {
-        let data = load_data();
-        if !data.config.plugin_mode_enabled {
+        let modified = config_path()
+            .ok()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok());
+        if modified != config_modified {
+            config_modified = modified;
+            plugin_enabled = load_data().config.plugin_mode_enabled;
+        }
+        if !plugin_enabled {
             thread::sleep(Duration::from_secs(3));
             continue;
         }
-        if running_oopz_exe().is_some() && !is_plugin_runtime_running() {
+        system.refresh_processes();
+        if running_oopz_exe_in(&system).is_some() && !is_plugin_runtime_running_in(&system) {
             let _ = spawn_plugin_runtime();
         }
         thread::sleep(Duration::from_secs(3));
@@ -1133,8 +1218,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     BOOL(1)
 }
 
-fn oopz_process_ids() -> Vec<u32> {
-    let system = System::new_all();
+fn oopz_process_ids_in(system: &System) -> Vec<u32> {
     system
         .processes()
         .iter()
@@ -1142,8 +1226,11 @@ fn oopz_process_ids() -> Vec<u32> {
         .collect()
 }
 
-fn oopz_window_info() -> Option<(HWND, RECT)> {
-    let pids = oopz_process_ids();
+fn oopz_process_ids() -> Vec<u32> {
+    oopz_process_ids_in(&System::new_all())
+}
+
+fn oopz_window_info_for_pids(pids: Vec<u32>) -> Option<(HWND, RECT)> {
     if pids.is_empty() {
         return None;
     }
@@ -1159,6 +1246,10 @@ fn oopz_window_info() -> Option<(HWND, RECT)> {
         );
     }
     search.hwnd.zip(search.rect)
+}
+
+fn oopz_window_info() -> Option<(HWND, RECT)> {
+    oopz_window_info_for_pids(oopz_process_ids())
 }
 
 fn overlay_dimensions(account_count: usize, vertical: bool) -> (u32, u32) {
@@ -1865,6 +1956,16 @@ fn credential_entry(account_id: &str) -> Result<Entry, String> {
     Entry::new(CREDENTIAL_SERVICE, account_id).map_err(|e| e.to_string())
 }
 
+fn read_secret_raw(account_id: &str) -> Option<String> {
+    credential_entry(account_id).ok()?.get_password().ok()
+}
+
+fn write_secret_raw(account_id: &str, raw: &str) -> Result<(), String> {
+    credential_entry(account_id)?
+        .set_password(raw)
+        .map_err(|e| e.to_string())
+}
+
 fn read_secret(account_id: &str) -> SecretPayload {
     let Ok(payload) = credential_entry(account_id)
         .and_then(|entry| entry.get_password().map_err(|e| e.to_string()))
@@ -1914,36 +2015,6 @@ fn delete_credential(account_id: &str) {
 
 fn account_snapshot_dir(account_id: &str) -> Result<PathBuf, String> {
     Ok(accounts_dir()?.join(account_id).join("snapshot"))
-}
-
-fn collect_export_files(
-    root: &Path,
-    current: &Path,
-    files: &mut Vec<ExportedFile>,
-) -> Result<(), String> {
-    if !current.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(current).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        if file_type.is_dir() {
-            collect_export_files(root, &path, files)?;
-        } else if file_type.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|e| e.to_string())?
-                .to_string_lossy()
-                .replace('\\', "/");
-            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-            files.push(ExportedFile {
-                path: relative,
-                data_base64: general_purpose::STANDARD.encode(bytes),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
@@ -2238,13 +2309,19 @@ fn plugin_status_inner(state: &AppState) -> Result<PluginStatus, String> {
         .map_err(|e| e.to_string())?
         .config
         .plugin_mode_enabled;
+    let system = System::new_all();
+    let watcher_running = is_watcher_running_in(&system);
+    let plugin_runtime_running = is_plugin_runtime_running_in(&system);
+    let oopz_pids = oopz_process_ids_in(&system);
+    let oopz_running = !oopz_pids.is_empty();
+    let overlay_visible = oopz_window_info_for_pids(oopz_pids).is_some() && plugin_runtime_running;
     Ok(PluginStatus {
         plugin_mode_enabled,
         watcher_installed: watcher_installed(),
-        watcher_running: is_watcher_running(),
-        plugin_runtime_running: is_plugin_runtime_running(),
-        oopz_running: running_oopz_exe().is_some(),
-        overlay_visible: oopz_window_info().is_some() && is_plugin_runtime_running(),
+        watcher_running,
+        plugin_runtime_running,
+        oopz_running,
+        overlay_visible,
     })
 }
 
@@ -2597,43 +2674,45 @@ fn import_account_inner(
     Ok(account)
 }
 
-fn build_export_entry(account: &SavedAccount) -> Result<ExportedAccountEntry, String> {
-    let oopz_login = read_oopz_login(&account.id)
-        .ok_or_else(|| "这个账号还不能导出，请先登录一次".to_string())?;
-    let snapshot = account_snapshot_dir(&account.id)?;
-    if !saved_snapshot_exists(account) {
-        return Err("这个账号还没有可导出的本地数据".to_string());
+fn collect_export_paths(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(PathBuf, String, u64)>,
+    total_size: &mut u64,
+) -> Result<(), String> {
+    if !current.exists() {
+        return Ok(());
     }
-    let mut files = Vec::new();
-    collect_export_files(&snapshot, &snapshot, &mut files)?;
-    if files.is_empty() {
-        return Err("这个账号还没有可导出的本地数据".to_string());
+    for entry in fs::read_dir(current).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            collect_export_paths(root, &path, files, total_size)?;
+        } else if file_type.is_file() {
+            if files.len() >= MAX_EXPORT_FILES {
+                return Err("导出文件数量过多".to_string());
+            }
+            let size = entry.metadata().map_err(|e| e.to_string())?.len();
+            *total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| "导出数据大小溢出".to_string())?;
+            if *total_size > MAX_EXPORT_PACKAGE_BYTES {
+                return Err("导出数据超过 512 MB，请减少账号后重试".to_string());
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            safe_relative_path(&relative)?;
+            files.push((path, relative, size));
+        }
     }
-    Ok(ExportedAccountEntry {
-        account: ExportedAccount {
-            display_name: account.display_name.clone(),
-            uid: account.uid.clone(),
-            pid: account.pid.clone(),
-            user_common_id: account.user_common_id.clone(),
-            masked_phone: account.masked_phone.clone(),
-            avatar_url: account.avatar_url.clone(),
-            note: account.note.clone(),
-        },
-        oopz_login,
-        files,
-    })
+    Ok(())
 }
 
-fn write_export_package(path: &Path, accounts: Vec<ExportedAccountEntry>) -> Result<(), String> {
-    let package = AccountExportPackage {
-        format: EXPORT_FORMAT.to_string(),
-        exported_at: now(),
-        accounts,
-    };
-    let raw = serde_json::to_string_pretty(&package).map_err(|e| e.to_string())?;
-    if raw.len() as u64 > MAX_EXPORT_PACKAGE_BYTES {
-        return Err("导出数据超过 512 MB，请减少账号后重试".to_string());
-    }
+fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2646,7 +2725,68 @@ fn write_export_package(path: &Path, accounts: Vec<ExportedAccountEntry>) -> Res
     let suffix = Uuid::new_v4();
     let temp = parent.join(format!(".{}.{}.tmp", name, suffix));
     let backup = parent.join(format!(".{}.{}.bak", name, suffix));
-    fs::write(&temp, raw).map_err(|e| format!("写入导出文件失败: {}", e))?;
+
+    let mut manifest_accounts = Vec::with_capacity(accounts.len());
+    let mut account_files = Vec::with_capacity(accounts.len());
+    let mut total_size = 0u64;
+    for (index, account) in accounts.iter().enumerate() {
+        let oopz_login = read_oopz_login(&account.id)
+            .ok_or_else(|| format!("{} 还不能导出，请先登录一次", account.display_name))?;
+        let snapshot = account_snapshot_dir(&account.id)?;
+        let mut files = Vec::new();
+        collect_export_paths(&snapshot, &snapshot, &mut files, &mut total_size)?;
+        if files.is_empty() {
+            return Err(format!("{} 没有可导出的本地数据", account.display_name));
+        }
+        let directory = format!("account-{:03}", index);
+        manifest_accounts.push(V3AccountManifest {
+            directory: directory.clone(),
+            account: ExportedAccount {
+                display_name: account.display_name.clone(),
+                uid: account.uid.clone(),
+                pid: account.pid.clone(),
+                user_common_id: account.user_common_id.clone(),
+                masked_phone: account.masked_phone.clone(),
+                avatar_url: account.avatar_url.clone(),
+                note: account.note.clone(),
+            },
+            oopz_login,
+        });
+        account_files.push((directory, files));
+    }
+
+    let result = (|| -> Result<(), String> {
+        let file = fs::File::create(&temp).map_err(|e| format!("创建导出文件失败: {}", e))?;
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        archive
+            .start_file("manifest.json", options)
+            .map_err(|e| e.to_string())?;
+        let manifest = V3ExportManifest {
+            format: EXPORT_FORMAT_V3.to_string(),
+            exported_at: now(),
+            accounts: manifest_accounts,
+        };
+        serde_json::to_writer(&mut archive, &manifest).map_err(|e| e.to_string())?;
+        for (directory, files) in account_files {
+            for (source, relative, _) in files {
+                archive
+                    .start_file(format!("accounts/{}/{}", directory, relative), options)
+                    .map_err(|e| e.to_string())?;
+                let mut source = fs::File::open(source).map_err(|e| e.to_string())?;
+                std::io::copy(&mut source, &mut archive).map_err(|e| e.to_string())?;
+            }
+        }
+        archive.finish().map_err(|e| e.to_string())?;
+        if fs::metadata(&temp).map_err(|e| e.to_string())?.len() > MAX_V3_ARCHIVE_BYTES {
+            return Err("v3 导出包超过文件大小限制".to_string());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     if path.exists() {
         fs::rename(path, &backup).map_err(|e| format!("备份原导出文件失败: {}", e))?;
     }
@@ -2693,15 +2833,8 @@ fn export_account_package_inner(
     if accounts.len() > MAX_EXPORT_ACCOUNTS {
         return Err(format!("一次最多导出 {} 个账号", MAX_EXPORT_ACCOUNTS));
     }
-    let mut exported = Vec::with_capacity(accounts.len());
-    for account in &accounts {
-        exported.push(
-            build_export_entry(account)
-                .map_err(|error| format!("{} 导出失败: {}", account.display_name, error))?,
-        );
-    }
-    let count = exported.len();
-    write_export_package(path, exported)?;
+    let count = accounts.len();
+    write_export_package_v3(path, &accounts)?;
     Ok(count)
 }
 
@@ -2731,8 +2864,8 @@ fn read_export_package(path: &Path) -> Result<Vec<ExportedAccountEntry>, String>
     let size = fs::metadata(path)
         .map_err(|e| format!("读取导入文件失败: {}", e))?
         .len();
-    if size == 0 || size > MAX_EXPORT_PACKAGE_BYTES {
-        return Err("导入文件为空或超过 512 MB".to_string());
+    if size == 0 || size > MAX_LEGACY_EXPORT_PACKAGE_BYTES {
+        return Err("旧版导入文件为空或超过 128 MB，请先使用旧客户端拆分账号".to_string());
     }
     let raw = fs::read_to_string(path).map_err(|e| format!("读取导入文件失败: {}", e))?;
     let value: serde_json::Value =
@@ -2791,11 +2924,8 @@ fn read_export_package(path: &Path) -> Result<Vec<ExportedAccountEntry>, String>
     Ok(accounts)
 }
 
-fn import_export_entry(
-    data: &mut AppData,
-    package: ExportedAccountEntry,
-) -> Result<SavedAccount, String> {
-    let existing_id = package.account.uid.as_ref().and_then(|uid| {
+fn imported_account_from_export(data: &AppData, exported: ExportedAccount) -> SavedAccount {
+    let existing_id = exported.uid.as_ref().and_then(|uid| {
         data.accounts
             .iter()
             .find(|account| account.uid.as_ref() == Some(uid))
@@ -2806,25 +2936,22 @@ fn import_export_entry(
         .and_then(|id| data.accounts.iter().find(|account| account.id == *id))
         .cloned();
     let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let snapshot = account_snapshot_dir(&id)?;
-    write_export_files(&snapshot, &package.files)?;
-    store_oopz_login(&id, &package.oopz_login)?;
     let timestamp = now();
-    let account = SavedAccount {
+    SavedAccount {
         id: id.clone(),
-        display_name: package.account.display_name,
-        uid: package.account.uid,
-        pid: package.account.pid,
-        user_common_id: package.account.user_common_id,
-        masked_phone: package.account.masked_phone,
-        avatar_url: package.account.avatar_url,
+        display_name: exported.display_name,
+        uid: exported.uid,
+        pid: exported.pid,
+        user_common_id: exported.user_common_id,
+        masked_phone: exported.masked_phone,
+        avatar_url: exported.avatar_url,
         avatar_source_url: existing_account
             .as_ref()
             .and_then(|account| account.avatar_source_url.clone()),
         login_name: existing_account
             .as_ref()
             .and_then(|account| account.login_name.clone()),
-        note: package.account.note.or_else(|| {
+        note: exported.note.or_else(|| {
             existing_account
                 .as_ref()
                 .and_then(|account| account.note.clone())
@@ -2841,27 +2968,436 @@ fn import_export_entry(
             .unwrap_or_else(|| timestamp.clone()),
         updated_at: timestamp,
         last_used_at: existing_account.and_then(|account| account.last_used_at),
-    };
-    if let Some(pos) = data.accounts.iter().position(|account| account.id == id) {
-        data.accounts[pos] = account.clone();
-    } else {
-        data.accounts.push(account.clone());
     }
-    Ok(account)
+}
+
+const MISSING_CREDENTIAL_MARKER: &str = "OOPZPLUS_TRANSACTION_NO_CREDENTIAL";
+
+fn valid_storage_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn import_transactions_dir() -> Result<PathBuf, String> {
+    Ok(storage_dir()?.join(".transactions"))
+}
+
+fn write_import_journal(root: &Path, journal: &ImportJournal) -> Result<(), String> {
+    let path = root.join("journal.json");
+    let temp = root.join("journal.json.tmp");
+    let raw = serde_json::to_vec_pretty(journal).map_err(|e| e.to_string())?;
+    fs::write(&temp, raw).map_err(|e| e.to_string())?;
+    fs::rename(temp, path).map_err(|e| e.to_string())
+}
+
+fn cleanup_transaction_credentials(journal: &ImportJournal) {
+    for entry in &journal.entries {
+        delete_credential(&entry.credential_backup_id);
+    }
+}
+
+fn rollback_snapshot_entry(
+    root: &Path,
+    entry: &ImportJournalEntry,
+    target: &Path,
+) -> Result<(), String> {
+    let backup = root.join("backup").join(&entry.account_id).join("snapshot");
+    if backup.exists() {
+        if target.exists() {
+            fs::remove_dir_all(target).map_err(|e| e.to_string())?;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::rename(backup, target).map_err(|e| e.to_string())?;
+    } else if !entry.had_snapshot && entry.phase != "pending" && target.exists() {
+        fs::remove_dir_all(target).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn rollback_import_transaction(root: &Path, journal: &ImportJournal) -> Result<(), String> {
+    let mut first_error = None;
+    for entry in &journal.entries {
+        if !valid_storage_id(&entry.account_id) {
+            first_error.get_or_insert_with(|| "导入事务包含无效账号 ID".to_string());
+            continue;
+        }
+        let target = account_snapshot_dir(&entry.account_id)?;
+        if let Err(error) = rollback_snapshot_entry(root, entry, &target) {
+            first_error.get_or_insert(error);
+        }
+        if let Some(raw) = read_secret_raw(&entry.credential_backup_id) {
+            let result = if raw == MISSING_CREDENTIAL_MARKER {
+                delete_credential(&entry.account_id);
+                Ok(())
+            } else {
+                write_secret_raw(&entry.account_id, &raw)
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let config = config_path()?;
+    let config_backup = root.join("config.backup");
+    if journal.config_existed && config_backup.exists() {
+        if let Err(error) = fs::copy(config_backup, config) {
+            first_error.get_or_insert_with(|| error.to_string());
+        }
+    } else if !journal.config_existed {
+        let _ = fs::remove_file(config);
+    }
+    cleanup_transaction_credentials(journal);
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+}
+
+fn recover_import_transactions() {
+    let Ok(base) = import_transactions_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let root = entry.path();
+        if !root.is_dir() {
+            continue;
+        }
+        let journal = fs::read(root.join("journal.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<ImportJournal>(&raw).ok());
+        match journal {
+            Some(journal) if journal.status == "committed" => {
+                cleanup_transaction_credentials(&journal);
+                let _ = fs::remove_dir_all(root);
+            }
+            Some(journal) => {
+                let _ = rollback_import_transaction(&root, &journal);
+            }
+            None => {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+}
+
+fn commit_prepared_import(
+    app: &AppHandle,
+    root: &Path,
+    mut data: AppData,
+    prepared: Vec<PreparedImportAccount>,
+) -> Result<Vec<SavedAccount>, String> {
+    let config = config_path()?;
+    let config_existed = config.exists();
+    if config_existed {
+        fs::copy(&config, root.join("config.backup")).map_err(|e| e.to_string())?;
+    }
+    let mut journal = ImportJournal {
+        id: root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        status: "prepared".to_string(),
+        config_existed,
+        entries: Vec::with_capacity(prepared.len()),
+    };
+    for item in &prepared {
+        if !valid_storage_id(&item.account.id) {
+            return Err("导入账号 ID 无效".to_string());
+        }
+        let backup_id = format!("__transaction-{}-{}", journal.id, item.account.id);
+        journal.entries.push(ImportJournalEntry {
+            account_id: item.account.id.clone(),
+            had_snapshot: account_snapshot_dir(&item.account.id)?.exists(),
+            credential_backup_id: backup_id,
+            phase: "pending".to_string(),
+        });
+    }
+    if let Err(error) = write_import_journal(root, &journal) {
+        let _ = fs::remove_dir_all(root);
+        return Err(error);
+    }
+    for entry in &journal.entries {
+        let old_raw = read_secret_raw(&entry.account_id)
+            .unwrap_or_else(|| MISSING_CREDENTIAL_MARKER.to_string());
+        if let Err(error) = write_secret_raw(&entry.credential_backup_id, &old_raw) {
+            delete_credential(&entry.credential_backup_id);
+            let rollback = rollback_import_transaction(root, &journal).err();
+            return match rollback {
+                Some(rollback) => Err(format!("{}；清理事务失败: {}", error, rollback)),
+                None => Err(error),
+            };
+        }
+    }
+
+    let commit_result = (|| -> Result<Vec<SavedAccount>, String> {
+        for item in &prepared {
+            let entry_index = journal
+                .entries
+                .iter()
+                .position(|entry| entry.account_id == item.account.id)
+                .ok_or_else(|| "导入事务清单不完整".to_string())?;
+            journal.entries[entry_index].phase = "replacing".to_string();
+            write_import_journal(root, &journal)?;
+            let target = account_snapshot_dir(&item.account.id)?;
+            let backup = root.join("backup").join(&item.account.id).join("snapshot");
+            if target.exists() {
+                if let Some(parent) = backup.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::rename(&target, &backup).map_err(|e| e.to_string())?;
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::rename(&item.staged_snapshot, &target).map_err(|e| e.to_string())?;
+            journal.entries[entry_index].phase = "snapshot-moved".to_string();
+            write_import_journal(root, &journal)?;
+        }
+        journal.status = "snapshots-committed".to_string();
+        write_import_journal(root, &journal)?;
+        for item in &prepared {
+            store_oopz_login(&item.account.id, &item.oopz_login)?;
+            if let Some(pos) = data
+                .accounts
+                .iter()
+                .position(|account| account.id == item.account.id)
+            {
+                data.accounts[pos] = item.account.clone();
+            } else {
+                data.accounts.push(item.account.clone());
+            }
+        }
+        save_data(&data)?;
+        *app.state::<AppState>()
+            .data
+            .lock()
+            .map_err(|e| e.to_string())? = data;
+        journal.status = "committed".to_string();
+        write_import_journal(root, &journal)?;
+        Ok(prepared.iter().map(|item| item.account.clone()).collect())
+    })();
+
+    match commit_result {
+        Ok(imported) => {
+            cleanup_transaction_credentials(&journal);
+            let _ = fs::remove_dir_all(root);
+            Ok(imported)
+        }
+        Err(error) => {
+            let rollback_error = rollback_import_transaction(root, &journal).err();
+            *app.state::<AppState>()
+                .data
+                .lock()
+                .map_err(|e| e.to_string())? = load_data();
+            match rollback_error {
+                Some(rollback) => Err(format!("{}；回滚失败: {}", error, rollback)),
+                None => Err(error),
+            }
+        }
+    }
+}
+
+fn prepare_legacy_import(
+    root: &Path,
+    data: &AppData,
+    packages: Vec<ExportedAccountEntry>,
+) -> Result<Vec<PreparedImportAccount>, String> {
+    let mut prepared = Vec::with_capacity(packages.len());
+    for package in packages {
+        let account = imported_account_from_export(data, package.account);
+        let staged_snapshot = root.join("staging").join(&account.id).join("snapshot");
+        write_export_files(&staged_snapshot, &package.files)?;
+        prepared.push(PreparedImportAccount {
+            account,
+            oopz_login: package.oopz_login,
+            staged_snapshot,
+        });
+    }
+    Ok(prepared)
+}
+
+fn read_v3_manifest(archive: &mut ZipArchive<fs::File>) -> Result<V3ExportManifest, String> {
+    let mut manifest_file = archive
+        .by_name("manifest.json")
+        .map_err(|_| "v3 导入包缺少 manifest.json".to_string())?;
+    if manifest_file.size() > 1024 * 1024 {
+        return Err("导入清单过大".to_string());
+    }
+    let mut raw = Vec::with_capacity(manifest_file.size() as usize);
+    manifest_file
+        .read_to_end(&mut raw)
+        .map_err(|e| e.to_string())?;
+    let manifest: V3ExportManifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if manifest.format != EXPORT_FORMAT_V3
+        || manifest.accounts.is_empty()
+        || manifest.accounts.len() > MAX_EXPORT_ACCOUNTS
+    {
+        return Err("v3 导入清单无效".to_string());
+    }
+    Ok(manifest)
+}
+
+fn prepare_v3_import(
+    root: &Path,
+    data: &AppData,
+    path: &Path,
+) -> Result<Vec<PreparedImportAccount>, String> {
+    if fs::metadata(path).map_err(|e| e.to_string())?.len() > MAX_V3_ARCHIVE_BYTES {
+        return Err("v3 导入包超过文件大小限制".to_string());
+    }
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("打开 v3 导入包失败: {}", e))?;
+    let manifest = read_v3_manifest(&mut archive)?;
+    let mut directory_indexes = HashMap::new();
+    let mut imported_uids = HashSet::new();
+    let mut account_ids = HashSet::new();
+    let mut prepared = Vec::with_capacity(manifest.accounts.len());
+    for item in manifest.accounts {
+        if item.directory.is_empty()
+            || !item
+                .directory
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            || directory_indexes.contains_key(&item.directory)
+            || item.account.display_name.trim().is_empty()
+            || item.oopz_login.trim().is_empty()
+        {
+            return Err("v3 导入清单包含无效账号".to_string());
+        }
+        if item
+            .account
+            .uid
+            .as_ref()
+            .is_some_and(|uid| !imported_uids.insert(uid.clone()))
+        {
+            return Err("v3 导入清单包含重复账号".to_string());
+        }
+        let account = imported_account_from_export(data, item.account);
+        if !account_ids.insert(account.id.clone()) {
+            return Err("v3 导入清单包含重复目标账号".to_string());
+        }
+        let prepared_index = prepared.len();
+        directory_indexes.insert(item.directory.clone(), prepared_index);
+        let staged_snapshot = root.join("staging").join(&account.id).join("snapshot");
+        fs::create_dir_all(&staged_snapshot).map_err(|e| e.to_string())?;
+        prepared.push(PreparedImportAccount {
+            account,
+            oopz_login: item.oopz_login,
+            staged_snapshot,
+        });
+    }
+
+    let mut seen = HashSet::new();
+    let mut files_per_directory = HashMap::<String, usize>::new();
+    let mut total_size = 0u64;
+    let mut manifest_count = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        let name = entry.name().replace('\\', "/");
+        if name == "manifest.json" {
+            manifest_count += 1;
+            continue;
+        }
+        if name.ends_with('/') {
+            continue;
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err("v3 导入包不能包含符号链接".to_string());
+        }
+        let Some(rest) = name.strip_prefix("accounts/") else {
+            return Err("v3 导入包包含未知文件".to_string());
+        };
+        let Some((directory, relative)) = rest.split_once('/') else {
+            return Err("v3 导入包路径无效".to_string());
+        };
+        let relative_path = safe_relative_path(relative)?;
+        if relative_path.as_os_str().is_empty()
+            || !seen.insert((directory.to_string(), relative.to_string()))
+        {
+            return Err("v3 导入包包含重复或无效路径".to_string());
+        }
+        if entry.size() > MAX_EXPORT_PACKAGE_BYTES || seen.len() > MAX_EXPORT_FILES {
+            return Err("v3 导入包内容超过限制".to_string());
+        }
+        let prepared_index = directory_indexes
+            .get(directory)
+            .copied()
+            .ok_or_else(|| "v3 导入包账号目录不存在".to_string())?;
+        let target = prepared[prepared_index].staged_snapshot.join(relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut output = fs::File::create(target).map_err(|e| e.to_string())?;
+        let remaining = MAX_EXPORT_PACKAGE_BYTES.saturating_sub(total_size);
+        let written = std::io::copy(&mut entry.by_ref().take(remaining + 1), &mut output)
+            .map_err(|e| e.to_string())?;
+        total_size = total_size
+            .checked_add(written)
+            .ok_or_else(|| "导入数据大小溢出".to_string())?;
+        if total_size > MAX_EXPORT_PACKAGE_BYTES {
+            return Err("v3 导入包内容超过限制".to_string());
+        }
+        if written != entry.size() {
+            return Err("v3 导入包文件大小不一致".to_string());
+        }
+        *files_per_directory
+            .entry(directory.to_string())
+            .or_default() += 1;
+    }
+    if manifest_count != 1 {
+        return Err("v3 导入包必须包含唯一清单".to_string());
+    }
+    for directory in directory_indexes.keys() {
+        if files_per_directory.get(directory).copied().unwrap_or(0) == 0 {
+            return Err("v3 导入包缺少账号文件".to_string());
+        }
+    }
+    Ok(prepared)
+}
+
+fn is_v3_package(path: &Path) -> bool {
+    let mut header = [0u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header == *b"PK\x03\x04"
 }
 
 fn import_account_package_inner(app: &AppHandle, path: &Path) -> Result<Vec<SavedAccount>, String> {
-    let packages = read_export_package(path)?;
     let state = app.state::<AppState>();
     let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
-    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
-    let mut imported = Vec::with_capacity(packages.len());
-    for package in packages {
-        imported.push(import_export_entry(&mut data, package)?);
-    }
+    let data = state.data.lock().map_err(|e| e.to_string())?.clone();
+    let transaction_id = Uuid::new_v4().to_string();
+    let root = import_transactions_dir()?.join(&transaction_id);
+    fs::create_dir_all(root.join("staging")).map_err(|e| e.to_string())?;
+    let prepared_result = if is_v3_package(path) {
+        prepare_v3_import(&root, &data, path)
+    } else {
+        read_export_package(path).and_then(|packages| prepare_legacy_import(&root, &data, packages))
+    };
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error);
+        }
+    };
     let config = data.config.clone();
-    save_data(&data)?;
-    *state.data.lock().map_err(|e| e.to_string())? = data;
+    let imported = commit_prepared_import(app, &root, data, prepared)?;
     update_tray(app);
     ensure_plugin_runtime_for_oopz(&config);
     let _ = app.emit("app-data-changed", ());
@@ -2940,7 +3476,6 @@ fn cancel_quick_share(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
     state.wormhole_cancelled.store(true, Ordering::SeqCst);
-    emit_wormhole_status(&app, "cancelling", "send", "正在取消分享...", None, None);
     Ok(())
 }
 
@@ -3177,7 +3712,7 @@ async fn receive_wormhole_package(
     .ok_or_else(|| "对方已取消传输".to_string())?;
     if !request.file_name().ends_with(".oopz+")
         || request.file_size() == 0
-        || request.file_size() > MAX_EXPORT_PACKAGE_BYTES
+        || request.file_size() > MAX_V3_ARCHIVE_BYTES
     {
         let _ = request.reject().await;
         return Err("对方发送的不是有效 OOPZ+ 登录态包".to_string());
@@ -3257,10 +3792,13 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
         None,
     );
     let package_path = wormhole_temp_package("oopz-plus-receive");
-    let receive_result = tokio::time::timeout(
-        Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS),
-        receive_wormhole_package(&app, code, &package_path),
-    )
+    let receive_app = app.clone();
+    let receive_result = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
+        tokio::select! {
+            result = receive_wormhole_package(&app, code, &package_path) => result,
+            _ = wait_for_quick_share_cancel(receive_app) => Err(QUICK_SHARE_CANCELLED.to_string()),
+        }
+    })
     .await;
     let result = match receive_result {
         Ok(Ok(())) => {
@@ -3294,6 +3832,14 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
             "complete",
             "receive",
             format!("快捷导入完成，共 {} 个账号", accounts.len()),
+            None,
+            None,
+        ),
+        Err(error) if error == QUICK_SHARE_CANCELLED => emit_wormhole_status(
+            &app,
+            "cancelled",
+            "receive",
+            QUICK_SHARE_CANCELLED,
             None,
             None,
         ),
@@ -3679,6 +4225,21 @@ pub fn run() {
         return;
     }
     let plugin_runtime = args.iter().any(|arg| arg == "--plugin-runtime");
+    let _plugin_runtime_mutex = if plugin_runtime {
+        match acquire_plugin_runtime_mutex() {
+            Ok(Some(handle)) => Some(handle),
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("{}", error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if !plugin_runtime {
+        recover_import_transactions();
+    }
     let updater_cleanup = args
         .iter()
         .position(|arg| arg == "--cleanup-updater")
@@ -3950,6 +4511,101 @@ mod tests {
         };
         fs::write(&path, serde_json::to_vec(&duplicate_package).unwrap()).unwrap();
         assert!(read_export_package(&path).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v3_packages_extract_streamingly_and_reject_path_traversal() {
+        let root = std::env::temp_dir().join(format!("oopz-plus-v3-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = V3ExportManifest {
+            format: EXPORT_FORMAT_V3.to_string(),
+            exported_at: now(),
+            accounts: vec![V3AccountManifest {
+                directory: "account-000".to_string(),
+                account: ExportedAccount {
+                    display_name: "account".to_string(),
+                    uid: Some("uid-1".to_string()),
+                    pid: None,
+                    user_common_id: None,
+                    masked_phone: None,
+                    avatar_url: None,
+                    note: None,
+                },
+                oopz_login: "login-state".to_string(),
+            }],
+        };
+        let create_package = |path: &Path, entry_name: &str| {
+            let file = fs::File::create(path).unwrap();
+            let mut archive = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            archive.start_file("manifest.json", options).unwrap();
+            serde_json::to_writer(&mut archive, &manifest).unwrap();
+            archive.start_file(entry_name, options).unwrap();
+            archive.write_all(b"snapshot-data").unwrap();
+            archive.finish().unwrap();
+        };
+
+        let valid = root.join("valid.oopz+");
+        create_package(&valid, "accounts/account-000/roaming/uid-1/state.json");
+        let valid_transaction = root.join("valid-transaction");
+        fs::create_dir_all(&valid_transaction).unwrap();
+        let prepared = prepare_v3_import(&valid_transaction, &AppData::default(), &valid).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            fs::read(prepared[0].staged_snapshot.join("roaming/uid-1/state.json")).unwrap(),
+            b"snapshot-data"
+        );
+
+        let unsafe_package = root.join("unsafe.oopz+");
+        create_package(&unsafe_package, "accounts/account-000/../outside.json");
+        let unsafe_transaction = root.join("unsafe-transaction");
+        fs::create_dir_all(&unsafe_transaction).unwrap();
+        assert!(
+            prepare_v3_import(&unsafe_transaction, &AppData::default(), &unsafe_package).is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_rollback_only_reverts_started_entries() {
+        let root = std::env::temp_dir().join(format!("oopz-plus-rollback-test-{}", Uuid::new_v4()));
+        let target = root.join("accounts/account/snapshot");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("original.txt"), b"original").unwrap();
+        let pending = ImportJournalEntry {
+            account_id: "account".to_string(),
+            had_snapshot: true,
+            credential_backup_id: "unused".to_string(),
+            phase: "pending".to_string(),
+        };
+        rollback_snapshot_entry(&root, &pending, &target).unwrap();
+        assert_eq!(fs::read(target.join("original.txt")).unwrap(), b"original");
+
+        let backup = root.join("backup/account/snapshot");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("original.txt"), b"original").unwrap();
+        fs::write(target.join("new.txt"), b"new").unwrap();
+        let replacing = ImportJournalEntry {
+            phase: "replacing".to_string(),
+            ..pending.clone()
+        };
+        rollback_snapshot_entry(&root, &replacing, &target).unwrap();
+        assert_eq!(fs::read(target.join("original.txt")).unwrap(), b"original");
+        assert!(!target.join("new.txt").exists());
+
+        let new_target = root.join("accounts/new-account/snapshot");
+        fs::create_dir_all(&new_target).unwrap();
+        fs::write(new_target.join("new.txt"), b"new").unwrap();
+        let new_entry = ImportJournalEntry {
+            account_id: "new-account".to_string(),
+            had_snapshot: false,
+            credential_backup_id: "unused".to_string(),
+            phase: "replacing".to_string(),
+        };
+        rollback_snapshot_entry(&root, &new_entry, &new_target).unwrap();
+        assert!(!new_target.exists());
         let _ = fs::remove_dir_all(root);
     }
 
