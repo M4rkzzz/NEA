@@ -90,20 +90,25 @@ button.primary {
 }
 
 .window-titlebar {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: space-between;
   height: 40px;
   border-bottom: 0;
   background: #eaf4f8;
+  overflow: visible;
   user-select: none;
 }
 
 .window-brand {
-  padding-left: 16px;
+  position: absolute;
+  top: 24px;
+  left: 18px;
   color: #20272b;
   font-size: 22px;
-  line-height: 40px;
+  line-height: 28px;
   font-weight: 700;
   letter-spacing: 0;
 }
