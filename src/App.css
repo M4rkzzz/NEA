@@ -99,19 +99,13 @@ button.primary {
   user-select: none;
 }
 
-.window-titlebar-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  padding-left: 14px;
-}
-
-.window-titlebar-status > img {
-  width: 19px;
-  height: 19px;
-  flex: 0 0 auto;
-  object-fit: contain;
+.window-brand {
+  padding-left: 16px;
+  color: #20272b;
+  font-size: 22px;
+  line-height: 40px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .window-controls {
@@ -204,7 +198,7 @@ button.primary {
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: min(520px, 55vw);
+  max-width: min(520px, 52vw);
   min-height: 20px;
   padding: 0;
   color: #6c777d;

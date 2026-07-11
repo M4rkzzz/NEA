@@ -4,7 +4,6 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Minus, Square, Trash2, X } from "lucide-react";
-import appIcon from "../src-tauri/icons/32x32.png";
 import "./App.css";
 
 type AppConfig = {
@@ -694,10 +693,7 @@ function App() {
   return (
     <main className="shell">
       <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
-        <div className="window-titlebar-status" data-tauri-drag-region>
-          <img src={appIcon} alt="" aria-hidden="true" data-tauri-drag-region />
-          <div className="status" data-busy={busy} data-tauri-drag-region>{busy && <span className="spinner" />}<span data-tauri-drag-region>{message}</span></div>
-        </div>
+        <div className="window-brand" data-tauri-drag-region>OOPZ+</div>
         <div className="window-controls">
           <button onClick={minimizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最小化" title="最小化"><Minus size={15} /></button>
           <button onClick={toggleMaximizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最大化或还原" title="最大化或还原"><Square size={13} /></button>
@@ -714,7 +710,10 @@ function App() {
         </aside>
 
         <section className="workspace">
-          <header className="topbar"><h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2></header>
+          <header className="topbar">
+            <h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2>
+            <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
+          </header>
           {activeFeature === "overview" ? overview : switcher}
         </section>
       </div>
