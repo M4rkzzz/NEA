@@ -1,7 +1,7 @@
 :root {
   font-family: Inter, "Microsoft YaHei UI", "Segoe UI", Arial, sans-serif;
-  color: #202124;
-  background: #eef1f5;
+  color: #262b2f;
+  background: #fff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -48,7 +48,7 @@ input {
 
 button {
   height: 30px;
-  border: 1px solid #c9d1dc;
+  border: 1px solid #d8dde2;
   border-radius: 6px;
   padding: 0 10px;
   background: #fff;
@@ -57,8 +57,9 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: #3b82f6;
-  color: #1d4ed8;
+  border-color: #b7c0c8;
+  background: #f5f7f8;
+  color: #111827;
 }
 
 button:disabled {
@@ -75,7 +76,7 @@ button.primary {
 .shell {
   height: 100vh;
   display: grid;
-  grid-template-rows: 38px minmax(0, 1fr);
+  grid-template-rows: 40px minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -85,15 +86,16 @@ button.primary {
   gap: 0;
   overflow: hidden;
   min-height: 0;
+  background: #eaf4f8;
 }
 
 .window-titlebar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 38px;
-  border-bottom: 1px solid #d7dde7;
-  background: #eef1f5;
+  height: 40px;
+  border-bottom: 0;
+  background: #eaf4f8;
   user-select: none;
 }
 
@@ -102,7 +104,7 @@ button.primary {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding-left: 12px;
+  padding-left: 14px;
 }
 
 .window-titlebar-status > img {
@@ -121,18 +123,18 @@ button.primary {
 .window-controls button {
   display: grid;
   width: 46px;
-  height: 37px;
+  height: 39px;
   place-items: center;
   border: 0;
   border-radius: 0;
   padding: 0;
   background: transparent;
-  color: #202124;
+  color: #2d3338;
 }
 
 .window-controls button:hover:not(:disabled) {
   border-color: transparent;
-  background: #dfe4ea;
+  background: #d9e8ed;
   color: #111827;
 }
 
@@ -143,38 +145,42 @@ button.primary {
 
 .sidebar {
   height: 100%;
-  border-right: 1px solid #d7dde7;
-  background: #f8fafc;
-  padding: 16px;
+  border-right: 0;
+  background: #eaf4f8;
+  padding: 18px 12px;
   overflow-y: auto;
 }
 
 .feature-list {
   display: grid;
-  gap: 7px;
+  gap: 4px;
 }
 
 .feature-list button {
   display: grid;
   width: 100%;
-  height: 40px;
+  height: 38px;
   justify-items: start;
   align-content: center;
   text-align: left;
-  padding: 7px 10px;
+  border-color: transparent;
+  padding: 7px 12px;
+  background: transparent;
 }
 
 .feature-list button[data-active="true"] {
-  border-color: #2563eb;
-  background: #eff6ff;
-  color: #1d4ed8;
+  border-color: transparent;
+  background: #dde9ed;
+  color: #20272b;
 }
 
 
 .workspace {
   min-width: 0;
   height: 100%;
-  padding: 16px;
+  padding: 16px 18px 20px;
+  border-radius: 14px 0 0 0;
+  background: #fff;
   overflow-y: auto;
 }
 
@@ -183,13 +189,14 @@ button.primary {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 12px;
+  min-height: 38px;
+  margin-bottom: 8px;
 }
 
 .topbar h2 {
   margin: 0;
-  font-size: 20px;
-  line-height: 26px;
+  font-size: 19px;
+  line-height: 24px;
   letter-spacing: 0;
 }
 
@@ -200,7 +207,7 @@ button.primary {
   max-width: min(520px, 55vw);
   min-height: 20px;
   padding: 0;
-  color: #6b7280;
+  color: #6c777d;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -231,21 +238,21 @@ button.primary {
 
 .content-stack {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .switcher-grid {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) minmax(280px, 1fr);
-  gap: 10px;
+  gap: 12px;
   align-items: start;
 }
 
 .panel {
-  border: 1px solid #d7dde7;
-  border-radius: 6px;
+  border: 1px solid #e0e5e8;
+  border-radius: 8px;
   background: #fff;
-  padding: 11px;
+  padding: 12px;
 }
 
 .hero-panel {
@@ -283,7 +290,7 @@ button.primary {
 
 .panel-title h2 {
   margin: 0;
-  font-size: 14px;
+  font-size: 15px;
   line-height: 20px;
   letter-spacing: 0;
 }
@@ -295,8 +302,8 @@ button.primary {
 }
 
 .metric {
-  border: 1px solid #d7dde7;
-  border-radius: 6px;
+  border: 1px solid #e0e5e8;
+  border-radius: 8px;
   background: #fff;
   padding: 10px;
 }
@@ -345,14 +352,14 @@ button.primary {
   width: 100%;
   min-height: 52px;
   padding: 6px;
-  border: 1px solid #e1e6ef;
-  border-radius: 6px;
+  border: 1px solid #e3e7ea;
+  border-radius: 7px;
   background: #fff;
 }
 
 .account-row[data-selected="true"] {
-  border-color: #2563eb;
-  background: #eff6ff;
+  border-color: #b9cbd3;
+  background: #f1f7f9;
 }
 
 .account-main {
@@ -555,7 +562,7 @@ button.primary {
   gap: 6px 10px;
   margin: 7px 0 0 44px;
   padding: 8px 10px;
-  border-top: 1px solid #dbe6f5;
+  border-top: 1px solid #dce7eb;
   color: #374151;
 }
 
@@ -885,7 +892,7 @@ button.primary {
     height: auto;
     max-height: 152px;
     border-right: 0;
-    border-bottom: 1px solid #d7dde7;
+    border-bottom: 0;
     overflow-y: auto;
   }
 
@@ -902,6 +909,7 @@ button.primary {
   .workspace {
     height: auto;
     min-height: 0;
+    border-radius: 14px 14px 0 0;
   }
 
   .account-row-main {

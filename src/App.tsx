@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -482,6 +482,11 @@ function App() {
     void getCurrentWindow().close().catch((error) => setMessage(errorMessage(error)));
   }
 
+  function startWindowDrag(event: MouseEvent<HTMLElement>) {
+    if (event.button !== 0 || event.detail > 1 || (event.target as HTMLElement).closest(".window-controls")) return;
+    void getCurrentWindow().startDragging().catch((error) => setMessage(errorMessage(error)));
+  }
+
   useEffect(() => {
     refresh()
       .then(() => validate())
@@ -688,7 +693,7 @@ function App() {
 
   return (
     <main className="shell">
-      <header className="window-titlebar" data-tauri-drag-region onDoubleClick={toggleMaximizeWindow}>
+      <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
         <div className="window-titlebar-status" data-tauri-drag-region>
           <img src={appIcon} alt="" aria-hidden="true" data-tauri-drag-region />
           <div className="status" data-busy={busy} data-tauri-drag-region>{busy && <span className="spinner" />}<span data-tauri-drag-region>{message}</span></div>
