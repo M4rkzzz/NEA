@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
+import { LayoutDashboard, Minus, RefreshCw, Square, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -663,7 +663,6 @@ function App() {
           <button onClick={() => handleAction(chooseDir)} disabled={busy}>手动选择目录</button>
           <button onClick={() => handleAction(validate)} disabled={busy}>重新校验</button>
           <button onClick={() => handleAction(restoreBackup)} disabled={busy}>恢复最近备份</button>
-          <button onClick={() => handleAction(checkForUpdates)} disabled={busy || updateActive}>检查更新</button>
         </div>
         {updateStatus?.state === "downloading" && typeof updateStatus.percent === "number" && (
           <div className="update-percent" aria-live="polite">下载进度 <strong>{updateStatus.percent}%</strong></div>
@@ -829,6 +828,7 @@ function App() {
       <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
         <div className="window-brand" data-tauri-drag-region>NEA</div>
         <div className="window-controls">
+          <button className="window-update" onClick={() => handleAction(checkForUpdates)} disabled={busy || updateActive} aria-label="检查更新" title={updateStatus?.message || "检查更新"}><RefreshCw className={updateActive ? "spin-icon" : ""} size={15} /></button>
           <button onClick={minimizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最小化" title="最小化"><Minus size={15} /></button>
           <button onClick={toggleMaximizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最大化或还原" title="最大化或还原"><Square size={13} /></button>
           <button className="window-close" onClick={closeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="关闭" title="关闭"><X size={16} /></button>

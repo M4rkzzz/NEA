@@ -21,7 +21,7 @@ use std::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, Signal, System, UpdateKind};
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
@@ -70,7 +70,8 @@ fn process_system() -> System {
 fn refresh_process_system(system: &mut System) {
     system.refresh_processes_specifics(process_refresh_kind());
 }
-const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
+const RUN_KEY_NAME: &str = "NEA Watcher";
+const LEGACY_RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const LEGACY_EXPORT_FORMAT: &str = "oopz-plus-account-v1";
 const EXPORT_FORMAT: &str = "oopz-plus-package-v2";
 const EXPORT_FORMAT_V3: &str = "oopz-plus-package-v3";
@@ -1292,6 +1293,7 @@ fn install_watcher() -> Result<(), String> {
     let (key, _) = hkcu
         .create_subkey(RUN_KEY_PATH)
         .map_err(|e| e.to_string())?;
+    let _ = key.delete_value(LEGACY_RUN_KEY_NAME);
     key.set_value(RUN_KEY_NAME, &command)
         .map_err(|e| format!("注册守护自启动失败: {}", e))
 }
@@ -1299,10 +1301,12 @@ fn install_watcher() -> Result<(), String> {
 fn uninstall_watcher() -> Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY_PATH, winreg::enums::KEY_SET_VALUE) {
-        match key.delete_value(RUN_KEY_NAME) {
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("取消守护自启动失败: {}", error)),
+        for value_name in [RUN_KEY_NAME, LEGACY_RUN_KEY_NAME] {
+            match key.delete_value(value_name) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("取消守护自启动失败: {}", error)),
+            }
         }
     }
     Ok(())
@@ -1311,8 +1315,12 @@ fn uninstall_watcher() -> Result<(), String> {
 fn watcher_installed() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     hkcu.open_subkey(RUN_KEY_PATH)
-        .and_then(|key| key.get_value::<String, _>(RUN_KEY_NAME))
-        .is_ok()
+        .map(|key| {
+            [RUN_KEY_NAME, LEGACY_RUN_KEY_NAME]
+                .iter()
+                .any(|name| key.get_value::<String, _>(*name).is_ok())
+        })
+        .unwrap_or(false)
 }
 
 fn spawn_plugin_runtime() -> Result<(), String> {
@@ -2151,14 +2159,17 @@ fn legacy_credential_entry(account_id: &str) -> Result<Entry, String> {
 }
 
 fn read_secret_raw(account_id: &str) -> Option<String> {
-    credential_entry(account_id)
+    if let Some(raw) = credential_entry(account_id)
         .ok()
         .and_then(|entry| entry.get_password().ok())
-        .or_else(|| {
-            legacy_credential_entry(account_id)
-                .ok()
-                .and_then(|entry| entry.get_password().ok())
-        })
+    {
+        return Some(raw);
+    }
+    let raw = legacy_credential_entry(account_id)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())?;
+    let _ = write_secret_raw(account_id, &raw);
+    Some(raw)
 }
 
 fn write_secret_raw(account_id: &str, raw: &str) -> Result<(), String> {
@@ -2168,9 +2179,7 @@ fn write_secret_raw(account_id: &str, raw: &str) -> Result<(), String> {
 }
 
 fn read_secret(account_id: &str) -> SecretPayload {
-    let Ok(payload) = credential_entry(account_id)
-        .and_then(|entry| entry.get_password().map_err(|e| e.to_string()))
-    else {
+    let Some(payload) = read_secret_raw(account_id) else {
         return SecretPayload::default();
     };
     serde_json::from_str(&payload).unwrap_or_default()
@@ -2401,10 +2410,12 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None::<&str>,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+
+    let oopz_menu = Submenu::new(app, "OOPZ", true)?;
     if data.accounts.is_empty() {
-        menu.append(&MenuItem::with_id(
+        oopz_menu.append(&MenuItem::with_id(
             app,
-            "empty",
+            "oopz-empty",
             "暂无账号",
             false,
             None::<&str>,
@@ -2419,30 +2430,49 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             } else {
                 format!("登录 {}", account.display_name)
             };
-            menu.append(&MenuItem::with_id(
+            oopz_menu.append(&MenuItem::with_id(
                 app,
-                format!("switch:{}", account.id),
+                format!("oopz-switch:{}", account.id),
                 label,
                 !is_current,
                 None::<&str>,
             )?)?;
         }
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "import",
-        "刷新账号",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "rediscover",
-        "重新搜索 OOPZ",
-        true,
-        None::<&str>,
-    )?)?;
+    menu.append(&oopz_menu)?;
+
+    let steam_menu = Submenu::new(app, "Steam", true)?;
+    if data.steam.accounts.is_empty() {
+        steam_menu.append(&MenuItem::with_id(
+            app,
+            "steam-empty",
+            "暂无账号",
+            false,
+            None::<&str>,
+        )?)?;
+    } else {
+        for account in &data.steam.accounts {
+            let mut label = match account
+                .note
+                .as_deref()
+                .filter(|note| !note.trim().is_empty())
+            {
+                Some(note) => format!("{}（{}）", account.display_name, note),
+                None => account.display_name.clone(),
+            };
+            if account.most_recent {
+                label.push_str("（登录中）");
+            }
+            steam_menu.append(&MenuItem::with_id(
+                app,
+                format!("steam-switch:{}", account.id),
+                label,
+                !account.most_recent,
+                None::<&str>,
+            )?)?;
+        }
+    }
+    menu.append(&steam_menu)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
     Ok(menu)
@@ -2493,7 +2523,10 @@ async fn discover_steam(app: AppHandle) -> Result<steam::SteamWorkspace, String>
             .find(|account| account.most_recent)
             .map(|account| account.id.clone());
         save_data(&data)?;
-        Ok(data.steam.clone())
+        let workspace = data.steam.clone();
+        drop(data);
+        update_tray(&app);
+        Ok(workspace)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2521,7 +2554,10 @@ async fn set_steam_account_note(
     let trimmed = note.trim();
     account.note = (!trimmed.is_empty()).then(|| trimmed.chars().take(120).collect());
     save_data(&data)?;
-    Ok(data.steam.clone())
+    let workspace = data.steam.clone();
+    drop(data);
+    update_tray(&app);
+    Ok(workspace)
 }
 
 #[tauri::command]
@@ -2541,6 +2577,8 @@ async fn delete_steam_account(app: AppHandle, account_id: String) -> Result<(), 
         fs::remove_dir_all(snapshot)
             .map_err(|error| format!("删除 Steam 账号快照失败: {}", error))?;
     }
+    drop(data);
+    update_tray(&app);
     Ok(())
 }
 
@@ -2591,6 +2629,8 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
             account.most_recent = account.id == account_id;
         }
         save_data(&data)?;
+        drop(data);
+        update_tray(&app);
         Ok(SwitchResult {
             ok: true,
             message: format!("已切换到 Steam 账号 {}", account_name),
@@ -4402,7 +4442,7 @@ fn switch_account_inner(
         ensure_plugin_runtime_after_oopz_start(config);
         return Ok(SwitchResult {
             ok: true,
-            message: "已打开 OOPZ 登录页。登录完成后回到 OOPZ+ 点刷新。".to_string(),
+            message: "已打开 OOPZ 登录页。登录完成后回到 NEA 点刷新。".to_string(),
         });
     }
 
@@ -4424,7 +4464,7 @@ fn switch_account_inner(
         ensure_plugin_runtime_after_oopz_start(config);
         return Ok(SwitchResult {
             ok: false,
-            message: "这个账号还不能快速切换。请在 OOPZ 里登录一次，然后回到 OOPZ+ 点刷新。"
+            message: "这个账号还不能快速切换。请在 OOPZ 里登录一次，然后回到 NEA 点刷新。"
                 .to_string(),
         });
     };
@@ -4437,7 +4477,7 @@ fn switch_account_inner(
     let roaming_snapshot = snapshot.join("roaming").join(&uid);
     let local_snapshot = snapshot.join("local_sandbox").join(&uid);
     if !roaming_snapshot.exists() && !local_snapshot.exists() {
-        return Err("账号数据不完整，请打开 OOPZ 登录一次，然后回到 OOPZ+ 点刷新".to_string());
+        return Err("账号数据不完整，请打开 OOPZ 登录一次，然后回到 NEA 点刷新".to_string());
     }
 
     detach_plugin_overlay(&app);
@@ -4621,15 +4661,9 @@ pub fn run() {
                     let id = event.id().0.as_str();
                     match id {
                         "show" => show_main_window(app),
-                        "import" => {
-                            let _ = app.emit("tray-action", "import");
-                        }
-                        "rediscover" => {
-                            let _ = app.emit("tray-action", "rediscover");
-                        }
                         "quit" => app.exit(0),
-                        _ if id.starts_with("switch:") => {
-                            let account_id = id.trim_start_matches("switch:").to_string();
+                        _ if id.starts_with("oopz-switch:") => {
+                            let account_id = id.trim_start_matches("oopz-switch:").to_string();
                             let app_handle = app.clone();
                             thread::spawn(move || {
                                 let state = app_handle.state::<AppState>();
@@ -4637,6 +4671,20 @@ pub fn run() {
                                     switch_account_inner(app_handle.clone(), state, account_id);
                                 let _ = app_handle
                                     .emit("switch-finished", result.map_err(|e| e.to_string()));
+                            });
+                        }
+                        _ if id.starts_with("steam-switch:") => {
+                            let account_id = id.trim_start_matches("steam-switch:").to_string();
+                            let app_handle = app.clone();
+                            thread::spawn(move || {
+                                let result = tauri::async_runtime::block_on(switch_steam_account(
+                                    app_handle.clone(),
+                                    account_id,
+                                ));
+                                let _ = app_handle.emit(
+                                    "switch-finished",
+                                    result.map_err(|error| error.to_string()),
+                                );
                             });
                         }
                         _ => {}
