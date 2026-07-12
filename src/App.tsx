@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Gamepad2, LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
+import { LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -831,8 +831,8 @@ function App() {
       <div className="app-layout">
         <aside className="app-rail">
           <nav className="app-list" aria-label="软件切换">
-            <button data-active={activeApp === "oopz"} onClick={() => selectApp("oopz")} aria-label="切换到 OOPZ" title="OOPZ"><span className="app-glyph">O</span></button>
-            <button data-active={activeApp === "steam"} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><Gamepad2 size={23} strokeWidth={1.8} aria-hidden="true" /></button>
+            <button data-active={activeApp === "oopz"} onClick={() => selectApp("oopz")} aria-label="切换到 OOPZ" title="OOPZ"><img className="app-icon-image" src="/oopz-icon.png" alt="" /></button>
+            <button data-active={activeApp === "steam"} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><img className="app-icon-image" src="/steam-icon.svg" alt="" /></button>
           </nav>
         </aside>
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
