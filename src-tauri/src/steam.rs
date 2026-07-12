@@ -304,23 +304,7 @@ impl SteamAdapter {
         let raw = fs::read_to_string(&path)
             .map_err(|error| format!("读取 Steam 登录状态失败: {}", error))?;
         let mut root = parse_vdf(&raw)?;
-        let account_name = {
-            let list = users_mut(&mut root)?;
-            let mut selected = None;
-            for (id, value) in list.iter_mut() {
-                let VdfValue::Object(account) = value else {
-                    continue;
-                };
-                let active = id == steam_id;
-                set_text(account, "MostRecent", if active { "1" } else { "0" });
-                if active {
-                    selected = text(account, "AccountName").map(str::to_string);
-                    set_text(account, "WantsOfflineMode", "0");
-                    set_text(account, "SkipOfflineModeWarning", "1");
-                }
-            }
-            selected.ok_or_else(|| "目标 Steam 账号已不存在".to_string())?
-        };
+        let account_name = select_account(&mut root, steam_id)?;
         let staging = path.with_extension("vdf.nea-new");
         let backup = path.with_extension("vdf.nea-backup");
         fs::write(&staging, serialize_vdf(&root))
@@ -371,6 +355,30 @@ impl SteamAdapter {
         }
         copy_dir(&source, destination)
     }
+}
+
+fn select_account(root: &mut BTreeMap<String, VdfValue>, steam_id: &str) -> Result<String, String> {
+    let list = users_mut(root)?;
+    let mut selected = None;
+    for (id, value) in list.iter_mut() {
+        let VdfValue::Object(account) = value else {
+            continue;
+        };
+        let active = id == steam_id;
+        set_text(account, "MostRecent", if active { "1" } else { "0" });
+        let remembered = text(account, "RememberPassword") == Some("1");
+        set_text(
+            account,
+            "AllowAutoLogin",
+            if active && remembered { "1" } else { "0" },
+        );
+        if active {
+            selected = text(account, "AccountName").map(str::to_string);
+            set_text(account, "WantsOfflineMode", "0");
+            set_text(account, "SkipOfflineModeWarning", "1");
+        }
+    }
+    selected.ok_or_else(|| "目标 Steam 账号已不存在".to_string())
 }
 
 fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
@@ -495,9 +503,21 @@ mod tests {
 
     #[test]
     fn parses_and_updates_loginusers_vdf() {
-        let input = "\"users\"\n{\n\"1\" { \"AccountName\" \"one\" \"PersonaName\" \"One\" \"MostRecent\" \"1\" }\n\"2\" { \"AccountName\" \"two\" \"MostRecent\" \"0\" }\n}";
-        let root = parse_vdf(input).unwrap();
+        let input = "\"users\"\n{\n\"1\" { \"AccountName\" \"one\" \"PersonaName\" \"One\" \"MostRecent\" \"1\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"1\" }\n\"2\" { \"AccountName\" \"two\" \"MostRecent\" \"0\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"0\" }\n}";
+        let mut root = parse_vdf(input).unwrap();
         assert_eq!(users(&root).unwrap().len(), 2);
+        assert_eq!(select_account(&mut root, "2").unwrap(), "two");
+        let list = users(&root).unwrap();
+        let VdfValue::Object(first) = list.get("1").unwrap() else {
+            panic!()
+        };
+        let VdfValue::Object(second) = list.get("2").unwrap() else {
+            panic!()
+        };
+        assert_eq!(text(first, "MostRecent"), Some("0"));
+        assert_eq!(text(first, "AllowAutoLogin"), Some("0"));
+        assert_eq!(text(second, "MostRecent"), Some("1"));
+        assert_eq!(text(second, "AllowAutoLogin"), Some("1"));
         let reparsed = parse_vdf(&serialize_vdf(&root)).unwrap();
         assert_eq!(users(&reparsed).unwrap().len(), 2);
     }
