@@ -405,6 +405,32 @@ fn process_system() -> System {
     system
 }
 
+fn steam_process_running(system: &System) -> bool {
+    system.processes().values().any(|process| {
+        process.name().eq_ignore_ascii_case("steam.exe")
+            || process.name().eq_ignore_ascii_case("steamwebhelper.exe")
+    })
+}
+
+fn refresh_processes(system: &mut System) {
+    system.refresh_processes_specifics(ProcessRefreshKind::new());
+}
+
+impl SteamAdapter {
+    pub fn start_with_login(
+        installation: &AppInstallation,
+        account_name: &str,
+    ) -> Result<(), String> {
+        Command::new(&installation.executable)
+            .current_dir(&installation.data_dir)
+            .arg("-login")
+            .arg(account_name)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("启动 Steam 失败: {}", error))
+    }
+}
+
 impl AppAdapter for SteamAdapter {
     fn id(&self) -> &'static str {
         "steam"
@@ -453,38 +479,58 @@ impl AppAdapter for SteamAdapter {
             })
             .collect())
     }
-    fn stop(&self, _installation: &AppInstallation) -> Result<(), String> {
+    fn stop(&self, installation: &AppInstallation) -> Result<(), String> {
         let mut system = process_system();
-        let pids: Vec<_> = system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| {
-                process
-                    .name()
-                    .eq_ignore_ascii_case("steam.exe")
-                    .then_some(*pid)
-            })
-            .collect();
-        for pid in &pids {
-            if let Some(process) = system.process(*pid) {
+        if !steam_process_running(&system) {
+            return Ok(());
+        }
+
+        let _ = Command::new(&installation.executable)
+            .current_dir(&installation.data_dir)
+            .arg("-shutdown")
+            .spawn();
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(500));
+            refresh_processes(&mut system);
+            if !steam_process_running(&system) {
+                return Ok(());
+            }
+        }
+
+        for process in system.processes().values() {
+            if process.name().eq_ignore_ascii_case("steam.exe")
+                || process.name().eq_ignore_ascii_case("steamwebhelper.exe")
+            {
                 let _ = process
                     .kill_with(Signal::Term)
                     .unwrap_or_else(|| process.kill());
             }
         }
-        if !pids.is_empty() {
-            thread::sleep(Duration::from_millis(1200));
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(500));
+            refresh_processes(&mut system);
+            if !steam_process_running(&system) {
+                return Ok(());
+            }
         }
-        system.refresh_processes_specifics(ProcessRefreshKind::new());
-        for pid in pids {
-            if let Some(process) = system.process(pid) {
+        for process in system.processes().values() {
+            if process.name().eq_ignore_ascii_case("steam.exe")
+                || process.name().eq_ignore_ascii_case("steamwebhelper.exe")
+            {
                 let _ = process.kill();
             }
         }
-        Ok(())
+        thread::sleep(Duration::from_millis(500));
+        refresh_processes(&mut system);
+        if steam_process_running(&system) {
+            Err("Steam 进程无法完全退出，已中止切号以防登录状态被覆盖".to_string())
+        } else {
+            Ok(())
+        }
     }
     fn start(&self, installation: &AppInstallation) -> Result<(), String> {
         Command::new(&installation.executable)
+            .current_dir(&installation.data_dir)
             .spawn()
             .map(|_| ())
             .map_err(|error| format!("启动 Steam 失败: {}", error))
