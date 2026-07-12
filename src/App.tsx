@@ -826,7 +826,9 @@ function App() {
   return (
     <main className="shell">
       <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
-        <div className="window-brand" data-tauri-drag-region>NEA</div>
+        <div className="window-brand" data-tauri-drag-region>
+          <img src="/nea-brand-dark.png" alt="NEA - Not Enough Accounts" draggable={false} data-tauri-drag-region />
+        </div>
         <div className="window-controls">
           <button className="window-update" onClick={() => handleAction(checkForUpdates)} disabled={busy || updateActive} aria-label="检查更新" title={updateStatus?.message || "检查更新"}><RefreshCw className={updateActive ? "spin-icon" : ""} size={15} /></button>
           <button onClick={minimizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最小化" title="最小化"><Minus size={15} /></button>

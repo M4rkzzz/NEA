@@ -146,13 +146,16 @@ button.primary {
 
 .window-brand {
   position: absolute;
-  top: 20px;
-  left: 20px;
-  color: #20272b;
-  font-size: 40px;
-  line-height: 48px;
-  font-weight: 700;
-  letter-spacing: 0;
+  top: 16px;
+  left: 14px;
+}
+
+.window-brand img {
+  display: block;
+  width: 148px;
+  height: auto;
+  pointer-events: none;
+  user-select: none;
 }
 
 .window-controls {
