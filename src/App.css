@@ -91,7 +91,7 @@ button.primary {
 
 .app-rail {
   height: 100%;
-  padding: 52px 8px 18px;
+  padding: 76px 8px 18px;
   background: #eaf4f8;
 }
 
@@ -146,8 +146,8 @@ button.primary {
 
 .window-brand {
   position: absolute;
-  top: 16px;
-  left: 14px;
+  top: 24px;
+  left: 24px;
 }
 
 .window-brand img {
@@ -276,7 +276,7 @@ button.primary.danger-confirm {
   height: 100%;
   border-right: 0;
   background: #eaf4f8;
-  padding: 52px 10px 18px;
+  padding: 76px 10px 18px;
   overflow-y: auto;
 }
 
@@ -1021,7 +1021,7 @@ button.primary.danger-confirm {
   }
 
   .sidebar {
-    padding: 52px 14px 14px;
+    padding: 76px 14px 14px;
   }
 
   .feature-list button {
