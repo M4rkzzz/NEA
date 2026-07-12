@@ -85,8 +85,7 @@ const WORMHOLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 const WORMHOLE_CODE_WORDS: usize = 4;
 const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
-const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/M4rkzzz/oopz-plus/releases/latest";
+const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/M4rkzzz/NEA/releases/latest";
 const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
@@ -391,36 +390,93 @@ fn storage_dir() -> Result<PathBuf, String> {
     let base = home_env("APPDATA")?;
     let current = base.join(APP_DIR_NAME);
     let legacy = base.join(LEGACY_APP_DIR_NAME);
-    if !current.exists() && legacy.exists() {
-        fs::create_dir_all(&current).map_err(|error| error.to_string())?;
-        for entry in fs::read_dir(&legacy).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let destination = current.join(entry.file_name());
-            if entry
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_dir()
-            {
-                copy_directory(&entry.path(), &destination)?;
-            } else {
-                fs::copy(entry.path(), destination).map_err(|error| error.to_string())?;
-            }
+    fs::create_dir_all(&current).map_err(|error| error.to_string())?;
+    let marker = current.join("migration-from-oopz-plus-v2.txt");
+    if legacy.exists() && !marker.exists() {
+        if migrate_legacy_storage(&legacy, &current).is_ok() {
+            let _ = fs::write(marker, now());
         }
-        let marker = current.join("migrated-from-oopz-plus.txt");
-        let _ = fs::write(marker, now());
     }
     let oopz_workspace = current.join("workspaces").join("oopz");
     for folder in ["accounts", "backups"] {
         let legacy_folder = current.join(folder);
         let workspace_folder = oopz_workspace.join(folder);
-        if legacy_folder.exists() && !workspace_folder.exists() {
-            copy_directory(&legacy_folder, &workspace_folder)?;
+        if legacy_folder.exists() {
+            copy_directory_missing(&legacy_folder, &workspace_folder)?;
         }
     }
     Ok(current)
 }
 
-fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+fn migrate_legacy_storage(legacy: &Path, current: &Path) -> Result<(), String> {
+    copy_directory_missing(legacy, current)?;
+    let legacy_config = legacy.join("config.json");
+    let current_config = current.join("config.json");
+    let Ok(legacy_raw) = fs::read_to_string(&legacy_config) else {
+        return Ok(());
+    };
+    let Ok(mut legacy_data) = serde_json::from_str::<AppData>(&legacy_raw) else {
+        return Ok(());
+    };
+    let mut current_data = fs::read_to_string(&current_config)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AppData>(&raw).ok())
+        .unwrap_or_default();
+    for account in legacy_data.accounts.drain(..) {
+        let exists = current_data.accounts.iter().any(|saved| {
+            saved.id == account.id
+                || (saved.uid.is_some() && saved.uid.as_deref() == account.uid.as_deref())
+        });
+        if !exists {
+            current_data.accounts.push(account);
+        }
+    }
+    if current_data.config.oopz_install_dir.is_none() {
+        current_data.config.oopz_install_dir = legacy_data.config.oopz_install_dir;
+    }
+    if current_data.config.oopz_exe_path.is_none() {
+        current_data.config.oopz_exe_path = legacy_data.config.oopz_exe_path;
+    }
+    if current_data.config.roaming_data_dir.is_none() {
+        current_data.config.roaming_data_dir = legacy_data.config.roaming_data_dir;
+    }
+    if current_data.config.local_sandbox_dir.is_none() {
+        current_data.config.local_sandbox_dir = legacy_data.config.local_sandbox_dir;
+    }
+    for account in legacy_data.steam.accounts {
+        if !current_data
+            .steam
+            .accounts
+            .iter()
+            .any(|saved| saved.id == account.id)
+        {
+            current_data.steam.accounts.push(account);
+        }
+    }
+    current_data.schema_version = current_data.schema_version.max(2);
+    let raw = serde_json::to_string_pretty(&current_data).map_err(|error| error.to_string())?;
+    let temp = current_config.with_extension("json.migration.tmp");
+    let backup = current_config.with_extension("json.migration.bak");
+    fs::write(&temp, raw).map_err(|error| error.to_string())?;
+    if backup.exists() {
+        let _ = fs::remove_file(&backup);
+    }
+    if current_config.exists() {
+        fs::rename(&current_config, &backup).map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = fs::rename(&temp, &current_config) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &current_config);
+        }
+        return Err(error.to_string());
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn copy_directory_missing(source: &Path, destination: &Path) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -430,8 +486,8 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?
             .is_dir()
         {
-            copy_directory(&entry.path(), &target)?;
-        } else {
+            copy_directory_missing(&entry.path(), &target)?;
+        } else if !target.exists() {
             fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
         }
     }
@@ -575,9 +631,12 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
         return Err("更新安装包大小异常".to_string());
     }
-    if !asset
-        .browser_download_url
-        .starts_with("https://github.com/M4rkzzz/oopz-plus/releases/download/")
+    if ![
+        "https://github.com/M4rkzzz/NEA/releases/download/",
+        "https://github.com/M4rkzzz/oopz-plus/releases/download/",
+    ]
+    .iter()
+    .any(|prefix| asset.browser_download_url.starts_with(prefix))
     {
         return Err("更新下载地址不可信".to_string());
     }
@@ -1321,6 +1380,13 @@ fn watcher_installed() -> bool {
                 .any(|name| key.get_value::<String, _>(*name).is_ok())
         })
         .unwrap_or(false)
+}
+
+fn watcher_registration_exists(name: &str) -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey(RUN_KEY_PATH)
+        .and_then(|key| key.get_value::<String, _>(name))
+        .is_ok()
 }
 
 fn spawn_plugin_runtime() -> Result<(), String> {
@@ -4639,8 +4705,15 @@ pub fn run() {
                 .map_err(|e| e.to_string())?
                 .config
                 .plugin_mode_enabled;
-            if plugin_enabled && !is_watcher_running() {
-                let _ = spawn_watcher();
+            if plugin_enabled {
+                if watcher_registration_exists(LEGACY_RUN_KEY_NAME)
+                    || !watcher_registration_exists(RUN_KEY_NAME)
+                {
+                    let _ = install_watcher();
+                }
+                if !is_watcher_running() {
+                    let _ = spawn_watcher();
+                }
             }
             let tray = TrayIconBuilder::with_id("main-tray")
                 .tooltip("NEA")
@@ -4742,6 +4815,92 @@ fn spawn_watcher() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_account(id: &str, uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "displayName": id,
+            "uid": uid,
+            "pid": null,
+            "userCommonId": null,
+            "maskedPhone": null,
+            "avatarUrl": null,
+            "loginName": null,
+            "note": null,
+            "hasSessionSnapshot": true,
+            "hasCredential": true,
+            "hasLoginState": true,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "lastUsedAt": null
+        })
+    }
+
+    fn test_config(path: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "oopzInstallDir": path,
+            "oopzExePath": null,
+            "roamingDataDir": null,
+            "localSandboxDir": null,
+            "pluginModeEnabled": false,
+            "pluginAutostartEnabled": false,
+            "overlayOffsetX": 0,
+            "overlayOffsetY": 0,
+            "overlayVertical": false
+        })
+    }
+
+    #[test]
+    fn interrupted_legacy_migration_merges_missing_data_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("nea-migration-test-{}", Uuid::new_v4()));
+        let legacy = root.join("OOPZ+");
+        let current = root.join("NEA");
+        fs::create_dir_all(legacy.join("accounts").join("legacy")).unwrap();
+        fs::create_dir_all(current.join("accounts").join("current")).unwrap();
+        fs::write(legacy.join("accounts/legacy/state.bin"), "legacy").unwrap();
+        fs::write(current.join("accounts/current/state.bin"), "current").unwrap();
+        let legacy_data = serde_json::json!({
+            "schemaVersion": 0,
+            "config": test_config(Some("legacy-path")),
+            "accounts": [test_account("legacy", "uid-legacy")],
+            "steam": { "installation": null, "accounts": [], "currentAccountId": null }
+        });
+        let current_data = serde_json::json!({
+            "schemaVersion": 2,
+            "config": test_config(Some("current-path")),
+            "accounts": [test_account("current", "uid-current")],
+            "steam": { "installation": null, "accounts": [], "currentAccountId": null }
+        });
+        fs::write(
+            legacy.join("config.json"),
+            serde_json::to_vec(&legacy_data).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            current.join("config.json"),
+            serde_json::to_vec(&current_data).unwrap(),
+        )
+        .unwrap();
+
+        migrate_legacy_storage(&legacy, &current).unwrap();
+
+        let merged: AppData =
+            serde_json::from_slice(&fs::read(current.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            merged.config.oopz_install_dir.as_deref(),
+            Some("current-path")
+        );
+        assert_eq!(merged.accounts.len(), 2);
+        assert_eq!(
+            fs::read_to_string(current.join("accounts/legacy/state.bin")).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            fs::read_to_string(current.join("accounts/current/state.bin")).unwrap(),
+            "current"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn copy_dir_recursive_replaces_complete_directory() {

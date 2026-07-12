@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
+    <Upgrade Id="43E6592C-B028-5973-906C-EB1CE6E9121F">
+      <UpgradeVersion Minimum="0.0.0"
+                      IncludeMinimum="yes"
+                      Maximum="1.2.1"
+                      IncludeMaximum="no"
+                      Property="LEGACYNEAPRODUCTS" />
+    </Upgrade>
     <DirectoryRef Id="DesktopFolder">
       <Component Id="RemoveLegacyDesktopShortcut" Guid="5E246096-84B1-4C9C-997F-B724470708E2">
         <RemoveFile Id="RemoveOopzPlusDesktopShortcut" Name="OOPZ+.lnk" On="install" />

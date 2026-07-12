@@ -40,6 +40,6 @@ jobs:
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OOPZ+ ${{ github.ref_name }}
+          name: NEA ${{ github.ref_name }}
           body_path: .github/releases/v1.0.0.md
           files: src-tauri/target/release/bundle/msi/*.msi

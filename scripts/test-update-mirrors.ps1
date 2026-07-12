@@ -8,8 +8,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$fileName = "OOPZ+_${Version}_x64_en-US.msi"
-$githubUrl = "https://github.com/M4rkzzz/oopz-plus/releases/download/v${Version}/${fileName}"
+$fileName = "NEA_${Version}_x64_en-US.msi"
+$githubUrl = "https://github.com/M4rkzzz/NEA/releases/download/v${Version}/${fileName}"
 $sampleBytes = $SampleMiB * 1MB
 $rangeEnd = $sampleBytes - 1
 
