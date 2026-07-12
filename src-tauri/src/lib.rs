@@ -2587,8 +2587,8 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
             let _ = adapter.start(&adapter_installation);
             return Err(error.clone());
         }
-        adapter.start(&adapter_installation)?;
         let account_name = switch_result?;
+        steam::SteamAdapter::start_with_login(&adapter_installation, &account_name)?;
         let mut data = state.data.lock().map_err(|error| error.to_string())?;
         data.steam.current_account_id = Some(account_id.clone());
         for account in &mut data.steam.accounts {
