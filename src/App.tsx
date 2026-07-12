@@ -115,7 +115,8 @@ type WormholeStatus = {
   total?: number;
 };
 
-type FeatureKey = "overview" | "oopz" | "steam";
+type AppKey = "oopz" | "steam";
+type FeatureKey = "overview" | "switcher";
 
 function fmtDate(value?: string) {
   if (!value) return "-";
@@ -190,6 +191,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [searchingOopz, setSearchingOopz] = useState(false);
   const [searchPath, setSearchPath] = useState("");
+  const [activeApp, setActiveApp] = useState<AppKey>("oopz");
   const [activeFeature, setActiveFeature] = useState<FeatureKey>("overview");
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
@@ -611,13 +613,13 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (activeFeature === "oopz" && !scannedOnceRef.current) {
+    if (activeApp === "oopz" && activeFeature === "switcher" && !scannedOnceRef.current) {
       refreshAccounts(false).catch(() => undefined);
     }
-    if (activeFeature === "oopz") {
+    if (activeApp === "oopz" && activeFeature === "switcher") {
       refreshPluginStatus().catch(() => undefined);
     }
-  }, [activeFeature]);
+  }, [activeApp, activeFeature]);
 
   useEffect(() => {
     if (!pendingDeleteAccount && !pendingDeleteSteamAccount) return;
@@ -678,7 +680,7 @@ function App() {
               <h3>{selected.displayName}</h3>
               <p>{accountLabel(selected)}</p>
             </div>
-            <button onClick={() => setActiveFeature("oopz")}>管理</button>
+            <button onClick={() => setActiveFeature("switcher")}>管理</button>
           </div>
         )}
       </div>
@@ -773,7 +775,7 @@ function App() {
     </section>
   );
 
-  const steam = (
+  const steamOverview = (
     <section className="content-stack">
       <div className="panel">
         <div className="panel-title"><h2>Steam 状态</h2><div className="actions"><button onClick={() => handleAction(discoverSteam)} disabled={busy}>搜索并刷新</button></div></div>
@@ -784,6 +786,11 @@ function App() {
         <div className="notice">Steam Guard、密码和二次验证由 Steam 自己处理，NEA 不保存密码或绕过验证。</div>
         <div className="actions"><label className="check-row"><input type="checkbox" checked={data.steam.includeUserdata} onChange={(event) => handleAction(() => setSteamUserdata(event.target.checked))} disabled={busy} />切换时额外保存对应 userdata</label></div>
       </div>
+    </section>
+  );
+
+  const steamSwitcher = (
+    <section className="content-stack">
       <div className="panel">
         <div className="panel-title"><h2>Steam 账号列表</h2></div>
         <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
@@ -801,6 +808,15 @@ function App() {
     </section>
   );
 
+  function selectApp(app: AppKey) {
+    setActiveApp(app);
+    setActiveFeature("overview");
+  }
+
+  const activeContent = activeApp === "oopz"
+    ? activeFeature === "overview" ? overview : switcher
+    : activeFeature === "overview" ? steamOverview : steamSwitcher;
+
   return (
     <main className="shell">
       <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
@@ -813,20 +829,26 @@ function App() {
       </header>
 
       <div className="app-layout">
+        <aside className="app-rail">
+          <nav className="app-list" aria-label="软件切换">
+            <button data-active={activeApp === "oopz"} onClick={() => selectApp("oopz")} aria-label="切换到 OOPZ" title="OOPZ"><span className="app-glyph">O</span></button>
+            <button data-active={activeApp === "steam"} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><Gamepad2 size={23} strokeWidth={1.8} aria-hidden="true" /></button>
+          </nav>
+        </aside>
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
+          <div className="sidebar-app-name">{activeApp === "oopz" ? "OOPZ" : "Steam"}</div>
           <nav className="feature-list">
             <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
-            <button data-active={activeFeature === "oopz"} onClick={() => setActiveFeature("oopz")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>OOPZ</strong></button>
-            <button data-active={activeFeature === "steam"} onClick={() => setActiveFeature("steam")}><Gamepad2 size={17} strokeWidth={2} aria-hidden="true" /><strong>Steam</strong></button>
+            <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
           </nav>
         </aside>
 
         <section className="workspace auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
-            <h2>{activeFeature === "overview" ? "概览" : activeFeature === "oopz" ? "OOPZ" : "Steam"}</h2>
+            <h2>{activeApp === "oopz" ? "OOPZ" : "Steam"} · {activeFeature === "overview" ? "概览" : "账号切换"}</h2>
             <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
           </header>
-          {activeFeature === "overview" ? overview : activeFeature === "oopz" ? switcher : steam}
+          {activeContent}
         </section>
       </div>
       {pendingDeleteAccount && (
