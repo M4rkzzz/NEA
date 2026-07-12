@@ -695,6 +695,24 @@ button.primary.danger-confirm {
   color: #374151;
 }
 
+.steam-account-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px 44px;
+}
+
+.steam-account-note input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  border: 1px solid #d8dde2;
+  border-radius: 6px;
+  padding: 0 9px;
+  color: #202124;
+  background: #fff;
+}
+
 .account-details dt {
   color: #6b7280;
 }

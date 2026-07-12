@@ -29,6 +29,8 @@ pub struct SteamAccount {
     pub most_recent: bool,
     pub userdata_captured: bool,
     pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -283,6 +285,7 @@ impl SteamAdapter {
                 most_recent: text(account, "MostRecent") == Some("1"),
                 userdata_captured: false,
                 last_used_at: None,
+                note: None,
             });
         }
         accounts.sort_by(|left, right| {

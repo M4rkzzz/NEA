@@ -50,6 +50,7 @@ type SteamAccount = {
   mostRecent: boolean;
   userdataCaptured: boolean;
   lastUsedAt?: string;
+  note?: string;
 };
 
 type SteamWorkspace = {
@@ -200,6 +201,8 @@ function App() {
   const [receiveCode, setReceiveCode] = useState("");
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<SavedAccount | null>(null);
   const [pendingDeleteSteamAccount, setPendingDeleteSteamAccount] = useState<SteamAccount | null>(null);
+  const [selectedSteamId, setSelectedSteamId] = useState<string | null>(null);
+  const [steamNoteDraft, setSteamNoteDraft] = useState("");
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -525,6 +528,17 @@ function App() {
     setMessage("Steam 账号快照已删除");
   }
 
+  function selectSteamAccount(account: SteamAccount) {
+    setSelectedSteamId(account.id);
+    setSteamNoteDraft(account.note || "");
+  }
+
+  async function saveSteamNote(account: SteamAccount) {
+    const workspace = await runTask("正在保存 Steam 账号备注...", () => invoke<SteamWorkspace>("set_steam_account_note", { accountId: account.id, note: steamNoteDraft }));
+    setData((current) => ({ ...current, steam: workspace }));
+    setMessage("Steam 账号备注已保存");
+  }
+
   function minimizeWindow() {
     void getCurrentWindow().minimize().catch((error) => setMessage(errorMessage(error)));
   }
@@ -778,7 +792,7 @@ function App() {
   const steamOverview = (
     <section className="content-stack">
       <div className="panel">
-        <div className="panel-title"><h2>Steam 状态</h2><div className="actions"><button onClick={() => handleAction(discoverSteam)} disabled={busy}>搜索并刷新</button></div></div>
+        <div className="panel-title"><h2>Steam 状态</h2></div>
         <dl className="paths">
           <dt>程序</dt><dd>{data.steam.installation?.executable || "未设置"}</dd>
           <dt>安装目录</dt><dd>{data.steam.installation?.installDir || "未设置"}</dd>
@@ -792,15 +806,16 @@ function App() {
   const steamSwitcher = (
     <section className="content-stack">
       <div className="panel">
-        <div className="panel-title"><h2>Steam 账号列表</h2></div>
+        <div className="panel-title"><h2>Steam 账号列表</h2><div className="actions"><button onClick={() => handleAction(discoverSteam)} disabled={busy}>搜索并刷新</button></div></div>
         <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           {data.steam.accounts.length === 0 && <div className="empty">未发现 Steam 账号，请先关闭 Steam 后点击刷新，或完成一次登录。</div>}
           {data.steam.accounts.map((account) => (
-            <div className="account-row" data-selected={data.steam.currentAccountId === account.id} key={account.id}>
+            <div className="account-row" data-selected={data.steam.currentAccountId === account.id || selectedSteamId === account.id} key={account.id}>
               <div className="account-row-main">
-                <div className="account-main"><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{account.displayName}</strong><small>{account.accountName} · {account.id}</small></span></div>
+                <button className="account-main" onClick={() => selectSteamAccount(account)} aria-expanded={selectedSteamId === account.id}><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{account.displayName}</strong><small>{account.accountName} · {account.id}{account.note ? ` · ${account.note}` : ""}</small></span></button>
                 <div className="account-actions"><button className="icon-button danger" onClick={() => setPendingDeleteSteamAccount(account)} disabled={busy} aria-label={`删除 ${account.displayName} 的 NEA 快照`} title="删除账号快照"><Trash2 size={16} /></button><button className={account.mostRecent ? "" : "primary"} onClick={() => handleAction(() => switchSteamAccount(account))} disabled={busy || account.mostRecent}>{account.mostRecent ? "当前登录" : "快速切号"}</button></div>
               </div>
+              {selectedSteamId === account.id && <div className="steam-account-note"><input value={steamNoteDraft} onChange={(event) => setSteamNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamNote(account))} disabled={busy}>保存备注</button></div>}
             </div>
           ))}
         </div>

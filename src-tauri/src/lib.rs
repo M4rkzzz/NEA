@@ -2517,6 +2517,26 @@ async fn set_steam_userdata_scope(
 }
 
 #[tauri::command]
+async fn set_steam_account_note(
+    app: AppHandle,
+    account_id: String,
+    note: String,
+) -> Result<steam::SteamWorkspace, String> {
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    let account = data
+        .steam
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "Steam 账号不存在".to_string())?;
+    let trimmed = note.trim();
+    account.note = (!trimmed.is_empty()).then(|| trimmed.chars().take(120).collect());
+    save_data(&data)?;
+    Ok(data.steam.clone())
+}
+
+#[tauri::command]
 async fn delete_steam_account(app: AppHandle, account_id: String) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut data = state.data.lock().map_err(|error| error.to_string())?;
@@ -4542,6 +4562,7 @@ pub fn run() {
             discover_steam,
             refresh_steam_accounts,
             set_steam_userdata_scope,
+            set_steam_account_note,
             delete_steam_account,
             switch_steam_account,
             get_plugin_status,
