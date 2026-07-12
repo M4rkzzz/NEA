@@ -2505,18 +2505,6 @@ async fn refresh_steam_accounts(app: AppHandle) -> Result<steam::SteamWorkspace,
 }
 
 #[tauri::command]
-async fn set_steam_userdata_scope(
-    app: AppHandle,
-    enabled: bool,
-) -> Result<steam::SteamWorkspace, String> {
-    let state = app.state::<AppState>();
-    let mut data = state.data.lock().map_err(|error| error.to_string())?;
-    data.steam.include_userdata = enabled;
-    save_data(&data)?;
-    Ok(data.steam.clone())
-}
-
-#[tauri::command]
 async fn set_steam_account_note(
     app: AppHandle,
     account_id: String,
@@ -2564,15 +2552,12 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
             .switch_operation
             .lock()
             .map_err(|error| error.to_string())?;
-        let (installation, include_userdata) = {
+        let installation = {
             let data = state.data.lock().map_err(|error| error.to_string())?;
-            (
-                data.steam
-                    .installation
-                    .clone()
-                    .ok_or_else(|| "请先搜索 Steam 安装目录".to_string())?,
-                data.steam.include_userdata,
-            )
+            data.steam
+                .installation
+                .clone()
+                .ok_or_else(|| "请先搜索 Steam 安装目录".to_string())?
         };
         let adapter = steam::SteamAdapter;
         let adapter_installation = adapters::AppInstallation {
@@ -2588,15 +2573,6 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
         adapter.stop(&adapter_installation)?;
         let switch_result = (|| {
             let account_name = steam::SteamAdapter::activate_account(&installation, &account_id)?;
-            if include_userdata {
-                let snapshot_dir = storage_dir()?
-                    .join("workspaces")
-                    .join("steam")
-                    .join("accounts")
-                    .join(&account_id)
-                    .join("userdata");
-                steam::SteamAdapter::capture_userdata(&installation, &account_id, &snapshot_dir)?;
-            }
             Ok::<_, String>(account_name)
         })();
         if let Err(error) = &switch_result {
@@ -4561,7 +4537,6 @@ pub fn run() {
             get_steam_workspace,
             discover_steam,
             refresh_steam_accounts,
-            set_steam_userdata_scope,
             set_steam_account_note,
             delete_steam_account,
             switch_steam_account,

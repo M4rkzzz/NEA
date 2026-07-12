@@ -639,22 +639,6 @@ button.primary.danger-confirm {
   color: #6b7280;
 }
 
-.check-row {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 30px;
-  color: #374151;
-  cursor: pointer;
-}
-
-.check-row input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: #2563eb;
-}
-
 .account-row-main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

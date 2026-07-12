@@ -39,8 +39,6 @@ pub struct SteamWorkspace {
     pub installation: Option<SteamInstallation>,
     pub accounts: Vec<SteamAccount>,
     pub current_account_id: Option<String>,
-    #[serde(default)]
-    pub include_userdata: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -344,20 +342,6 @@ impl SteamAdapter {
             .map_err(|error| format!("备份 Steam 登录状态失败: {}", error))?;
         Ok(())
     }
-
-    pub fn capture_userdata(
-        installation: &SteamInstallation,
-        steam_id: &str,
-        destination: &Path,
-    ) -> Result<(), String> {
-        let source = PathBuf::from(&installation.install_dir)
-            .join("userdata")
-            .join(steam_id);
-        if !source.is_dir() {
-            return Ok(());
-        }
-        copy_dir(&source, destination)
-    }
 }
 
 fn select_account(root: &mut BTreeMap<String, VdfValue>, steam_id: &str) -> Result<String, String> {
@@ -382,24 +366,6 @@ fn select_account(root: &mut BTreeMap<String, VdfValue>, steam_id: &str) -> Resu
         }
     }
     selected.ok_or_else(|| "目标 Steam 账号已不存在".to_string())
-}
-
-fn copy_dir(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let target = destination.join(entry.file_name());
-        if entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-        {
-            copy_dir(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
 }
 
 fn process_system() -> System {

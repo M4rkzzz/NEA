@@ -57,7 +57,6 @@ type SteamWorkspace = {
   installation?: { installDir: string; executable: string; valid: boolean };
   accounts: SteamAccount[];
   currentAccountId?: string;
-  includeUserdata: boolean;
 };
 
 type SwitchResult = {
@@ -185,7 +184,7 @@ function errorMessage(error: unknown) {
 }
 
 function App() {
-  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], includeUserdata: false } });
+  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [] } });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState("正在初始化...");
@@ -517,11 +516,6 @@ function App() {
     setMessage(result.message);
   }
 
-  async function setSteamUserdata(enabled: boolean) {
-    const workspace = await runTask(enabled ? "正在启用 Steam userdata 快照..." : "正在关闭 Steam userdata 快照...", () => invoke<SteamWorkspace>("set_steam_userdata_scope", { enabled }));
-    setData((current) => ({ ...current, steam: workspace }));
-  }
-
   async function deleteSteamAccount(account: SteamAccount) {
     await runTask("正在删除 Steam 账号快照...", () => invoke("delete_steam_account", { accountId: account.id }));
     setPendingDeleteSteamAccount(null);
@@ -797,8 +791,6 @@ function App() {
           <dt>程序</dt><dd>{data.steam.installation?.executable || "未设置"}</dd>
           <dt>安装目录</dt><dd>{data.steam.installation?.installDir || "未设置"}</dd>
         </dl>
-        <div className="notice">Steam Guard、密码和二次验证由 Steam 自己处理，NEA 不保存密码或绕过验证。</div>
-        <div className="actions"><label className="check-row"><input type="checkbox" checked={data.steam.includeUserdata} onChange={(event) => handleAction(() => setSteamUserdata(event.target.checked))} disabled={busy} />切换时额外保存对应 userdata</label></div>
       </div>
     </section>
   );
