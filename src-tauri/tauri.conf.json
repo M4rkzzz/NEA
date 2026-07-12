@@ -29,7 +29,12 @@
     "targets": ["msi"],
     "windows": {
       "wix": {
-        "upgradeCode": "ad32cc2e-6059-5afe-9ea1-403fa1467432"
+        "upgradeCode": "ad32cc2e-6059-5afe-9ea1-403fa1467432",
+        "fragmentPaths": ["wix/legacy-cleanup.wxs"],
+        "componentRefs": [
+          "RemoveLegacyDesktopShortcut",
+          "RemoveLegacyStartMenuShortcuts"
+        ]
       }
     },
     "icon": [

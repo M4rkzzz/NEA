@@ -816,7 +816,7 @@ function App() {
 
   function selectApp(app: AppKey) {
     setActiveApp(app);
-    setActiveFeature("overview");
+    setActiveFeature("switcher");
   }
 
   const activeContent = activeApp === "oopz"
