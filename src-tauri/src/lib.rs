@@ -728,7 +728,12 @@ fn download_update_asset(
 fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
     let program_files_exes = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
-        .map(|path| vec![path.join("NEA").join("oopz-plus.exe"), path.join("OOPZ+").join("oopz-plus.exe")]);
+        .map(|path| {
+            vec![
+                path.join("NEA").join("oopz-plus.exe"),
+                path.join("OOPZ+").join("oopz-plus.exe"),
+            ]
+        });
     if original_exe
         .to_string_lossy()
         .to_ascii_lowercase()
@@ -736,7 +741,9 @@ fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
         && original_exe.exists()
     {
         original_exe.to_path_buf()
-    } else if let Some(path) = program_files_exes.and_then(|paths| paths.into_iter().find(|path| path.exists())) {
+    } else if let Some(path) =
+        program_files_exes.and_then(|paths| paths.into_iter().find(|path| path.exists()))
+    {
         path
     } else {
         original_exe.to_path_buf()
