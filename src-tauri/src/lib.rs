@@ -44,8 +44,14 @@ use windows_core::Interface;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
-const APP_DIR_NAME: &str = "OOPZ+";
-const CREDENTIAL_SERVICE: &str = "OOPZ+";
+mod adapters;
+mod steam;
+use adapters::AppAdapter;
+
+const APP_DIR_NAME: &str = "NEA";
+const LEGACY_APP_DIR_NAME: &str = "OOPZ+";
+const CREDENTIAL_SERVICE: &str = "NEA";
+const LEGACY_CREDENTIAL_SERVICE: &str = "OOPZ+";
 const WATCHER_FILE_NAME: &str = "oopz-plus-watcher.exe";
 const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
@@ -68,6 +74,7 @@ const RUN_KEY_NAME: &str = "OOPZ+ Watcher";
 const LEGACY_EXPORT_FORMAT: &str = "oopz-plus-account-v1";
 const EXPORT_FORMAT: &str = "oopz-plus-package-v2";
 const EXPORT_FORMAT_V3: &str = "oopz-plus-package-v3";
+const NEA_EXPORT_FORMAT_V1: &str = "nea-package-v1";
 const MAX_EXPORT_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_V3_ARCHIVE_BYTES: u64 = 528 * 1024 * 1024;
 const MAX_LEGACY_EXPORT_PACKAGE_BYTES: u64 = 128 * 1024 * 1024;
@@ -145,8 +152,14 @@ struct V3AccountManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct V3ExportManifest {
     format: String,
+    #[serde(default = "default_oopz_app_id")]
+    app_id: String,
     exported_at: String,
     accounts: Vec<V3AccountManifest>,
+}
+
+fn default_oopz_app_id() -> String {
+    "oopz".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,8 +224,12 @@ struct ExportedFile {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AppData {
+    #[serde(default)]
+    schema_version: u32,
     config: AppConfig,
     accounts: Vec<SavedAccount>,
+    #[serde(default)]
+    steam: steam::SteamWorkspace,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_login_uid: Option<String>,
 }
@@ -371,7 +388,53 @@ fn home_env(name: &str) -> Result<PathBuf, String> {
 
 fn storage_dir() -> Result<PathBuf, String> {
     let base = home_env("APPDATA")?;
-    Ok(base.join(APP_DIR_NAME))
+    let current = base.join(APP_DIR_NAME);
+    let legacy = base.join(LEGACY_APP_DIR_NAME);
+    if !current.exists() && legacy.exists() {
+        fs::create_dir_all(&current).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(&legacy).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let destination = current.join(entry.file_name());
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                copy_directory(&entry.path(), &destination)?;
+            } else {
+                fs::copy(entry.path(), destination).map_err(|error| error.to_string())?;
+            }
+        }
+        let marker = current.join("migrated-from-oopz-plus.txt");
+        let _ = fs::write(marker, now());
+    }
+    let oopz_workspace = current.join("workspaces").join("oopz");
+    for folder in ["accounts", "backups"] {
+        let legacy_folder = current.join(folder);
+        let workspace_folder = oopz_workspace.join(folder);
+        if legacy_folder.exists() && !workspace_folder.exists() {
+            copy_directory(&legacy_folder, &workspace_folder)?;
+        }
+    }
+    Ok(current)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -379,11 +442,17 @@ fn config_path() -> Result<PathBuf, String> {
 }
 
 fn accounts_dir() -> Result<PathBuf, String> {
-    Ok(storage_dir()?.join("accounts"))
+    Ok(storage_dir()?
+        .join("workspaces")
+        .join("oopz")
+        .join("accounts"))
 }
 
 fn backups_dir() -> Result<PathBuf, String> {
-    Ok(storage_dir()?.join("backups"))
+    Ok(storage_dir()?
+        .join("workspaces")
+        .join("oopz")
+        .join("backups"))
 }
 
 fn update_marker_path() -> Result<PathBuf, String> {
@@ -493,9 +562,14 @@ fn record_update_check(app: &AppHandle) -> Result<(), String> {
 }
 
 fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'a str, String> {
-    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
-    if !asset.name.eq_ignore_ascii_case(&expected_name) {
-        return Err(format!("Release 缺少安装包 {}", expected_name));
+    let nea_name = format!("NEA_{}_x64_en-US.msi", version);
+    let legacy_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    if !asset.name.eq_ignore_ascii_case(&nea_name) && !asset.name.eq_ignore_ascii_case(&legacy_name)
+    {
+        return Err(format!(
+            "Release 缺少安装包 {} 或 {}",
+            nea_name, legacy_name
+        ));
     }
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
         return Err("更新安装包大小异常".to_string());
@@ -530,7 +604,7 @@ fn download_update_asset_from_url(
     version: &str,
     expected_digest: &str,
 ) -> Result<PathBuf, String> {
-    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    let expected_name = asset.name.clone();
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -538,7 +612,7 @@ fn download_update_asset_from_url(
         .map_err(|e| e.to_string())?;
     let mut response = client
         .get(download_url)
-        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .header(reqwest::header::USER_AGENT, "NEA-Updater")
         .send()
         .map_err(|e| format!("下载更新失败: {}", e))?
         .error_for_status()
@@ -652,9 +726,9 @@ fn download_update_asset(
 }
 
 fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
-    let program_files_exe = std::env::var_os("ProgramFiles")
+    let program_files_exes = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
-        .map(|path| path.join("OOPZ+").join("oopz-plus.exe"));
+        .map(|path| vec![path.join("NEA").join("oopz-plus.exe"), path.join("OOPZ+").join("oopz-plus.exe")]);
     if original_exe
         .to_string_lossy()
         .to_ascii_lowercase()
@@ -662,8 +736,8 @@ fn preferred_installed_exe(original_exe: &Path) -> PathBuf {
         && original_exe.exists()
     {
         original_exe.to_path_buf()
-    } else if program_files_exe.as_ref().is_some_and(|path| path.exists()) {
-        program_files_exe.unwrap()
+    } else if let Some(path) = program_files_exes.and_then(|paths| paths.into_iter().find(|path| path.exists())) {
+        path
     } else {
         original_exe.to_path_buf()
     }
@@ -766,7 +840,7 @@ fn perform_update_check(app: &AppHandle, force: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let response = client
         .get(GITHUB_LATEST_RELEASE_URL)
-        .header(reqwest::header::USER_AGENT, "OOPZ-Plus-Updater")
+        .header(reqwest::header::USER_AGENT, "NEA-Updater")
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
@@ -801,12 +875,19 @@ fn perform_update_check(app: &AppHandle, force: bool) -> Result<(), String> {
         set_update_status(app, "current", None, "当前已是最新版本");
         return Ok(());
     }
-    let expected_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    let nea_name = format!("NEA_{}_x64_en-US.msi", version);
+    let legacy_name = format!("OOPZ+_{}_x64_en-US.msi", version);
     let asset = release
         .assets
         .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(&expected_name))
-        .ok_or_else(|| format!("Release 缺少安装包 {}", expected_name))?;
+        .find(|asset| asset.name.eq_ignore_ascii_case(&nea_name))
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name.eq_ignore_ascii_case(&legacy_name))
+        })
+        .ok_or_else(|| format!("Release 缺少安装包 {} 或 {}", nea_name, legacy_name))?;
     set_update_status(
         app,
         "downloading",
@@ -940,6 +1021,9 @@ fn load_data() -> AppData {
         return AppData::default();
     };
     let mut data: AppData = serde_json::from_str(&raw).unwrap_or_default();
+    if data.schema_version == 0 {
+        data.schema_version = 2;
+    }
     migrate_current_login_state(&mut data);
     migrate_avatar_sources(&mut data);
     reconcile_account_readiness(&mut data);
@@ -2055,8 +2139,19 @@ fn credential_entry(account_id: &str) -> Result<Entry, String> {
     Entry::new(CREDENTIAL_SERVICE, account_id).map_err(|e| e.to_string())
 }
 
+fn legacy_credential_entry(account_id: &str) -> Result<Entry, String> {
+    Entry::new(LEGACY_CREDENTIAL_SERVICE, account_id).map_err(|e| e.to_string())
+}
+
 fn read_secret_raw(account_id: &str) -> Option<String> {
-    credential_entry(account_id).ok()?.get_password().ok()
+    credential_entry(account_id)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .or_else(|| {
+            legacy_credential_entry(account_id)
+                .ok()
+                .and_then(|entry| entry.get_password().ok())
+        })
 }
 
 fn write_secret_raw(account_id: &str, raw: &str) -> Result<(), String> {
@@ -2093,6 +2188,9 @@ fn read_oopz_login(account_id: &str) -> Option<String> {
 
 fn delete_credential(account_id: &str) {
     if let Ok(entry) = credential_entry(account_id) {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(entry) = legacy_credential_entry(account_id) {
         let _ = entry.delete_credential();
     }
 }
@@ -2291,7 +2389,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     menu.append(&MenuItem::with_id(
         app,
         "show",
-        "打开 OOPZ+",
+        "打开 NEA",
         true,
         None::<&str>,
     )?)?;
@@ -2361,6 +2459,142 @@ async fn get_app_data(app: AppHandle) -> Result<AppData, String> {
     tauri::async_runtime::spawn_blocking(move || get_app_data_inner(&app))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_steam_workspace(state: State<'_, AppState>) -> Result<steam::SteamWorkspace, String> {
+    state
+        .data
+        .lock()
+        .map(|data| data.steam.clone())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn discover_steam(app: AppHandle) -> Result<steam::SteamWorkspace, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let installation = steam::SteamAdapter::discover_installation()?;
+        let accounts = steam::SteamAdapter::read_accounts(&installation)?;
+        let state = app.state::<AppState>();
+        let mut data = state.data.lock().map_err(|error| error.to_string())?;
+        data.steam.installation = Some(installation);
+        data.steam.accounts = accounts;
+        data.steam.current_account_id = data
+            .steam
+            .accounts
+            .iter()
+            .find(|account| account.most_recent)
+            .map(|account| account.id.clone());
+        save_data(&data)?;
+        Ok(data.steam.clone())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn refresh_steam_accounts(app: AppHandle) -> Result<steam::SteamWorkspace, String> {
+    discover_steam(app).await
+}
+
+#[tauri::command]
+async fn set_steam_userdata_scope(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<steam::SteamWorkspace, String> {
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    data.steam.include_userdata = enabled;
+    save_data(&data)?;
+    Ok(data.steam.clone())
+}
+
+#[tauri::command]
+async fn delete_steam_account(app: AppHandle, account_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    data.steam
+        .accounts
+        .retain(|account| account.id != account_id);
+    save_data(&data)?;
+    let snapshot = storage_dir()?
+        .join("workspaces")
+        .join("steam")
+        .join("accounts")
+        .join(account_id);
+    if snapshot.exists() {
+        fs::remove_dir_all(snapshot)
+            .map_err(|error| format!("删除 Steam 账号快照失败: {}", error))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<SwitchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _operation = state
+            .switch_operation
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let (installation, include_userdata) = {
+            let data = state.data.lock().map_err(|error| error.to_string())?;
+            (
+                data.steam
+                    .installation
+                    .clone()
+                    .ok_or_else(|| "请先搜索 Steam 安装目录".to_string())?,
+                data.steam.include_userdata,
+            )
+        };
+        let adapter = steam::SteamAdapter;
+        let adapter_installation = adapters::AppInstallation {
+            executable: PathBuf::from(&installation.executable),
+            data_dir: PathBuf::from(&installation.install_dir),
+        };
+        let backup_dir = storage_dir()?
+            .join("workspaces")
+            .join("steam")
+            .join("backups")
+            .join(Uuid::new_v4().to_string());
+        steam::SteamAdapter::snapshot_login_state(&installation, &backup_dir)?;
+        adapter.stop(&adapter_installation)?;
+        let switch_result = (|| {
+            let account_name = steam::SteamAdapter::activate_account(&installation, &account_id)?;
+            if include_userdata {
+                let snapshot_dir = storage_dir()?
+                    .join("workspaces")
+                    .join("steam")
+                    .join("accounts")
+                    .join(&account_id)
+                    .join("userdata");
+                steam::SteamAdapter::capture_userdata(&installation, &account_id, &snapshot_dir)?;
+            }
+            Ok::<_, String>(account_name)
+        })();
+        if let Err(error) = &switch_result {
+            let loginusers = PathBuf::from(&installation.install_dir)
+                .join("config")
+                .join("loginusers.vdf");
+            let _ = fs::copy(backup_dir.join("loginusers.vdf"), loginusers);
+            let _ = adapter.start(&adapter_installation);
+            return Err(error.clone());
+        }
+        adapter.start(&adapter_installation)?;
+        let account_name = switch_result?;
+        let mut data = state.data.lock().map_err(|error| error.to_string())?;
+        data.steam.current_account_id = Some(account_id.clone());
+        for account in &mut data.steam.accounts {
+            account.most_recent = account.id == account_id;
+        }
+        save_data(&data)?;
+        Ok(SwitchResult {
+            ok: true,
+            message: format!("已切换到 Steam 账号 {}", account_name),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn schedule_auto_import_current_login(app: AppHandle) {
@@ -2873,7 +3107,8 @@ fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(),
             .start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         let manifest = V3ExportManifest {
-            format: EXPORT_FORMAT_V3.to_string(),
+            format: NEA_EXPORT_FORMAT_V1.to_string(),
+            app_id: "oopz".to_string(),
             exported_at: now(),
             accounts: manifest_accounts,
         };
@@ -3349,7 +3584,8 @@ fn read_v3_manifest(archive: &mut ZipArchive<fs::File>) -> Result<V3ExportManife
         .read_to_end(&mut raw)
         .map_err(|e| e.to_string())?;
     let manifest: V3ExportManifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    if manifest.format != EXPORT_FORMAT_V3
+    if (manifest.format != EXPORT_FORMAT_V3 && manifest.format != NEA_EXPORT_FORMAT_V1)
+        || !manifest.app_id.eq_ignore_ascii_case("oopz")
         || manifest.accounts.is_empty()
         || manifest.accounts.len() > MAX_EXPORT_ACCOUNTS
     {
@@ -4295,6 +4531,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
+            get_steam_workspace,
+            discover_steam,
+            refresh_steam_accounts,
+            set_steam_userdata_scope,
+            delete_steam_account,
+            switch_steam_account,
             get_plugin_status,
             set_plugin_mode,
             repair_plugin_environment,
@@ -4332,7 +4574,7 @@ pub fn run() {
                     "plugin-overlay",
                     WebviewUrl::App("index.html?overlay=1".into()),
                 )
-                .title("OOPZ+ Plugin")
+                .title("NEA OOPZ Plugin")
                 .decorations(false)
                 .transparent(true)
                 .shadow(false)
@@ -4358,7 +4600,7 @@ pub fn run() {
                 let _ = spawn_watcher();
             }
             let tray = TrayIconBuilder::with_id("main-tray")
-                .tooltip("OOPZ+")
+                .tooltip("NEA")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -4544,6 +4786,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let manifest = V3ExportManifest {
             format: EXPORT_FORMAT_V3.to_string(),
+            app_id: "oopz".to_string(),
             exported_at: now(),
             accounts: vec![V3AccountManifest {
                 directory: "account-000".to_string(),

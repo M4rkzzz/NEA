@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
+import { Gamepad2, LayoutDashboard, Minus, Square, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -35,9 +35,33 @@ type SavedAccount = {
 };
 
 type AppData = {
+  schemaVersion?: number;
   config: AppConfig;
   accounts: SavedAccount[];
+  steam: SteamWorkspace;
   currentLoginUid?: string;
+};
+
+type SteamAccount = {
+  id: string;
+  accountName: string;
+  displayName: string;
+  rememberPassword: boolean;
+  mostRecent: boolean;
+  userdataCaptured: boolean;
+  lastUsedAt?: string;
+};
+
+type SteamWorkspace = {
+  installation?: { installDir: string; executable: string; valid: boolean };
+  accounts: SteamAccount[];
+  currentAccountId?: string;
+  includeUserdata: boolean;
+};
+
+type SwitchResult = {
+  ok: boolean;
+  message: string;
 };
 
 type OopzPaths = {
@@ -91,7 +115,7 @@ type WormholeStatus = {
   total?: number;
 };
 
-type FeatureKey = "overview" | "switcher";
+type FeatureKey = "overview" | "oopz" | "steam";
 
 function fmtDate(value?: string) {
   if (!value) return "-";
@@ -159,7 +183,7 @@ function errorMessage(error: unknown) {
 }
 
 function App() {
-  const [data, setData] = useState<AppData>({ config: {}, accounts: [] });
+  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], includeUserdata: false } });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState("正在初始化...");
@@ -173,6 +197,7 @@ function App() {
   const [quickCode, setQuickCode] = useState("");
   const [receiveCode, setReceiveCode] = useState("");
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<SavedAccount | null>(null);
+  const [pendingDeleteSteamAccount, setPendingDeleteSteamAccount] = useState<SteamAccount | null>(null);
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -302,8 +327,8 @@ function App() {
     }
     const target = await save({
       title: "导出账号登录数据",
-      defaultPath: `${safeFileName(account.displayName)}_${exportTimestamp()}.oopz+`,
-      filters: [{ name: "OOPZ+ 登录态包", extensions: ["oopz+"] }],
+      defaultPath: `${safeFileName(account.displayName)}_${exportTimestamp()}.nea`,
+      filters: [{ name: "NEA 登录态包", extensions: ["nea"] }],
     });
     if (!target) return;
     const count = await runTask("正在导出账号...", () =>
@@ -315,8 +340,8 @@ function App() {
   async function exportAllAccounts() {
     const target = await save({
       title: "导出全部账号登录态",
-      defaultPath: `${exportTimestamp()}.oopz+`,
-      filters: [{ name: "OOPZ+ 登录态包", extensions: ["oopz+"] }],
+      defaultPath: `${exportTimestamp()}.nea`,
+      filters: [{ name: "NEA 登录态包", extensions: ["nea"] }],
     });
     if (!target) return;
     const count = await runTask("正在打包全部账号...", () =>
@@ -330,6 +355,7 @@ function App() {
       title: "导入账号登录数据",
       multiple: false,
       filters: [
+        { name: "NEA 登录态包", extensions: ["nea"] },
         { name: "OOPZ+ 登录态包", extensions: ["oopz+"] },
         { name: "旧版 OOPZ+ 登录数据", extensions: ["json", "txt"] },
       ],
@@ -475,6 +501,28 @@ function App() {
     setMessage(status.message);
   }
 
+  async function discoverSteam() {
+    const workspace = await runTask("正在搜索 Steam...", () => invoke<SteamWorkspace>("discover_steam"));
+    setData((current) => ({ ...current, steam: workspace }));
+    setMessage("Steam 账号已刷新");
+  }
+
+  async function switchSteamAccount(account: SteamAccount) {
+    const result = await runTask("正在切换 Steam 账号...", () => invoke<SwitchResult>("switch_steam_account", { accountId: account.id }));
+    setMessage(result.message);
+  }
+
+  async function setSteamUserdata(enabled: boolean) {
+    const workspace = await runTask(enabled ? "正在启用 Steam userdata 快照..." : "正在关闭 Steam userdata 快照...", () => invoke<SteamWorkspace>("set_steam_userdata_scope", { enabled }));
+    setData((current) => ({ ...current, steam: workspace }));
+  }
+
+  async function deleteSteamAccount(account: SteamAccount) {
+    await runTask("正在删除 Steam 账号快照...", () => invoke("delete_steam_account", { accountId: account.id }));
+    setPendingDeleteSteamAccount(null);
+    setMessage("Steam 账号快照已删除");
+  }
+
   function minimizeWindow() {
     void getCurrentWindow().minimize().catch((error) => setMessage(errorMessage(error)));
   }
@@ -563,22 +611,25 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (activeFeature === "switcher" && !scannedOnceRef.current) {
+    if (activeFeature === "oopz" && !scannedOnceRef.current) {
       refreshAccounts(false).catch(() => undefined);
     }
-    if (activeFeature === "switcher") {
+    if (activeFeature === "oopz") {
       refreshPluginStatus().catch(() => undefined);
     }
   }, [activeFeature]);
 
   useEffect(() => {
-    if (!pendingDeleteAccount) return;
+    if (!pendingDeleteAccount && !pendingDeleteSteamAccount) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) setPendingDeleteAccount(null);
+      if (event.key === "Escape" && !busy) {
+        setPendingDeleteAccount(null);
+        setPendingDeleteSteamAccount(null);
+      }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [pendingDeleteAccount, busy]);
+  }, [pendingDeleteAccount, pendingDeleteSteamAccount, busy]);
 
   useEffect(() => () => {
     scrollTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -627,7 +678,7 @@ function App() {
               <h3>{selected.displayName}</h3>
               <p>{accountLabel(selected)}</p>
             </div>
-            <button onClick={() => setActiveFeature("switcher")}>管理</button>
+            <button onClick={() => setActiveFeature("oopz")}>管理</button>
           </div>
         )}
       </div>
@@ -722,10 +773,38 @@ function App() {
     </section>
   );
 
+  const steam = (
+    <section className="content-stack">
+      <div className="panel">
+        <div className="panel-title"><h2>Steam 状态</h2><div className="actions"><button onClick={() => handleAction(discoverSteam)} disabled={busy}>搜索并刷新</button></div></div>
+        <dl className="paths">
+          <dt>程序</dt><dd>{data.steam.installation?.executable || "未设置"}</dd>
+          <dt>安装目录</dt><dd>{data.steam.installation?.installDir || "未设置"}</dd>
+        </dl>
+        <div className="notice">Steam Guard、密码和二次验证由 Steam 自己处理，NEA 不保存密码或绕过验证。</div>
+        <div className="actions"><label className="check-row"><input type="checkbox" checked={data.steam.includeUserdata} onChange={(event) => handleAction(() => setSteamUserdata(event.target.checked))} disabled={busy} />切换时额外保存对应 userdata</label></div>
+      </div>
+      <div className="panel">
+        <div className="panel-title"><h2>Steam 账号列表</h2></div>
+        <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
+          {data.steam.accounts.length === 0 && <div className="empty">未发现 Steam 账号，请先关闭 Steam 后点击刷新，或完成一次登录。</div>}
+          {data.steam.accounts.map((account) => (
+            <div className="account-row" data-selected={data.steam.currentAccountId === account.id} key={account.id}>
+              <div className="account-row-main">
+                <div className="account-main"><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{account.displayName}</strong><small>{account.accountName} · {account.id}</small></span></div>
+                <div className="account-actions"><button className="icon-button danger" onClick={() => setPendingDeleteSteamAccount(account)} disabled={busy} aria-label={`删除 ${account.displayName} 的 NEA 快照`} title="删除账号快照"><Trash2 size={16} /></button><button className={account.mostRecent ? "" : "primary"} onClick={() => handleAction(() => switchSteamAccount(account))} disabled={busy || account.mostRecent}>{account.mostRecent ? "当前登录" : "快速切号"}</button></div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+
   return (
     <main className="shell">
       <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
-        <div className="window-brand" data-tauri-drag-region>OOPZ+</div>
+        <div className="window-brand" data-tauri-drag-region>NEA</div>
         <div className="window-controls">
           <button onClick={minimizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最小化" title="最小化"><Minus size={15} /></button>
           <button onClick={toggleMaximizeWindow} onDoubleClick={(event) => event.stopPropagation()} aria-label="最大化或还原" title="最大化或还原"><Square size={13} /></button>
@@ -737,16 +816,17 @@ function App() {
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <nav className="feature-list">
             <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
-            <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
+            <button data-active={activeFeature === "oopz"} onClick={() => setActiveFeature("oopz")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>OOPZ</strong></button>
+            <button data-active={activeFeature === "steam"} onClick={() => setActiveFeature("steam")}><Gamepad2 size={17} strokeWidth={2} aria-hidden="true" /><strong>Steam</strong></button>
           </nav>
         </aside>
 
         <section className="workspace auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
-            <h2>{activeFeature === "overview" ? "概览" : "账号切换"}</h2>
+            <h2>{activeFeature === "overview" ? "概览" : activeFeature === "oopz" ? "OOPZ" : "Steam"}</h2>
             <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
           </header>
-          {activeFeature === "overview" ? overview : switcher}
+          {activeFeature === "overview" ? overview : activeFeature === "oopz" ? switcher : steam}
         </section>
       </div>
       {pendingDeleteAccount && (
@@ -757,6 +837,14 @@ function App() {
               <button className="primary danger-confirm" onClick={confirmDeleteSelected} disabled={busy} autoFocus>确定</button>
               <button onClick={() => setPendingDeleteAccount(null)} disabled={busy}>取消</button>
             </div>
+          </div>
+        </div>
+      )}
+      {pendingDeleteSteamAccount && (
+        <div className="confirm-backdrop" onMouseDown={() => !busy && setPendingDeleteSteamAccount(null)}>
+          <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="steam-delete-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
+            <p id="steam-delete-confirm-title">确定删除账号“{pendingDeleteSteamAccount.displayName}”吗？</p>
+            <div className="confirm-actions"><button className="primary danger-confirm" onClick={() => handleAction(() => deleteSteamAccount(pendingDeleteSteamAccount))} disabled={busy} autoFocus>确定</button><button onClick={() => setPendingDeleteSteamAccount(null)} disabled={busy}>取消</button></div>
           </div>
         </div>
       )}
