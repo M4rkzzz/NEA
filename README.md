@@ -1,6 +1,6 @@
 # NEA
 
-NEA（Not Enough Accounts）是一个面向 Windows 的本地多软件账号切换器。当前支持 OOPZ 与 Steam，在不保存密码、不绕过平台安全验证的前提下备份和恢复本地登录状态。
+NEA（Not Enough Accounts）是一个面向 Windows 的本地多软件账号切换器。当前支持 OOPZ、Steam 与完美世界竞技平台，在不保存密码、不绕过平台安全验证的前提下管理本地账号状态。
 
 > 项目由 OOPZ+ 演进而来。旧版 OOPZ+ 配置、账号快照、凭据和 `.oopz+` 包继续兼容，首次启动 NEA 会执行无损迁移。
 

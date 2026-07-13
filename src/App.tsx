@@ -59,6 +59,13 @@ type SteamWorkspace = {
   currentAccountId?: string;
 };
 
+type PerfectArenaWorkspace = {
+  installation?: { installDir: string; executable: string; valid: boolean };
+  accounts: SteamAccount[];
+  currentAccountId?: string;
+  running: boolean;
+};
+
 type SwitchResult = {
   ok: boolean;
   message: string;
@@ -115,7 +122,7 @@ type WormholeStatus = {
   total?: number;
 };
 
-type AppKey = "oopz" | "steam";
+type AppKey = "oopz" | "steam" | "perfect";
 type FeatureKey = "overview" | "switcher";
 
 function fmtDate(value?: string) {
@@ -202,6 +209,7 @@ function App() {
   const [pendingDeleteSteamAccount, setPendingDeleteSteamAccount] = useState<SteamAccount | null>(null);
   const [selectedSteamId, setSelectedSteamId] = useState<string | null>(null);
   const [steamNoteDraft, setSteamNoteDraft] = useState("");
+  const [perfectWorkspace, setPerfectWorkspace] = useState<PerfectArenaWorkspace>({ accounts: [], running: false });
   const scannedOnceRef = useRef(false);
   const dataSignatureRef = useRef("");
   const busyRef = useRef(false);
@@ -508,7 +516,26 @@ function App() {
   async function discoverSteam() {
     const workspace = await runTask("正在搜索 Steam...", () => invoke<SteamWorkspace>("discover_steam"));
     setData((current) => ({ ...current, steam: workspace }));
+    await refreshPerfectArena();
     setMessage("Steam 账号已刷新");
+  }
+
+  async function refreshPerfectArena() {
+    const workspace = await invoke<PerfectArenaWorkspace>("get_perfect_arena_workspace");
+    setPerfectWorkspace(workspace);
+    return workspace;
+  }
+
+  async function discoverPerfectArena() {
+    const workspace = await runTask("正在搜索完美对战平台...", () => invoke<PerfectArenaWorkspace>("discover_perfect_arena"));
+    setPerfectWorkspace(workspace);
+    setMessage(workspace.installation ? "完美对战平台账号已刷新" : "未找到完美对战平台");
+  }
+
+  async function switchPerfectArenaAccount(account: SteamAccount) {
+    const result = await runTask("正在联动切换 Steam 与完美对战平台...", () => invoke<SwitchResult>("switch_perfect_arena_account", { accountId: account.id }));
+    await refreshPerfectArena();
+    setMessage(result.message);
   }
 
   async function switchSteamAccount(account: SteamAccount) {
@@ -530,6 +557,7 @@ function App() {
   async function saveSteamNote(account: SteamAccount) {
     const workspace = await runTask("正在保存 Steam 账号备注...", () => invoke<SteamWorkspace>("set_steam_account_note", { accountId: account.id, note: steamNoteDraft }));
     setData((current) => ({ ...current, steam: workspace }));
+    await refreshPerfectArena();
     setMessage("Steam 账号备注已保存");
   }
 
@@ -571,6 +599,7 @@ function App() {
       if (status.state === "updated" || status.state === "error") setMessage(status.message);
     }).catch(() => undefined);
     refreshPluginStatus().catch(() => undefined);
+    refreshPerfectArena().catch(() => undefined);
 
     let disposed = false;
     const unsubs: Array<() => void> = [];
@@ -587,6 +616,7 @@ function App() {
     }));
     keepListener(listen<unknown>("switch-finished", (event) => {
       refresh().catch(() => undefined);
+      refreshPerfectArena().catch(() => undefined);
       const payload = event.payload as { Ok?: { message?: string }; Err?: string } | string;
       if (typeof payload === "string") setMessage(payload);
       else if (payload?.Ok?.message) setMessage(payload.Ok.message);
@@ -626,6 +656,9 @@ function App() {
     }
     if (activeApp === "oopz" && activeFeature === "switcher") {
       refreshPluginStatus().catch(() => undefined);
+    }
+    if (activeApp === "perfect") {
+      refreshPerfectArena().catch(() => undefined);
     }
   }, [activeApp, activeFeature]);
 
@@ -814,6 +847,42 @@ function App() {
     </section>
   );
 
+  const perfectOverview = (
+    <section className="content-stack">
+      <div className="panel">
+        <div className="panel-title"><h2>完美对战平台状态</h2><div className="actions"><button onClick={() => handleAction(discoverPerfectArena)} disabled={busy}>重新搜索</button></div></div>
+        <dl className="paths">
+          <dt>程序</dt><dd>{perfectWorkspace.installation?.executable || "未找到"}</dd>
+          <dt>运行状态</dt><dd>{perfectWorkspace.running ? "运行中" : "未运行"}</dd>
+          <dt>当前账号</dt><dd>{perfectWorkspace.accounts.find((account) => account.id === perfectWorkspace.currentAccountId)?.displayName || "未识别"}</dd>
+        </dl>
+      </div>
+    </section>
+  );
+
+  const perfectSwitcher = (
+    <section className="content-stack">
+      <div className="panel">
+        <div className="panel-title"><h2>完美对战平台账号</h2><div className="actions"><button onClick={() => handleAction(discoverPerfectArena)} disabled={busy}>搜索并刷新</button></div></div>
+        <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
+          {!perfectWorkspace.installation && <div className="empty">未找到完美对战平台。</div>}
+          {perfectWorkspace.installation && perfectWorkspace.accounts.length === 0 && <div className="empty">暂无可用 Steam 账号，请先刷新 Steam 账号列表。</div>}
+          {perfectWorkspace.accounts.map((account) => {
+            const current = perfectWorkspace.currentAccountId === account.id;
+            return (
+              <div className="account-row" data-selected={current} key={account.id}>
+                <div className="account-row-main">
+                  <div className="account-main account-main-static"><span className="avatar-wrap"><span className="avatar-fallback">P</span></span><span><strong>{account.displayName}</strong><small>{account.accountName} · {account.id}{account.note ? ` · ${account.note}` : ""}</small></span></div>
+                  <div className="account-actions"><button className={current ? "" : "primary"} onClick={() => handleAction(() => switchPerfectArenaAccount(account))} disabled={busy || current || !perfectWorkspace.installation}>{current ? "当前登录" : "联动切号"}</button></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+
   function selectApp(app: AppKey) {
     setActiveApp(app);
     setActiveFeature("switcher");
@@ -821,7 +890,10 @@ function App() {
 
   const activeContent = activeApp === "oopz"
     ? activeFeature === "overview" ? overview : switcher
-    : activeFeature === "overview" ? steamOverview : steamSwitcher;
+    : activeApp === "steam"
+      ? activeFeature === "overview" ? steamOverview : steamSwitcher
+      : activeFeature === "overview" ? perfectOverview : perfectSwitcher;
+  const activeAppName = activeApp === "oopz" ? "OOPZ" : activeApp === "steam" ? "Steam" : "完美对战平台";
 
   return (
     <main className="shell">
@@ -842,10 +914,11 @@ function App() {
           <nav className="app-list" aria-label="软件切换">
             <button data-active={activeApp === "oopz"} onClick={() => selectApp("oopz")} aria-label="切换到 OOPZ" title="OOPZ"><img className="app-icon-image" src="/oopz-icon.png" alt="" /></button>
             <button data-active={activeApp === "steam"} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><img className="app-icon-image" src="/steam-icon.svg" alt="" /></button>
+            <button data-active={activeApp === "perfect"} onClick={() => selectApp("perfect")} aria-label="切换到完美对战平台" title="完美对战平台"><img className="app-icon-image" src="/perfect-arena-icon.png" alt="" /></button>
           </nav>
         </aside>
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
-          <div className="sidebar-app-name">{activeApp === "oopz" ? "OOPZ" : "Steam"}</div>
+          <div className="sidebar-app-name">{activeAppName}</div>
           <nav className="feature-list">
             <button data-active={activeFeature === "overview"} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
             <button data-active={activeFeature === "switcher"} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
@@ -854,7 +927,7 @@ function App() {
 
         <section className="workspace auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
-            <h2>{activeApp === "oopz" ? "OOPZ" : "Steam"} · {activeFeature === "overview" ? "概览" : "账号切换"}</h2>
+            <h2>{activeAppName} · {activeFeature === "overview" ? "概览" : "账号切换"}</h2>
             <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
           </header>
           {activeContent}

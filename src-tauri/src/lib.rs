@@ -45,6 +45,7 @@ use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod adapters;
+mod perfect_arena;
 mod steam;
 use adapters::AppAdapter;
 
@@ -2539,6 +2540,49 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         }
     }
     menu.append(&steam_menu)?;
+
+    let perfect_workspace = perfect_arena::workspace(&data.steam);
+    let perfect_menu = Submenu::new(app, "完美对战平台", true)?;
+    if perfect_workspace.installation.is_none() {
+        perfect_menu.append(&MenuItem::with_id(
+            app,
+            "perfect-missing",
+            "未安装",
+            false,
+            None::<&str>,
+        )?)?;
+    } else if perfect_workspace.accounts.is_empty() {
+        perfect_menu.append(&MenuItem::with_id(
+            app,
+            "perfect-empty",
+            "暂无 Steam 账号",
+            false,
+            None::<&str>,
+        )?)?;
+    } else {
+        for account in &perfect_workspace.accounts {
+            let mut label = match account
+                .note
+                .as_deref()
+                .filter(|note| !note.trim().is_empty())
+            {
+                Some(note) => format!("{}（{}）", account.display_name, note),
+                None => account.display_name.clone(),
+            };
+            let is_current = perfect_workspace.current_account_id.as_deref() == Some(&account.id);
+            if is_current {
+                label.push_str("（登录中）");
+            }
+            perfect_menu.append(&MenuItem::with_id(
+                app,
+                format!("perfect-switch:{}", account.id),
+                label,
+                !is_current,
+                None::<&str>,
+            )?)?;
+        }
+    }
+    menu.append(&perfect_menu)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
     Ok(menu)
@@ -2601,6 +2645,80 @@ async fn discover_steam(app: AppHandle) -> Result<steam::SteamWorkspace, String>
 #[tauri::command]
 async fn refresh_steam_accounts(app: AppHandle) -> Result<steam::SteamWorkspace, String> {
     discover_steam(app).await
+}
+
+#[tauri::command]
+async fn get_perfect_arena_workspace(
+    state: State<'_, AppState>,
+) -> Result<perfect_arena::PerfectArenaWorkspace, String> {
+    let steam = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .steam
+        .clone();
+    Ok(perfect_arena::workspace(&steam))
+}
+
+#[tauri::command]
+async fn discover_perfect_arena(
+    app: AppHandle,
+) -> Result<perfect_arena::PerfectArenaWorkspace, String> {
+    if app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .steam
+        .accounts
+        .is_empty()
+    {
+        discover_steam(app.clone()).await?;
+    }
+    get_perfect_arena_workspace(app.state::<AppState>()).await
+}
+
+#[tauri::command]
+async fn switch_perfect_arena_account(
+    app: AppHandle,
+    account_id: String,
+) -> Result<SwitchResult, String> {
+    let installation = perfect_arena::discover_installation()?;
+    let installation_for_stop = installation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        perfect_arena::ensure_games_stopped()?;
+        perfect_arena::stop(&installation_for_stop)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    if let Err(error) = switch_steam_account(app.clone(), account_id.clone()).await {
+        let _ = perfect_arena::start(&installation);
+        return Err(error);
+    }
+
+    let account_name = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .steam
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.display_name.clone())
+        .unwrap_or(account_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        thread::sleep(Duration::from_secs(2));
+        perfect_arena::start(&installation)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    update_tray(&app);
+    Ok(SwitchResult {
+        ok: true,
+        message: format!("已切换 Steam 并启动完美对战平台：{}", account_name),
+    })
 }
 
 #[tauri::command]
@@ -4643,6 +4761,9 @@ pub fn run() {
             get_steam_workspace,
             discover_steam,
             refresh_steam_accounts,
+            get_perfect_arena_workspace,
+            discover_perfect_arena,
+            switch_perfect_arena_account,
             set_steam_account_note,
             delete_steam_account,
             switch_steam_account,
@@ -4754,6 +4875,19 @@ pub fn run() {
                                     app_handle.clone(),
                                     account_id,
                                 ));
+                                let _ = app_handle.emit(
+                                    "switch-finished",
+                                    result.map_err(|error| error.to_string()),
+                                );
+                            });
+                        }
+                        _ if id.starts_with("perfect-switch:") => {
+                            let account_id = id.trim_start_matches("perfect-switch:").to_string();
+                            let app_handle = app.clone();
+                            thread::spawn(move || {
+                                let result = tauri::async_runtime::block_on(
+                                    switch_perfect_arena_account(app_handle.clone(), account_id),
+                                );
                                 let _ = app_handle.emit(
                                     "switch-finished",
                                     result.map_err(|error| error.to_string()),
