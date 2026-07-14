@@ -1162,7 +1162,7 @@ function App() {
         <label><input type="checkbox" checked={perfectPendingOnly} onChange={(event) => setPerfectPendingOnly(event.target.checked)} />仅显示待检测</label>
         <label><input type="checkbox" checked={perfectAvailableOnly} onChange={(event) => setPerfectAvailableOnly(event.target.checked)} />仅显示可用账号</label>
       </div>
-      <div className="perfect-account-grid">
+      <div className="perfect-account-grid auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
         {data.steam.webSessions.length === 0 && <div className="empty perfect-grid-empty">暂无账号。</div>}
         {data.steam.webSessions.length > 0 && filteredPerfectSessions.length === 0 && <div className="empty perfect-grid-empty">没有符合筛选条件的账号。</div>}
         {filteredPerfectSessions.map((session) => {
@@ -1210,6 +1210,18 @@ function App() {
   function selectApp(app: AppKey) {
     setActiveApp(app);
     setActiveFeature("switcher");
+    if (app === "oopz") {
+      setMessage(`已保存 ${data.accounts.length} 个 OOPZ 账号，${sessionCount} 个可快速切换`);
+    } else if (app === "steam") {
+      setMessage(`Steam 网页账号 ${data.steam.webSessions.length} 个，客户端账号 ${data.steam.accounts.length} 个`);
+    } else {
+      const available = data.steam.webSessions.filter((session) => {
+        if (!session.steamId || data.perfectUnavailableAccountIds?.includes(session.steamId)) return false;
+        const profile = perfectProfiles[session.steamId];
+        return !profile?.highRisk && !profile?.reputationRequiresVerification;
+      }).length;
+      setMessage(`完美账号 ${data.steam.webSessions.length} 个，${available} 个可快速切换`);
+    }
   }
 
   const activeContent = activeApp === "oopz"
@@ -1250,7 +1262,7 @@ function App() {
           </nav>
         </aside>
 
-        <section className="workspace auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
+        <section className="workspace auto-hide-scrollbar" data-contained-scroll={activeApp === "perfect" && activeFeature === "switcher" || undefined} onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
             <h2>{activeAppName} · {activeFeature === "overview" ? "概览" : "账号切换"}</h2>
             <div className="status" data-busy={busy}>{busy && <span className="spinner" />}<span>{message}</span></div>
