@@ -13,7 +13,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -23,6 +23,7 @@ use sysinfo::{Pid, ProcessRefreshKind, Signal, System, UpdateKind};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::{Cookie, PageLoadEvent},
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
@@ -90,6 +91,9 @@ const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/M4rkzzz/NE
 const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
+static CONFIG_WRITES_BLOCKED: AtomicBool = AtomicBool::new(false);
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static LAST_INTERNAL_CONFIG_BYTES: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +235,10 @@ struct AppData {
     accounts: Vec<SavedAccount>,
     #[serde(default)]
     steam: steam::SteamWorkspace,
+    #[serde(default)]
+    perfect_profiles: HashMap<String, perfect_arena::PerfectArenaProfile>,
+    #[serde(default)]
+    perfect_unavailable_account_ids: HashSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_login_uid: Option<String>,
 }
@@ -318,6 +326,61 @@ struct WormholeStatus {
     total: Option<u64>,
 }
 
+const NEA_SHARE_FORMAT_V1: &str = "nea-wormhole-share-v1";
+const MAX_SHARED_WEB_SESSIONS: usize = 100;
+const MAX_SHARED_COOKIES_PER_SESSION: usize = 256;
+const MAX_SHARED_COOKIE_BYTES: usize = 16 * 1024;
+const MAX_SHARE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickShareSelection {
+    #[serde(default)]
+    oopz_account_ids: Vec<String>,
+    #[serde(default)]
+    steam_web_session_ids: Vec<String>,
+    #[serde(default)]
+    perfect_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedWebSession {
+    kind: String,
+    session: steam::SteamWebSession,
+    cookies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    perfect_profile: Option<perfect_arena::PerfectArenaProfile>,
+    #[serde(default)]
+    perfect_unavailable: bool,
+    #[serde(default)]
+    perfect_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeaShareManifest {
+    format: String,
+    exported_at: String,
+    has_oopz_package: bool,
+    web_sessions: Vec<SharedWebSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickImportResult {
+    oopz_accounts: Vec<SavedAccount>,
+    steam_web_accounts: usize,
+    perfect_accounts: usize,
+}
+
+struct PreparedQuickImport {
+    root: PathBuf,
+    manifest: NeaShareManifest,
+    oopz_package: Option<PathBuf>,
+    perfect_files: Vec<(String, String, PathBuf)>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -341,6 +404,7 @@ struct AppState {
     data: Mutex<AppData>,
     account_operation: Mutex<()>,
     switch_operation: Mutex<()>,
+    switch_running: AtomicBool,
     discovery_cancelled: AtomicBool,
     auto_import_running: AtomicBool,
     plugin_operation: Mutex<()>,
@@ -351,7 +415,56 @@ struct AppState {
     update_status: Mutex<UpdateStatus>,
     wormhole_running: AtomicBool,
     wormhole_cancelled: AtomicBool,
+    steam_web_import_running: AtomicBool,
     main_webview_low_memory: AtomicBool,
+}
+
+struct SwitchActivityGuard {
+    app: AppHandle,
+}
+
+struct SteamWebImportGuard {
+    app: AppHandle,
+}
+
+impl Drop for SteamWebImportGuard {
+    fn drop(&mut self) {
+        self.app
+            .state::<AppState>()
+            .steam_web_import_running
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+fn acquire_steam_web_import(app: &AppHandle) -> Result<SteamWebImportGuard, String> {
+    if app
+        .state::<AppState>()
+        .steam_web_import_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("已有 Steam 网页账号批量导入正在进行".to_string());
+    }
+    Ok(SteamWebImportGuard { app: app.clone() })
+}
+
+impl Drop for SwitchActivityGuard {
+    fn drop(&mut self) {
+        self.app
+            .state::<AppState>()
+            .switch_running
+            .store(false, Ordering::SeqCst);
+    }
+}
+
+fn acquire_switch_activity(app: &AppHandle) -> Result<SwitchActivityGuard, String> {
+    if app
+        .state::<AppState>()
+        .switch_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("另一项切号或恢复操作正在进行，请稍候".to_string());
+    }
+    Ok(SwitchActivityGuard { app: app.clone() })
 }
 
 struct NamedMutex(HANDLE);
@@ -393,10 +506,8 @@ fn storage_dir() -> Result<PathBuf, String> {
     let legacy = base.join(LEGACY_APP_DIR_NAME);
     fs::create_dir_all(&current).map_err(|error| error.to_string())?;
     let marker = current.join("migration-from-oopz-plus-v2.txt");
-    if legacy.exists() && !marker.exists() {
-        if migrate_legacy_storage(&legacy, &current).is_ok() {
-            let _ = fs::write(marker, now());
-        }
+    if legacy.exists() && !marker.exists() && migrate_legacy_storage(&legacy, &current).is_ok() {
+        let _ = fs::write(marker, now());
     }
     let oopz_workspace = current.join("workspaces").join("oopz");
     for folder in ["accounts", "backups"] {
@@ -1078,17 +1189,62 @@ fn ensure_storage() -> Result<(), String> {
     Ok(())
 }
 
+fn parse_app_data_file(path: &Path) -> Option<(AppData, String)> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<AppData>(&raw)
+        .ok()
+        .map(|data| (data, raw))
+}
+
+fn recover_config_file(path: &Path) -> Option<(AppData, String)> {
+    let backup = path.with_extension("json.bak");
+    let temp = path.with_extension("json.tmp");
+    if let Some(valid) = parse_app_data_file(path) {
+        CONFIG_WRITES_BLOCKED.store(false, Ordering::SeqCst);
+        return Some(valid);
+    }
+    for candidate in [&backup, &temp] {
+        let Some((data, raw)) = parse_app_data_file(candidate) else {
+            continue;
+        };
+        let recovery = path.with_extension("json.recovery.tmp");
+        if fs::write(&recovery, &raw).is_err() {
+            continue;
+        }
+        if path.exists() {
+            let corrupt = path.with_extension(format!(
+                "json.corrupt-{}",
+                Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            if fs::rename(path, corrupt).is_err() {
+                let _ = fs::remove_file(&recovery);
+                continue;
+            }
+        }
+        if fs::rename(&recovery, path).is_ok() {
+            CONFIG_WRITES_BLOCKED.store(false, Ordering::SeqCst);
+            return Some((data, raw));
+        }
+        let _ = fs::remove_file(recovery);
+    }
+    let recovery_files_exist = path.exists() || backup.exists() || temp.exists();
+    CONFIG_WRITES_BLOCKED.store(recovery_files_exist, Ordering::SeqCst);
+    None
+}
+
 fn load_data() -> AppData {
     if ensure_storage().is_err() {
         return AppData::default();
     }
+    if let Ok(root) = storage_dir() {
+        recover_staged_deletions(&root);
+    }
     let Ok(path) = config_path() else {
         return AppData::default();
     };
-    let Ok(raw) = fs::read_to_string(&path) else {
+    let Some((mut data, raw)) = recover_config_file(&path) else {
         return AppData::default();
     };
-    let mut data: AppData = serde_json::from_str(&raw).unwrap_or_default();
     if data.schema_version == 0 {
         data.schema_version = 2;
     }
@@ -1097,7 +1253,7 @@ fn load_data() -> AppData {
     reconcile_account_readiness(&mut data);
     if let Ok(next_raw) = serde_json::to_string_pretty(&data) {
         if next_raw != raw {
-            let _ = fs::write(&path, next_raw);
+            let _ = save_data(&data);
         }
     }
     data
@@ -1117,17 +1273,23 @@ fn migrate_avatar_sources(data: &mut AppData) {
 }
 
 fn save_data(data: &AppData) -> Result<(), String> {
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|error| format!("配置写入锁异常: {error}"))?;
+    if CONFIG_WRITES_BLOCKED.load(Ordering::SeqCst) {
+        return Err("NEA 配置文件损坏且无法自动恢复，已阻止写入以保护现有账号数据".to_string());
+    }
     ensure_storage()?;
-    let raw = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+    let raw = serde_json::to_vec_pretty(data).map_err(|e| e.to_string())?;
     let path = config_path()?;
     let temp = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
-    fs::write(&temp, raw).map_err(|e| format!("写入配置失败: {}", e))?;
+    fs::write(&temp, &raw).map_err(|e| format!("写入配置失败: {}", e))?;
 
-    if backup.exists() {
-        let _ = fs::remove_file(&backup);
-    }
     if path.exists() {
+        if backup.exists() {
+            let _ = fs::remove_file(&backup);
+        }
         fs::rename(&path, &backup).map_err(|e| format!("备份原配置失败: {}", e))?;
     }
     if let Err(error) = fs::rename(&temp, &path) {
@@ -1137,9 +1299,9 @@ fn save_data(data: &AppData) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
         return Err(format!("保存配置失败: {}", error));
     }
-    if backup.exists() {
-        let _ = fs::remove_file(backup);
-    }
+    *LAST_INTERNAL_CONFIG_BYTES
+        .lock()
+        .map_err(|error| format!("配置写入状态锁异常: {error}"))? = Some(raw);
     Ok(())
 }
 
@@ -2386,8 +2548,23 @@ fn watch_config_changes(app: AppHandle) {
                 if changed_config_bytes == last_config_bytes {
                     continue;
                 }
+                let Some(changed_config_bytes) = changed_config_bytes else {
+                    continue;
+                };
+                if serde_json::from_slice::<AppData>(&changed_config_bytes).is_err() {
+                    continue;
+                }
+                let internal_write = LAST_INTERNAL_CONFIG_BYTES
+                    .lock()
+                    .ok()
+                    .and_then(|bytes| bytes.clone())
+                    .is_some_and(|bytes| bytes == changed_config_bytes);
+                if internal_write {
+                    last_config_bytes = Some(changed_config_bytes);
+                    continue;
+                }
                 refresh_app_data_from_disk(&app);
-                last_config_bytes = fs::read(&path).ok().or(changed_config_bytes);
+                last_config_bytes = fs::read(&path).ok();
                 update_tray(&app);
                 let _ = app.emit("app-data-changed", ());
                 thread::sleep(Duration::from_millis(150));
@@ -2541,43 +2718,34 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     }
     menu.append(&steam_menu)?;
 
-    let perfect_workspace = perfect_arena::workspace(&data.steam);
     let perfect_menu = Submenu::new(app, "完美对战平台", true)?;
-    if perfect_workspace.installation.is_none() {
+    let verified_web_sessions = data
+        .steam
+        .web_sessions
+        .iter()
+        .filter(|session| session.steam_id.is_some())
+        .collect::<Vec<_>>();
+    if verified_web_sessions.is_empty() {
         perfect_menu.append(&MenuItem::with_id(
             app,
-            "perfect-missing",
-            "未安装",
-            false,
-            None::<&str>,
-        )?)?;
-    } else if perfect_workspace.accounts.is_empty() {
-        perfect_menu.append(&MenuItem::with_id(
-            app,
-            "perfect-empty",
-            "暂无 Steam 账号",
+            "perfect-web-empty",
+            "暂无 Steam 网页账号",
             false,
             None::<&str>,
         )?)?;
     } else {
-        for account in &perfect_workspace.accounts {
-            let mut label = match account
+        for session in verified_web_sessions {
+            let label = session
                 .note
                 .as_deref()
                 .filter(|note| !note.trim().is_empty())
-            {
-                Some(note) => format!("{}（{}）", account.display_name, note),
-                None => account.display_name.clone(),
-            };
-            let is_current = perfect_workspace.current_account_id.as_deref() == Some(&account.id);
-            if is_current {
-                label.push_str("（登录中）");
-            }
+                .map(|note| format!("{}（{}）", session.display_name, note))
+                .unwrap_or_else(|| session.display_name.clone());
             perfect_menu.append(&MenuItem::with_id(
                 app,
-                format!("perfect-switch:{}", account.id),
+                format!("perfect-web:{}", session.id),
                 label,
-                !is_current,
+                true,
                 None::<&str>,
             )?)?;
         }
@@ -2606,6 +2774,15 @@ async fn get_app_data(app: AppHandle) -> Result<AppData, String> {
     tauri::async_runtime::spawn_blocking(move || get_app_data_inner(&app))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn get_config_health() -> Result<(), String> {
+    if CONFIG_WRITES_BLOCKED.load(Ordering::SeqCst) {
+        Err("NEA 配置文件损坏且无法自动恢复，已阻止写入以保护现有账号数据".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -2647,6 +2824,1120 @@ async fn refresh_steam_accounts(app: AppHandle) -> Result<steam::SteamWorkspace,
     discover_steam(app).await
 }
 
+const STEAM_WEB_LOGIN_URL: &str =
+    "https://store.steampowered.com/login/?redir=account%2F&redir_ssl=1";
+const STEAM_WEB_ACCOUNT_URL: &str = "https://store.steampowered.com/account/";
+const PERFECT_STEAM_OAUTH_URL: &str = "https://pvp.wanmei.com/csgo/pwaSteam";
+const MAX_STEAM_TEXT_IMPORT_ACCOUNTS: usize = 30;
+const STEAM_VERIFICATION_WINDOW_TITLE: &str = "__NEA_STEAM_VERIFICATION_REQUIRED__";
+const PERFECT_OAUTH_AUTOMATION_SCRIPT: &str = r#"
+(() => {
+  if (window.__neaPerfectOauthAutomation) return;
+  window.__neaPerfectOauthAutomation = true;
+  const accepted = new Set(['登录', '允许', 'sign in', 'allow']);
+  const clickOfficialAction = () => {
+    if (location.hostname.toLowerCase() !== 'store.steampowered.com') return;
+    for (const element of document.querySelectorAll('button, input[type="submit"]')) {
+      const label = String(element.innerText || element.value || '').trim().toLowerCase();
+      if (!accepted.has(label) || element.disabled || element.dataset.neaClicked) continue;
+      element.dataset.neaClicked = 'true';
+      setTimeout(() => element.click(), 350);
+      break;
+    }
+  };
+  addEventListener('DOMContentLoaded', clickOfficialAction);
+  setInterval(clickOfficialAction, 600);
+})();
+"#;
+const PERFECT_OAUTH_LOOP_STOP_SCRIPT: &str = r#"
+(() => {
+  window.stop();
+  document.open();
+  document.write('<!doctype html><meta charset="utf-8"><title>NEA - 完美授权异常</title><body style="margin:0;background:#171d25;color:#d6d7d8;font:16px Microsoft YaHei UI,sans-serif;display:grid;place-items:center;min-height:100vh"><main style="text-align:center"><h2>完美平台未接受本次授权</h2><p>已停止重复授权，请返回 NEA 查看提示。</p></main></body>');
+  document.close();
+})();
+"#;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SteamCredentialInput {
+    account: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SteamBulkImportResult {
+    imported: usize,
+    failed: usize,
+    verification_required_accounts: Vec<String>,
+}
+
+fn steam_credential_automation_script(
+    credentials: &SteamCredentialInput,
+) -> Result<String, String> {
+    let encoded = general_purpose::STANDARD.encode(
+        serde_json::to_vec(credentials)
+            .map_err(|error| format!("编码 Steam 登录信息失败: {error}"))?,
+    );
+    Ok(format!(
+        r#"
+(() => {{
+  if (window.__neaSteamCredentialAutomation) return;
+  window.__neaSteamCredentialAutomation = true;
+  const raw = Uint8Array.from(atob('{encoded}'), c => c.charCodeAt(0));
+  const credentials = JSON.parse(new TextDecoder().decode(raw));
+  let submitted = false;
+  const verificationTitle = '{verification_title}';
+  const visible = element => {{
+    if (!(element instanceof HTMLElement)) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || '1') > 0 && rect.width > 0 && rect.height > 0;
+  }};
+  const setValue = (input, value) => {{
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, value);
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  }};
+  const fillAndSubmit = () => {{
+    if (submitted || window.top !== window ||
+        location.hostname.toLowerCase() !== 'store.steampowered.com' ||
+        !location.pathname.toLowerCase().startsWith('/login')) return;
+    const password = [...document.querySelectorAll('input[type="password"]')].find(visible);
+    if (!password) return;
+    let loginRoot = password.closest('form');
+    if (!loginRoot) {{
+      let candidate = password.parentElement;
+      while (candidate && candidate !== document.body) {{
+        const visibleTextInputs = [...candidate.querySelectorAll(
+          'input[type="text"], input[type="email"], input:not([type])'
+        )].filter(visible);
+        const visiblePasswords = [...candidate.querySelectorAll('input[type="password"]')]
+          .filter(visible);
+        if (visibleTextInputs.length === 1 && visiblePasswords.length === 1) {{
+          loginRoot = candidate;
+          break;
+        }}
+        candidate = candidate.parentElement;
+      }}
+    }}
+    if (!loginRoot) return;
+    const textInputs = [...loginRoot.querySelectorAll(
+      'input[autocomplete="username"], input[name*="account" i], input[name*="user" i], input[type="text"], input[type="email"], input:not([type])'
+    )].filter(visible);
+    const account = textInputs.find(input => input !== password);
+    if (!account || !loginRoot.contains(password)) return;
+    const submit = [...loginRoot.querySelectorAll('button, input[type="submit"]')].find(element => {{
+      if (!visible(element) || element.disabled) return false;
+      const text = String(element.innerText || element.value || '').trim().toLowerCase();
+      return text === '登录' || text === 'sign in';
+    }});
+    if (!submit) return;
+    account.setAttribute('autocomplete', 'off');
+    password.setAttribute('autocomplete', 'off');
+    setValue(account, credentials.account);
+    setValue(password, credentials.password);
+    submitted = true;
+    setTimeout(() => submit.click(), 500);
+  }};
+  const detectVerificationChallenge = () => {{
+    if (location.hostname.toLowerCase() !== 'store.steampowered.com') return;
+    const text = String(document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
+    const phrases = [
+      '此账户受到手机验证器保护',
+      '输入您 steam 手机应用上的代码',
+      '输入您的 steam 令牌验证码',
+      '我们已将验证码发送至您的电子邮件',
+      '输入我们发送到您电子邮件的代码',
+      'this account is protected by a steam guard mobile authenticator',
+      'enter the code from your steam mobile app',
+      'we sent a code to your email',
+      'enter the code we sent to your email'
+    ];
+    const oneTimeCode = [...document.querySelectorAll('input')].some(input =>
+      visible(input) && (
+        input.autocomplete === 'one-time-code' ||
+        /auth|guard|twofactor|code/i.test(`${{input.name}} ${{input.id}}`)
+      )
+    );
+    if (phrases.some(phrase => text.includes(phrase)) ||
+        (oneTimeCode && (text.includes('steam guard') || text.includes('验证码')))) {{
+      document.title = verificationTitle;
+    }}
+  }};
+  addEventListener('DOMContentLoaded', fillAndSubmit);
+  addEventListener('DOMContentLoaded', detectVerificationChallenge);
+  setInterval(fillAndSubmit, 400);
+  setInterval(detectVerificationChallenge, 250);
+}})();
+"#,
+        verification_title = STEAM_VERIFICATION_WINDOW_TITLE
+    ))
+}
+
+fn clear_sensitive_string(value: &mut String) {
+    let byte_length = value.len();
+    if byte_length > 0 {
+        value.replace_range(.., &"\0".repeat(byte_length));
+        value.clear();
+    }
+}
+
+fn steam_web_session_dir(session_id: &str) -> Result<PathBuf, String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("Steam 网页会话 ID 无效".to_string());
+    }
+    Ok(storage_dir()?
+        .join("workspaces")
+        .join("steam")
+        .join("web-sessions")
+        .join(session_id))
+}
+
+fn steam_web_window_label(session_id: &str) -> String {
+    format!("steam-web-{}", session_id)
+}
+
+fn build_steam_web_window(
+    app: &AppHandle,
+    session_id: &str,
+    visible: bool,
+    auto_complete: bool,
+    credentials: Option<&SteamCredentialInput>,
+) -> Result<WebviewWindow, String> {
+    let label = steam_web_window_label(session_id);
+    let url = tauri::Url::parse(STEAM_WEB_LOGIN_URL).map_err(|error| error.to_string())?;
+    let data_dir = steam_web_session_dir(session_id)?.join("webview2");
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("创建 Steam 网页会话目录失败: {}", error))?;
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title("NEA - Steam 网页账号")
+        .data_directory(data_dir)
+        .inner_size(1180.0, 780.0)
+        .min_inner_size(760.0, 520.0)
+        .visible(visible)
+        .center();
+    if let Some(credentials) = credentials {
+        builder = builder.initialization_script(steam_credential_automation_script(credentials)?);
+    }
+    if auto_complete {
+        let session_id = session_id.to_string();
+        let checking = Arc::new(AtomicBool::new(false));
+        builder = builder.on_page_load(move |window, payload| {
+            if payload.event() != PageLoadEvent::Finished
+                || payload.url().host_str() != Some("store.steampowered.com")
+                || checking.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let session_id = session_id.clone();
+            let checking = checking.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let app = window.app_handle().clone();
+                match steam_id_from_web_window(window.clone()).await {
+                    Ok(Some(steam_id)) => {
+                        match persist_verified_steam_web_session(&app, &session_id, &steam_id) {
+                            Ok(display_name) => {
+                                let _ = app.emit("app-data-changed", ());
+                                let _ = app.emit("steam-web-session-verified", display_name);
+                                let _ = window.destroy();
+                            }
+                            Err(error) => {
+                                let _ = app.emit("steam-web-session-error", error);
+                                checking.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Ok(None) => checking.store(false, Ordering::SeqCst),
+                    Err(error) => {
+                        let _ = app.emit("steam-web-session-error", error);
+                        checking.store(false, Ordering::SeqCst);
+                    }
+                }
+            });
+        });
+    }
+    builder
+        .build()
+        .map_err(|error| format!("打开 Steam 网页账号窗口失败: {}", error))
+}
+
+fn open_steam_web_window(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let label = steam_web_window_label(session_id);
+    let url = tauri::Url::parse(STEAM_WEB_ACCOUNT_URL).map_err(|error| error.to_string())?;
+    if let Some(window) = app.get_webview_window(&label) {
+        window.navigate(url).map_err(|error| error.to_string())?;
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    build_steam_web_window(app, session_id, true, false, None).map(|_| ())
+}
+
+fn build_perfect_oauth_window(
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<(WebviewWindow, Arc<AtomicBool>), String> {
+    let label = steam_web_window_label(session_id);
+    let url = tauri::Url::parse(PERFECT_STEAM_OAUTH_URL).map_err(|error| error.to_string())?;
+    let data_dir = steam_web_session_dir(session_id)?.join("webview2");
+    fs::create_dir_all(&data_dir).map_err(|error| format!("打开 Steam 网页会话失败: {}", error))?;
+    let steam_page_starts = Arc::new(AtomicUsize::new(0));
+    let loop_detected = Arc::new(AtomicBool::new(false));
+    let page_starts = steam_page_starts.clone();
+    let detected = loop_detected.clone();
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title("NEA - 完美世界竞技平台 Steam 授权")
+        .data_directory(data_dir)
+        .initialization_script(PERFECT_OAUTH_AUTOMATION_SCRIPT)
+        .on_page_load(move |window, payload| {
+            if payload.event() != PageLoadEvent::Started
+                || payload.url().host_str() != Some("store.steampowered.com")
+            {
+                return;
+            }
+            if page_starts.fetch_add(1, Ordering::SeqCst) >= 2 {
+                detected.store(true, Ordering::SeqCst);
+                let _ = window.eval(PERFECT_OAUTH_LOOP_STOP_SCRIPT);
+            }
+        })
+        .inner_size(1180.0, 780.0)
+        .min_inner_size(760.0, 520.0)
+        .center()
+        .build()
+        .map_err(|error| format!("打开完美 Steam 授权窗口失败: {}", error))?;
+    Ok((window, loop_detected))
+}
+
+fn steam_id_from_web_cookie(value: &str) -> Option<String> {
+    let steam_id: String = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    (steam_id.len() == 17).then_some(steam_id)
+}
+
+fn recover_steam_web_session_from_disk(session_id: &str) -> Option<steam::SteamWebSession> {
+    let path = config_path().ok()?;
+    let candidates = [
+        path.clone(),
+        path.with_extension("json.tmp"),
+        path.with_extension("json.bak"),
+    ];
+    candidates.into_iter().find_map(|candidate| {
+        parse_app_data_file(&candidate).and_then(|(data, _)| {
+            data.steam
+                .web_sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+        })
+    })
+}
+
+async fn steam_id_from_web_window(window: WebviewWindow) -> Result<Option<String>, String> {
+    let url =
+        tauri::Url::parse("https://store.steampowered.com/").map_err(|error| error.to_string())?;
+    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("读取 Steam 网页登录状态失败: {}", error))?;
+    Ok(cookies
+        .iter()
+        .find(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
+        .and_then(|cookie| steam_id_from_web_cookie(cookie.value())))
+}
+
+fn persist_verified_steam_web_session(
+    app: &AppHandle,
+    session_id: &str,
+    steam_id: &str,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let mut next_data = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let fallback_display_name = next_data
+        .steam
+        .accounts
+        .iter()
+        .find(|account| account.id == steam_id)
+        .map(|account| account.display_name.clone())
+        .unwrap_or_else(|| steam_id.to_string());
+    if !next_data
+        .steam
+        .web_sessions
+        .iter()
+        .any(|session| session.id == session_id)
+    {
+        if let Some(recovered) = recover_steam_web_session_from_disk(session_id) {
+            next_data.steam.web_sessions.push(recovered);
+        }
+    }
+    let session = next_data
+        .steam
+        .web_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Steam 网页会话不存在".to_string())?;
+    session.steam_id = Some(steam_id.to_string());
+    if session.account_name.is_none() {
+        session.display_name = fallback_display_name;
+    }
+    session.last_verified_at = Some(Utc::now().to_rfc3339());
+    let (deduplicated, removed_session_ids) = deduplicate_steam_web_sessions(
+        std::mem::take(&mut next_data.steam.web_sessions),
+        Some(session_id),
+    );
+    next_data.steam.web_sessions = deduplicated;
+    let display_name = next_data
+        .steam
+        .web_sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .map(steam_web_session_primary_name)
+        .ok_or_else(|| "Steam 网页会话去重失败".to_string())?;
+    save_data(&next_data)?;
+    *state.data.lock().map_err(|error| error.to_string())? = next_data;
+    cleanup_steam_web_session_directories(app, removed_session_ids);
+    update_tray(app);
+    Ok(display_name)
+}
+
+fn steam_web_session_primary_name(session: &steam::SteamWebSession) -> String {
+    session
+        .account_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&session.display_name)
+        .to_string()
+}
+
+fn merge_steam_web_session(
+    primary: &mut steam::SteamWebSession,
+    duplicate: &steam::SteamWebSession,
+) {
+    if primary.account_name.is_none() {
+        primary.account_name = duplicate.account_name.clone();
+    }
+    if primary.note.is_none() {
+        primary.note = duplicate.note.clone();
+    }
+    let primary_is_fallback = primary.display_name.trim().is_empty()
+        || primary.display_name == "待登录网页账号"
+        || primary.steam_id.as_deref() == Some(primary.display_name.as_str());
+    let duplicate_is_useful = !duplicate.display_name.trim().is_empty()
+        && duplicate.display_name != "待登录网页账号"
+        && duplicate.steam_id.as_deref() != Some(duplicate.display_name.as_str());
+    if primary_is_fallback && duplicate_is_useful {
+        primary.display_name.clone_from(&duplicate.display_name);
+    }
+}
+
+fn deduplicate_steam_web_sessions(
+    sessions: Vec<steam::SteamWebSession>,
+    preferred_session_id: Option<&str>,
+) -> (Vec<steam::SteamWebSession>, Vec<String>) {
+    let mut unique = Vec::<steam::SteamWebSession>::with_capacity(sessions.len());
+    let mut indices = HashMap::<String, usize>::new();
+    let mut removed = Vec::new();
+    for session in sessions {
+        let Some(steam_id) = session.steam_id.clone() else {
+            unique.push(session);
+            continue;
+        };
+        let Some(&existing_index) = indices.get(&steam_id) else {
+            indices.insert(steam_id, unique.len());
+            unique.push(session);
+            continue;
+        };
+        let prefer_new = preferred_session_id == Some(session.id.as_str());
+        if prefer_new {
+            let replaced = std::mem::replace(&mut unique[existing_index], session);
+            merge_steam_web_session(&mut unique[existing_index], &replaced);
+            removed.push(replaced.id);
+        } else {
+            merge_steam_web_session(&mut unique[existing_index], &session);
+            removed.push(session.id);
+        }
+    }
+    (unique, removed)
+}
+
+fn cleanup_steam_web_session_directories(app: &AppHandle, session_ids: Vec<String>) {
+    for session_id in session_ids {
+        if let Some(window) = app.get_webview_window(&steam_web_window_label(&session_id)) {
+            let _ = window.destroy();
+        }
+        let Ok(directory) = steam_web_session_dir(&session_id) else {
+            continue;
+        };
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || fs::remove_dir_all(directory)).await;
+        });
+    }
+}
+
+#[tauri::command]
+async fn create_steam_web_session(app: AppHandle) -> Result<steam::SteamWorkspace, String> {
+    let session = steam::SteamWebSession {
+        id: Uuid::new_v4().to_string(),
+        steam_id: None,
+        account_name: None,
+        display_name: "待登录网页账号".to_string(),
+        note: None,
+        created_at: Utc::now().to_rfc3339(),
+        last_verified_at: None,
+    };
+    {
+        let state = app.state::<AppState>();
+        let mut data = state.data.lock().map_err(|error| error.to_string())?;
+        data.steam.web_sessions.push(session.clone());
+        save_data(&data)?;
+    }
+    if let Err(error) = build_steam_web_window(&app, &session.id, true, true, None) {
+        let state = app.state::<AppState>();
+        let mut data = state
+            .data
+            .lock()
+            .map_err(|lock_error| lock_error.to_string())?;
+        data.steam.web_sessions.retain(|item| item.id != session.id);
+        let _ = save_data(&data);
+        return Err(error);
+    }
+    app.state::<AppState>()
+        .data
+        .lock()
+        .map(|data| data.steam.clone())
+        .map_err(|error| error.to_string())
+}
+
+async fn discard_unverified_steam_web_session(
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(&steam_web_window_label(session_id)) {
+        let _ = window.destroy();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let removed = {
+        let state = app.state::<AppState>();
+        let mut next_data = state
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        let before = next_data.steam.web_sessions.len();
+        next_data
+            .steam
+            .web_sessions
+            .retain(|session| session.id != session_id || session.steam_id.is_some());
+        let removed = next_data.steam.web_sessions.len() != before;
+        if removed {
+            save_data(&next_data)?;
+            *state.data.lock().map_err(|error| error.to_string())? = next_data;
+        }
+        removed
+    };
+    if removed {
+        if let Ok(directory) = steam_web_session_dir(session_id) {
+            let _ =
+                tauri::async_runtime::spawn_blocking(move || fs::remove_dir_all(directory)).await;
+        }
+    }
+    let _ = app.emit("app-data-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn import_steam_web_accounts_from_text(
+    app: AppHandle,
+    accounts: Vec<SteamCredentialInput>,
+) -> Result<SteamBulkImportResult, String> {
+    let _import_guard = acquire_steam_web_import(&app)?;
+    if accounts.is_empty() {
+        return Err("没有可导入的 Steam 网页账号".to_string());
+    }
+    if accounts.len() > MAX_STEAM_TEXT_IMPORT_ACCOUNTS {
+        return Err(format!(
+            "一次最多导入 {} 个 Steam 网页账号",
+            MAX_STEAM_TEXT_IMPORT_ACCOUNTS
+        ));
+    }
+    let mut seen = HashSet::new();
+    for credentials in &accounts {
+        let account = credentials.account.trim();
+        if account.is_empty()
+            || account.len() > 128
+            || account.chars().any(char::is_whitespace)
+            || credentials.password.is_empty()
+            || credentials.password.len() > 512
+        {
+            return Err("Steam 账号文本包含无效的账号或密码".to_string());
+        }
+        if !seen.insert(account.to_ascii_lowercase()) {
+            return Err(format!("Steam 账号 {} 重复", account));
+        }
+    }
+
+    let total = accounts.len();
+    let mut imported = 0usize;
+    let mut failed = 0usize;
+    let mut verification_required_accounts = Vec::new();
+    for (index, mut credentials) in accounts.into_iter().enumerate() {
+        let account_label = credentials.account.clone();
+        let session = steam::SteamWebSession {
+            id: Uuid::new_v4().to_string(),
+            steam_id: None,
+            account_name: Some(credentials.account.clone()),
+            display_name: credentials.account.clone(),
+            note: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_verified_at: None,
+        };
+        {
+            let state = app.state::<AppState>();
+            let mut next_data = state
+                .data
+                .lock()
+                .map_err(|error| error.to_string())?
+                .clone();
+            next_data.steam.web_sessions.push(session.clone());
+            save_data(&next_data)?;
+            *state.data.lock().map_err(|error| error.to_string())? = next_data;
+        }
+        let _ = app.emit(
+            "steam-bulk-import-progress",
+            format!("正在登录 Steam 网页账号 {}/{}", index + 1, total),
+        );
+        let window_result =
+            build_steam_web_window(&app, &session.id, true, true, Some(&credentials));
+        clear_sensitive_string(&mut credentials.password);
+        if let Err(error) = window_result {
+            let _ = discard_unverified_steam_web_session(&app, &session.id).await;
+            failed += 1;
+            let _ = app.emit(
+                "steam-bulk-import-progress",
+                format!("{} 登录窗口打开失败: {}", account_label, error),
+            );
+            continue;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(300);
+        enum ImportOutcome {
+            Verified,
+            VerificationRequired,
+            Failed,
+        }
+        let outcome = loop {
+            let recognized = {
+                let state = app.state::<AppState>();
+                let recognized = state
+                    .data
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .steam
+                    .web_sessions
+                    .iter()
+                    .find(|saved| saved.id == session.id)
+                    .and_then(|saved| saved.steam_id.as_ref())
+                    .is_some();
+                recognized
+            };
+            if recognized {
+                break ImportOutcome::Verified;
+            }
+            let Some(window) = app.get_webview_window(&steam_web_window_label(&session.id)) else {
+                break ImportOutcome::Failed;
+            };
+            if window.title().ok().as_deref() == Some(STEAM_VERIFICATION_WINDOW_TITLE) {
+                break ImportOutcome::VerificationRequired;
+            }
+            if Instant::now() >= deadline {
+                break ImportOutcome::Failed;
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        };
+        match outcome {
+            ImportOutcome::Verified => imported += 1,
+            ImportOutcome::VerificationRequired => {
+                verification_required_accounts.push(account_label.clone());
+                discard_unverified_steam_web_session(&app, &session.id).await?;
+                let _ = app.emit(
+                    "steam-bulk-import-progress",
+                    format!("{} 需要 Steam 验证，已跳过", account_label),
+                );
+            }
+            ImportOutcome::Failed => {
+                failed += 1;
+                discard_unverified_steam_web_session(&app, &session.id).await?;
+            }
+        }
+    }
+    update_tray(&app);
+    Ok(SteamBulkImportResult {
+        imported,
+        failed,
+        verification_required_accounts,
+    })
+}
+
+#[tauri::command]
+async fn open_steam_web_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let exists = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .steam
+        .web_sessions
+        .iter()
+        .any(|session| session.id == session_id);
+    if !exists {
+        return Err("Steam 网页会话不存在".to_string());
+    }
+    open_steam_web_window(&app, &session_id)
+}
+
+#[tauri::command]
+async fn refresh_steam_web_sessions(app: AppHandle) -> Result<steam::SteamWorkspace, String> {
+    let session_ids = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .steam
+        .web_sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let cookie_url =
+        tauri::Url::parse("https://store.steampowered.com/").map_err(|error| error.to_string())?;
+    let mut verified = HashMap::new();
+    for session_id in session_ids {
+        let (window, temporary) = match app.get_webview_window(&steam_web_window_label(&session_id))
+        {
+            Some(window) => (window, false),
+            None => (
+                build_steam_web_window(&app, &session_id, false, false, None)?,
+                true,
+            ),
+        };
+        if temporary {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+        let url = cookie_url.clone();
+        let cookie_window = window.clone();
+        let cookies =
+            tauri::async_runtime::spawn_blocking(move || cookie_window.cookies_for_url(url))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("读取 Steam 网页登录状态失败: {}", error))?;
+        if temporary {
+            let _ = window.destroy();
+        }
+        let steam_id = cookies
+            .iter()
+            .find(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
+            .and_then(|cookie| steam_id_from_web_cookie(cookie.value()));
+        if let Some(steam_id) = steam_id {
+            verified.insert(session_id, steam_id);
+        }
+    }
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    let account_names = data
+        .steam
+        .accounts
+        .iter()
+        .map(|account| (account.id.clone(), account.display_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let verified_at = Utc::now().to_rfc3339();
+    for session in &mut data.steam.web_sessions {
+        let Some(steam_id) = verified.get(&session.id) else {
+            continue;
+        };
+        session.steam_id = Some(steam_id.clone());
+        if session.account_name.is_none() {
+            session.display_name = account_names
+                .get(steam_id)
+                .cloned()
+                .unwrap_or_else(|| steam_id.clone());
+        }
+        session.last_verified_at = Some(verified_at.clone());
+    }
+    let (deduplicated, removed_session_ids) =
+        deduplicate_steam_web_sessions(std::mem::take(&mut data.steam.web_sessions), None);
+    data.steam.web_sessions = deduplicated;
+    save_data(&data)?;
+    let workspace = data.steam.clone();
+    drop(data);
+    cleanup_steam_web_session_directories(&app, removed_session_ids);
+    update_tray(&app);
+    Ok(workspace)
+}
+
+#[tauri::command]
+async fn set_steam_web_session_note(
+    app: AppHandle,
+    session_id: String,
+    note: String,
+) -> Result<steam::SteamWorkspace, String> {
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    let session = data
+        .steam
+        .web_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Steam 网页会话不存在".to_string())?;
+    let trimmed = note.trim();
+    session.note = (!trimmed.is_empty()).then(|| trimmed.chars().take(120).collect());
+    save_data(&data)?;
+    Ok(data.steam.clone())
+}
+
+#[tauri::command]
+async fn delete_steam_web_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let _activity = acquire_switch_activity(&app)?;
+    let session_dir = steam_web_session_dir(&session_id)?;
+    if let Some(window) = app.get_webview_window(&steam_web_window_label(&session_id)) {
+        window.destroy().map_err(|error| error.to_string())?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let staged = stage_for_deletion(&session_dir)?;
+    let state = app.state::<AppState>();
+    let mut next_data = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    if !next_data
+        .steam
+        .web_sessions
+        .iter()
+        .any(|session| session.id == session_id)
+    {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err("Steam 网页会话不存在".to_string());
+    }
+    next_data
+        .steam
+        .web_sessions
+        .retain(|session| session.id != session_id);
+    if let Err(error) = save_data(&next_data) {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err(error);
+    }
+    if let Some(staged) = &staged {
+        mark_staged_deletion_committed(staged);
+    }
+    *state.data.lock().map_err(|error| error.to_string())? = next_data;
+    finish_staged_deletion(staged);
+    update_tray(&app);
+    Ok(())
+}
+
+fn perfect_profile_is_complete(profile: &perfect_arena::PerfectArenaProfile) -> bool {
+    profile.found
+        && profile.nickname.is_some()
+        && profile.avatar_url.is_some()
+        && profile.score.is_some()
+        && profile.player_identity.is_some()
+        && profile.reputation_level.is_some()
+}
+
+fn merge_perfect_profile(
+    saved: &mut perfect_arena::PerfectArenaProfile,
+    fresh: perfect_arena::PerfectArenaProfile,
+) {
+    if !fresh.found {
+        return;
+    }
+    let saved_updated = saved
+        .updated_at
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let fresh_updated = fresh
+        .updated_at
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let overwrite = fresh_updated >= saved_updated;
+    let mut content_changed = false;
+
+    macro_rules! merge_field {
+        ($field:ident) => {
+            if fresh.$field.is_some() && (overwrite || saved.$field.is_none()) {
+                content_changed |= saved.$field != fresh.$field;
+                saved.$field = fresh.$field;
+            }
+        };
+    }
+
+    saved.found = true;
+    merge_field!(nickname);
+    merge_field!(avatar_url);
+    merge_field!(avatar_source_url);
+    merge_field!(score);
+    merge_field!(season);
+    merge_field!(player_identity);
+    merge_field!(high_risk);
+    merge_field!(reputation_requires_verification);
+    merge_field!(reputation_points);
+    merge_field!(reputation_level);
+    if fresh_updated > saved_updated && content_changed {
+        saved.updated_at = fresh.updated_at;
+    }
+}
+
+fn cache_perfect_profile_avatar(
+    profile: &mut perfect_arena::PerfectArenaProfile,
+    previous: Option<&perfect_arena::PerfectArenaProfile>,
+) {
+    let Some(source_url) = profile
+        .avatar_url
+        .clone()
+        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+    else {
+        return;
+    };
+    profile.avatar_source_url = Some(source_url.clone());
+    if let Some(cached) = previous.filter(|cached| {
+        cached.avatar_source_url.as_deref() == Some(source_url.as_str())
+            && cached
+                .avatar_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/"))
+    }) {
+        profile.avatar_url = cached.avatar_url.clone();
+        return;
+    }
+    if let Some(data_url) = download_avatar_data_url(&source_url) {
+        profile.avatar_url = Some(data_url);
+    }
+}
+
+async fn refresh_perfect_profiles_for_ids(
+    app: &AppHandle,
+    steam_ids: Vec<String>,
+    wait_for_complete: bool,
+) -> Result<Vec<perfect_arena::PerfectArenaProfile>, String> {
+    let steam_ids = steam_ids
+        .into_iter()
+        .filter(|id| id.len() == 17 && id.chars().all(|character| character.is_ascii_digit()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let previous = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        data.perfect_profiles.clone()
+    };
+    let query_ids = steam_ids.clone();
+    let fresh = tauri::async_runtime::spawn_blocking(move || {
+        let online = perfect_arena::online_profiles(&query_ids).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let cached = loop {
+            let profiles = perfect_arena::cached_profiles(&query_ids);
+            if !wait_for_complete
+                || profiles.iter().all(perfect_profile_is_complete)
+                || Instant::now() >= deadline
+            {
+                break profiles;
+            }
+            thread::sleep(Duration::from_millis(750));
+        };
+        let mut merged = online
+            .into_iter()
+            .map(|profile| (profile.steam_id.clone(), profile))
+            .collect::<HashMap<_, _>>();
+        for cached_profile in cached {
+            if !cached_profile.found {
+                continue;
+            }
+            let entry = merged
+                .entry(cached_profile.steam_id.clone())
+                .or_insert_with(|| cached_profile.clone());
+            if entry.nickname.is_none() {
+                entry.nickname = cached_profile.nickname.clone();
+            }
+            if entry.avatar_url.is_none() {
+                entry.avatar_url = cached_profile.avatar_url.clone();
+            }
+            if entry.score.is_none() {
+                entry.score = cached_profile.score;
+            }
+            if entry.season.is_none() {
+                entry.season = cached_profile.season.clone();
+            }
+            if cached_profile.player_identity.is_some() {
+                entry.player_identity = cached_profile.player_identity.clone();
+            }
+            if cached_profile.high_risk.is_some() {
+                entry.high_risk = cached_profile.high_risk;
+            }
+            if cached_profile.reputation_requires_verification.is_some() {
+                entry.reputation_requires_verification =
+                    cached_profile.reputation_requires_verification;
+            }
+            if cached_profile.reputation_points.is_some() {
+                entry.reputation_points = cached_profile.reputation_points;
+                entry.reputation_level = cached_profile.reputation_level.clone();
+            }
+            entry.found = true;
+        }
+        query_ids
+            .iter()
+            .filter_map(|id| merged.remove(id))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let previous_for_avatar = previous.clone();
+    let fresh = tauri::async_runtime::spawn_blocking(move || {
+        fresh
+            .into_iter()
+            .map(|mut profile| {
+                let steam_id = profile.steam_id.clone();
+                cache_perfect_profile_avatar(&mut profile, previous_for_avatar.get(&steam_id));
+                profile
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let state = app.state::<AppState>();
+    let mut data = state.data.lock().map_err(|error| error.to_string())?;
+    let mut changed = false;
+    for profile in fresh {
+        let is_new = !data.perfect_profiles.contains_key(&profile.steam_id);
+        let saved = data
+            .perfect_profiles
+            .entry(profile.steam_id.clone())
+            .or_insert_with(|| profile.clone());
+        let before = saved.clone();
+        merge_perfect_profile(saved, profile);
+        changed |= is_new || *saved != before;
+    }
+    if changed {
+        save_data(&data)?;
+    }
+    Ok(steam_ids
+        .iter()
+        .filter_map(|id| data.perfect_profiles.get(id).cloned())
+        .collect())
+}
+
+#[tauri::command]
+async fn switch_perfect_web_account(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SwitchResult, String> {
+    switch_perfect_web_account_impl(app, session_id, true).await
+}
+
+async fn switch_perfect_web_account_impl(
+    app: AppHandle,
+    session_id: String,
+    acquire_activity: bool,
+) -> Result<SwitchResult, String> {
+    let _activity = acquire_activity
+        .then(|| acquire_switch_activity(&app))
+        .transpose()?;
+    let (steam_id, display_name) = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        let session = data
+            .steam
+            .web_sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "Steam 网页会话不存在".to_string())?;
+        let steam_id = session
+            .steam_id
+            .clone()
+            .ok_or_else(|| "请先登录并识别该 Steam 网页账号".to_string())?;
+        (steam_id, session.display_name.clone())
+    };
+    let installation = perfect_arena::discover_installation()?;
+    let installation_for_prepare = installation.clone();
+    let started_at = tauri::async_runtime::spawn_blocking(move || {
+        perfect_arena::prepare_oauth_login(&installation_for_prepare)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let label = steam_web_window_label(&session_id);
+    if let Some(window) = app.get_webview_window(&label) {
+        window.destroy().map_err(|error| error.to_string())?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (oauth_window, oauth_loop_detected) = build_perfect_oauth_window(&app, &session_id)?;
+    let oauth_cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_on_close = oauth_cancelled.clone();
+    oauth_window.on_window_event(move |event| {
+        if matches!(
+            event,
+            WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+        ) {
+            cancel_on_close.store(true, Ordering::SeqCst);
+        }
+    });
+    let target_id = steam_id.clone();
+    let wait_cancelled = oauth_cancelled.clone();
+    let login_result = tauri::async_runtime::spawn_blocking(move || {
+        perfect_arena::wait_for_oauth_login(
+            &target_id,
+            started_at,
+            Duration::from_secs(120),
+            wait_cancelled,
+            oauth_loop_detected,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if login_result.is_ok() {
+        let _ = oauth_window.destroy();
+        update_tray(&app);
+    }
+    login_result?;
+    let all_steam_ids = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        data.steam
+            .web_sessions
+            .iter()
+            .filter_map(|session| session.steam_id.clone())
+            .chain(data.steam.accounts.iter().map(|account| account.id.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let _ = refresh_perfect_profiles_for_ids(&app, all_steam_ids, false).await;
+    Ok(SwitchResult {
+        ok: true,
+        message: format!("已通过 Steam 网页认证切换完美账号：{}", display_name),
+    })
+}
+
 #[tauri::command]
 async fn get_perfect_arena_workspace(
     state: State<'_, AppState>,
@@ -2658,6 +3949,65 @@ async fn get_perfect_arena_workspace(
         .steam
         .clone();
     Ok(perfect_arena::workspace(&steam))
+}
+
+#[tauri::command]
+async fn get_perfect_arena_profiles(
+    app: AppHandle,
+) -> Result<Vec<perfect_arena::PerfectArenaProfile>, String> {
+    let steam_ids = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        data.steam
+            .web_sessions
+            .iter()
+            .filter_map(|session| session.steam_id.clone())
+            .chain(data.steam.accounts.iter().map(|account| account.id.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    refresh_perfect_profiles_for_ids(&app, steam_ids, false).await
+}
+
+#[tauri::command]
+fn set_perfect_account_unavailable(
+    app: AppHandle,
+    steam_id: String,
+    unavailable: bool,
+) -> Result<Vec<String>, String> {
+    if steam_id.len() != 17 || !steam_id.chars().all(|character| character.is_ascii_digit()) {
+        return Err("完美账号 SteamID 无效".to_string());
+    }
+    let state = app.state::<AppState>();
+    let mut next_data = state.data.lock().map_err(|error| error.to_string())?.clone();
+    if !next_data
+        .steam
+        .web_sessions
+        .iter()
+        .any(|session| session.steam_id.as_deref() == Some(&steam_id))
+    {
+        return Err("完美账号不存在".to_string());
+    }
+    if unavailable {
+        next_data
+            .perfect_unavailable_account_ids
+            .insert(steam_id);
+    } else {
+        next_data
+            .perfect_unavailable_account_ids
+            .remove(&steam_id);
+    }
+    save_data(&next_data)?;
+    let mut account_ids = next_data
+        .perfect_unavailable_account_ids
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    account_ids.sort();
+    *state.data.lock().map_err(|error| error.to_string())? = next_data;
+    let _ = app.emit("app-data-changed", ());
+    Ok(account_ids)
 }
 
 #[tauri::command]
@@ -2676,49 +4026,6 @@ async fn discover_perfect_arena(
         discover_steam(app.clone()).await?;
     }
     get_perfect_arena_workspace(app.state::<AppState>()).await
-}
-
-#[tauri::command]
-async fn switch_perfect_arena_account(
-    app: AppHandle,
-    account_id: String,
-) -> Result<SwitchResult, String> {
-    let installation = perfect_arena::discover_installation()?;
-    let installation_for_stop = installation.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        perfect_arena::ensure_games_stopped()?;
-        perfect_arena::stop(&installation_for_stop)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-
-    if let Err(error) = switch_steam_account(app.clone(), account_id.clone()).await {
-        let _ = perfect_arena::start(&installation);
-        return Err(error);
-    }
-
-    let account_name = app
-        .state::<AppState>()
-        .data
-        .lock()
-        .map_err(|error| error.to_string())?
-        .steam
-        .accounts
-        .iter()
-        .find(|account| account.id == account_id)
-        .map(|account| account.display_name.clone())
-        .unwrap_or(account_id);
-    tauri::async_runtime::spawn_blocking(move || {
-        thread::sleep(Duration::from_secs(2));
-        perfect_arena::start(&installation)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    update_tray(&app);
-    Ok(SwitchResult {
-        ok: true,
-        message: format!("已切换 Steam 并启动完美对战平台：{}", account_name),
-    })
 }
 
 #[tauri::command]
@@ -2744,30 +4051,184 @@ async fn set_steam_account_note(
     Ok(workspace)
 }
 
+#[derive(Serialize, Deserialize)]
+struct StagedDeletionMarker {
+    original: PathBuf,
+    staged: PathBuf,
+    committed: bool,
+}
+
+struct StagedDeletion {
+    original: PathBuf,
+    staged: PathBuf,
+    marker: PathBuf,
+}
+
+fn stage_for_deletion(path: &Path) -> Result<Option<StagedDeletion>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let trash = storage_dir()?.join("trash");
+    fs::create_dir_all(&trash).map_err(|error| format!("创建删除暂存区失败: {error}"))?;
+    let id = Uuid::new_v4().to_string();
+    let staged = trash.join(format!("{id}.data"));
+    let marker = trash.join(format!("{id}.json"));
+    fs::rename(path, &staged).map_err(|error| format!("暂存待删除数据失败: {error}"))?;
+    let marker_data = StagedDeletionMarker {
+        original: path.to_path_buf(),
+        staged: staged.clone(),
+        committed: false,
+    };
+    if let Err(error) = fs::write(
+        &marker,
+        serde_json::to_vec(&marker_data).map_err(|error| error.to_string())?,
+    ) {
+        let _ = fs::rename(&staged, path);
+        return Err(format!("记录删除事务失败: {error}"));
+    }
+    Ok(Some(StagedDeletion {
+        original: path.to_path_buf(),
+        staged,
+        marker,
+    }))
+}
+
+fn rollback_staged_deletion(staged: &StagedDeletion) {
+    if staged.staged.exists() && !staged.original.exists() {
+        let _ = fs::rename(&staged.staged, &staged.original);
+    }
+    let _ = fs::remove_file(&staged.marker);
+}
+
+fn mark_staged_deletion_committed(staged: &StagedDeletion) {
+    let marker_data = StagedDeletionMarker {
+        original: staged.original.clone(),
+        staged: staged.staged.clone(),
+        committed: true,
+    };
+    if let Ok(raw) = serde_json::to_vec(&marker_data) {
+        let _ = fs::write(&staged.marker, raw);
+    }
+}
+
+fn finish_staged_deletion(staged: Option<StagedDeletion>) {
+    if let Some(staged) = staged {
+        let _ = fs::remove_dir_all(&staged.staged);
+        if !staged.staged.exists() {
+            let _ = fs::remove_file(staged.marker);
+        }
+    }
+}
+
+fn recover_staged_deletions(storage_root: &Path) {
+    let trash = storage_root.join("trash");
+    for entry in fs::read_dir(&trash).into_iter().flatten().flatten() {
+        let marker_path = entry.path();
+        if marker_path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(marker) = fs::read(&marker_path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<StagedDeletionMarker>(&raw).ok())
+        else {
+            continue;
+        };
+        if !marker.original.starts_with(storage_root) || !marker.staged.starts_with(&trash) {
+            continue;
+        }
+        let resolved = if marker.committed {
+            let _ = fs::remove_dir_all(&marker.staged);
+            !marker.staged.exists()
+        } else if marker.staged.exists() && !marker.original.exists() {
+            if let Some(parent) = marker.original.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::rename(&marker.staged, &marker.original);
+            marker.original.exists()
+        } else {
+            marker.original.exists()
+        };
+        if resolved {
+            let _ = fs::remove_file(marker_path);
+        }
+    }
+}
+
 #[tauri::command]
 async fn delete_steam_account(app: AppHandle, account_id: String) -> Result<(), String> {
+    let _activity = acquire_switch_activity(&app)?;
     let state = app.state::<AppState>();
-    let mut data = state.data.lock().map_err(|error| error.to_string())?;
-    data.steam
+    let mut next_data = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    if !next_data
+        .steam
         .accounts
-        .retain(|account| account.id != account_id);
-    save_data(&data)?;
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err("Steam 账号不存在".to_string());
+    }
     let snapshot = storage_dir()?
         .join("workspaces")
         .join("steam")
         .join("accounts")
-        .join(account_id);
-    if snapshot.exists() {
-        fs::remove_dir_all(snapshot)
-            .map_err(|error| format!("删除 Steam 账号快照失败: {}", error))?;
+        .join(&account_id);
+    let staged = stage_for_deletion(&snapshot)?;
+    next_data
+        .steam
+        .accounts
+        .retain(|account| account.id != account_id);
+    if let Err(error) = save_data(&next_data) {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err(error);
     }
-    drop(data);
+    if let Some(staged) = &staged {
+        mark_staged_deletion_committed(staged);
+    }
+    *state.data.lock().map_err(|error| error.to_string())? = next_data;
+    finish_staged_deletion(staged);
     update_tray(&app);
     Ok(())
 }
 
+fn prune_old_directories(root: &Path, keep: usize) {
+    let mut directories = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (entry.path(), modified)
+        })
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    for (path, _) in directories.into_iter().skip(keep) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 #[tauri::command]
 async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<SwitchResult, String> {
+    switch_steam_account_impl(app, account_id, true).await
+}
+
+async fn switch_steam_account_impl(
+    app: AppHandle,
+    account_id: String,
+    acquire_activity: bool,
+) -> Result<SwitchResult, String> {
+    let _activity = acquire_activity
+        .then(|| acquire_switch_activity(&app))
+        .transpose()?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _operation = state
@@ -2786,34 +4247,52 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
             executable: PathBuf::from(&installation.executable),
             data_dir: PathBuf::from(&installation.install_dir),
         };
-        let backup_dir = storage_dir()?
+        let backup_root = storage_dir()?
             .join("workspaces")
             .join("steam")
-            .join("backups")
-            .join(Uuid::new_v4().to_string());
+            .join("backups");
+        let backup_dir = backup_root.join(Uuid::new_v4().to_string());
+        let previous_auto_login = steam::SteamAdapter::auto_login_user();
+        let was_running = adapter.is_running(&adapter_installation);
         steam::SteamAdapter::snapshot_login_state(&installation, &backup_dir)?;
         adapter.stop(&adapter_installation)?;
-        let switch_result = (|| {
+        let switch_result = (|| -> Result<String, String> {
             let account_name = steam::SteamAdapter::activate_account(&installation, &account_id)?;
-            Ok::<_, String>(account_name)
+            steam::SteamAdapter::start_with_login(&adapter_installation, &account_name)?;
+            let mut next_data = state
+                .data
+                .lock()
+                .map_err(|error| error.to_string())?
+                .clone();
+            next_data.steam.current_account_id = Some(account_id.clone());
+            for account in &mut next_data.steam.accounts {
+                account.most_recent = account.id == account_id;
+            }
+            save_data(&next_data)?;
+            *state.data.lock().map_err(|error| error.to_string())? = next_data;
+            Ok(account_name)
         })();
-        if let Err(error) = &switch_result {
-            let loginusers = PathBuf::from(&installation.install_dir)
-                .join("config")
-                .join("loginusers.vdf");
-            let _ = fs::copy(backup_dir.join("loginusers.vdf"), loginusers);
-            let _ = adapter.start(&adapter_installation);
-            return Err(error.clone());
-        }
-        let account_name = switch_result?;
-        steam::SteamAdapter::start_with_login(&adapter_installation, &account_name)?;
-        let mut data = state.data.lock().map_err(|error| error.to_string())?;
-        data.steam.current_account_id = Some(account_id.clone());
-        for account in &mut data.steam.accounts {
-            account.most_recent = account.id == account_id;
-        }
-        save_data(&data)?;
-        drop(data);
+        let account_name = match switch_result {
+            Ok(account_name) => account_name,
+            Err(error) => {
+                let _ = adapter.stop(&adapter_installation);
+                let restore_result = steam::SteamAdapter::restore_login_state(
+                    &installation,
+                    &backup_dir,
+                    previous_auto_login.as_deref(),
+                );
+                if was_running {
+                    let _ = adapter.start(&adapter_installation);
+                }
+                return match restore_result {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(format!(
+                        "{error}；同时无法恢复原 Steam 登录状态: {restore_error}"
+                    )),
+                };
+            }
+        };
+        prune_old_directories(&backup_root, 5);
         update_tray(&app);
         Ok(SwitchResult {
             ok: true,
@@ -2822,6 +4301,68 @@ async fn switch_steam_account(app: AppHandle, account_id: String) -> Result<Swit
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn switch_steam_and_perfect_account(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SwitchResult, String> {
+    let _activity = acquire_switch_activity(&app)?;
+    let (steam_id, steam_installation) = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        let session = data
+            .steam
+            .web_sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "完美网页账号不存在".to_string())?;
+        let steam_id = session
+            .steam_id
+            .clone()
+            .ok_or_else(|| "请先登录并识别该完美网页账号".to_string())?;
+        data.steam
+            .accounts
+            .iter()
+            .find(|account| account.id == steam_id)
+            .ok_or_else(|| "未找到相同 SteamID 的 Steam 客户端账号".to_string())?;
+        let installation = data
+            .steam
+            .installation
+            .clone()
+            .ok_or_else(|| "请先搜索 Steam 安装目录".to_string())?;
+        (steam_id, installation)
+    };
+    let fresh_accounts = steam::SteamAdapter::read_accounts(&steam_installation)?;
+    if !fresh_accounts.iter().any(|account| account.id == steam_id) {
+        return Err("相同 SteamID 的 Steam 客户端账号已不存在，请刷新账号列表".to_string());
+    }
+    let steam_is_current = fresh_accounts
+        .iter()
+        .any(|account| account.id == steam_id && account.most_recent)
+        && steam::SteamAdapter.is_running(&adapters::AppInstallation {
+            executable: PathBuf::from(&steam_installation.executable),
+            data_dir: PathBuf::from(&steam_installation.install_dir),
+        });
+
+    let steam_was_switched = !steam_is_current;
+    if steam_was_switched {
+        switch_steam_account_impl(app.clone(), steam_id, false).await?;
+    }
+    let perfect_result = switch_perfect_web_account_impl(app, session_id, false)
+        .await
+        .map_err(|error| {
+            if steam_was_switched {
+                format!("Steam 已切换，但完美账号切换未完成: {error}")
+            } else {
+                error
+            }
+        })?;
+    Ok(SwitchResult {
+        ok: perfect_result.ok,
+        message: "Steam 与完美账号已同步切换".to_string(),
+    })
 }
 
 fn schedule_auto_import_current_login(app: AppHandle) {
@@ -4019,8 +5560,8 @@ fn wormhole_relay_hints() -> Result<Vec<transit::RelayHint>, String> {
     Ok(vec![hint])
 }
 
-fn wormhole_temp_package(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{}-{}.oopz+", prefix, Uuid::new_v4()))
+fn wormhole_temp_package(prefix: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{}-{}.{}", prefix, Uuid::new_v4(), extension))
 }
 
 async fn wait_for_quick_share_cancel(app: AppHandle) {
@@ -4042,6 +5583,202 @@ fn finish_wormhole_operation(app: &AppHandle) {
     state.wormhole_cancelled.store(false, Ordering::SeqCst);
 }
 
+fn collect_web_session_cookies(
+    app: &AppHandle,
+    session: &steam::SteamWebSession,
+) -> Result<Vec<String>, String> {
+    let label = steam_web_window_label(&session.id);
+    let (window, temporary) = match app.get_webview_window(&label) {
+        Some(window) => (window, false),
+        None => (
+            build_steam_web_window(app, &session.id, false, false, None)?,
+            true,
+        ),
+    };
+    if temporary {
+        thread::sleep(Duration::from_millis(200));
+    }
+    let result = window
+        .cookies()
+        .map_err(|error| format!("读取 {} 的网页登录态失败: {}", session.display_name, error))?
+        .into_iter()
+        .filter(is_allowed_steam_cookie)
+        .map(|cookie| cookie.to_string())
+        .collect::<Vec<_>>();
+    if temporary {
+        let _ = window.destroy();
+    }
+    if !result
+        .iter()
+        .any(|cookie| cookie.to_ascii_lowercase().starts_with("steamloginsecure="))
+    {
+        return Err(format!("{} 的 Steam 网页登录态已失效", session.display_name));
+    }
+    Ok(result)
+}
+
+fn is_allowed_steam_cookie(cookie: &Cookie<'_>) -> bool {
+    cookie.domain().is_some_and(|domain| {
+        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        domain == "steampowered.com"
+            || domain.ends_with(".steampowered.com")
+            || domain == "steamcommunity.com"
+            || domain.ends_with(".steamcommunity.com")
+    })
+}
+
+fn prepare_quick_share_material(
+    app: &AppHandle,
+    selection: &QuickShareSelection,
+) -> Result<(Vec<SavedAccount>, Vec<SharedWebSession>), String> {
+    let perfect_ids = selection
+        .perfect_session_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let web_ids = selection
+        .steam_web_session_ids
+        .iter()
+        .filter(|id| !perfect_ids.contains(*id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let oopz_ids = selection
+        .oopz_account_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if oopz_ids.is_empty() && web_ids.is_empty() && perfect_ids.is_empty() {
+        return Err("请至少选择一个可分享账号".to_string());
+    }
+    if !perfect_ids.is_empty() {
+        perfect_arena::stop_for_share_transfer()?;
+    }
+    let (oopz_accounts, sessions, profiles, unavailable_ids) = {
+        let state = app.state::<AppState>();
+        let data = state
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let oopz_accounts = data
+            .accounts
+            .iter()
+            .filter(|account| oopz_ids.contains(&account.id) && account.has_login_state)
+            .cloned()
+            .collect::<Vec<_>>();
+        let sessions = data
+            .steam
+            .web_sessions
+            .iter()
+            .filter(|session| web_ids.contains(&session.id) || perfect_ids.contains(&session.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (
+            oopz_accounts,
+            sessions,
+            data.perfect_profiles.clone(),
+            data.perfect_unavailable_account_ids.clone(),
+        )
+    };
+    if oopz_accounts.len() != oopz_ids.len() {
+        return Err("所选 OOPZ 账号包含不可分享或不存在的登录态".to_string());
+    }
+    if sessions.len() != web_ids.len() + perfect_ids.len() {
+        return Err("所选 Steam 网页账号不存在".to_string());
+    }
+    let mut shared_sessions = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let steam_id = session
+            .steam_id
+            .clone()
+            .ok_or_else(|| format!("{} 尚未识别 SteamID", session.display_name))?;
+        let perfect = perfect_ids.contains(&session.id);
+        let perfect_files = if perfect {
+            perfect_arena::account_database_files(&steam_id)
+                .into_iter()
+                .filter_map(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        shared_sessions.push(SharedWebSession {
+            kind: if perfect { "perfect" } else { "steam-web" }.to_string(),
+            cookies: collect_web_session_cookies(app, &session)?,
+            perfect_profile: perfect.then(|| profiles.get(&steam_id).cloned()).flatten(),
+            perfect_unavailable: perfect && unavailable_ids.contains(&steam_id),
+            perfect_files,
+            session,
+        });
+    }
+    Ok((oopz_accounts, shared_sessions))
+}
+
+fn write_quick_share_package(
+    path: &Path,
+    oopz_accounts: &[SavedAccount],
+    web_sessions: &[SharedWebSession],
+) -> Result<(), String> {
+    let oopz_package = path.with_extension(format!("{}.oopz.tmp", Uuid::new_v4()));
+    if !oopz_accounts.is_empty() {
+        write_export_package_v3(&oopz_package, oopz_accounts)?;
+    }
+    let result = (|| -> Result<(), String> {
+        let file = fs::File::create(path).map_err(|error| error.to_string())?;
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        archive
+            .start_file("manifest.json", options)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_writer(
+            &mut archive,
+            &NeaShareManifest {
+                format: NEA_SHARE_FORMAT_V1.to_string(),
+                exported_at: now(),
+                has_oopz_package: !oopz_accounts.is_empty(),
+                web_sessions: web_sessions.to_vec(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if !oopz_accounts.is_empty() {
+            archive
+                .start_file("oopz/accounts.nea", options)
+                .map_err(|error| error.to_string())?;
+            let mut source = fs::File::open(&oopz_package).map_err(|error| error.to_string())?;
+            std::io::copy(&mut source, &mut archive).map_err(|error| error.to_string())?;
+        }
+        for item in web_sessions.iter().filter(|item| item.kind == "perfect") {
+            let Some(steam_id) = item.session.steam_id.as_deref() else {
+                continue;
+            };
+            for file_name in &item.perfect_files {
+                let relative = safe_relative_path(file_name)?;
+                if relative.components().count() != 1 {
+                    return Err("完美账号数据库文件名无效".to_string());
+                }
+                let Some(database_dir) = perfect_arena::account_database_dir() else {
+                    continue;
+                };
+                let source_path = database_dir.join(file_name);
+                if !source_path.is_file() {
+                    continue;
+                }
+                archive
+                    .start_file(format!("perfect/{}/{}", steam_id, file_name), options)
+                    .map_err(|error| error.to_string())?;
+                let mut source = fs::File::open(source_path).map_err(|error| error.to_string())?;
+                std::io::copy(&mut source, &mut archive).map_err(|error| error.to_string())?;
+            }
+        }
+        archive.finish().map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(oopz_package);
+    result
+}
+
 #[tauri::command]
 fn cancel_quick_share(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -4053,7 +5790,10 @@ fn cancel_quick_share(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn start_quick_export(app: AppHandle) -> Result<String, String> {
+async fn start_quick_export(
+    app: AppHandle,
+    selection: QuickShareSelection,
+) -> Result<String, String> {
     if app
         .state::<AppState>()
         .wormhole_running
@@ -4068,15 +5808,23 @@ async fn start_quick_export(app: AppHandle) -> Result<String, String> {
         &app,
         "preparing",
         "send",
-        "正在打包全部账号登录态...",
+        "正在打包所选账号登录态...",
         None,
         None,
     );
-    let package_path = wormhole_temp_package("oopz-plus-share");
-    let build_app = app.clone();
+    let package_path = wormhole_temp_package("nea-share", "nea");
+    let material = prepare_quick_share_material(&app, &selection);
+    let (oopz_accounts, web_sessions) = match material {
+        Ok(material) => material,
+        Err(error) => {
+            finish_wormhole_operation(&app);
+            emit_wormhole_status(&app, "error", "send", &error, None, None);
+            return Err(error);
+        }
+    };
     let build_path = package_path.clone();
     let build_result = match tauri::async_runtime::spawn_blocking(move || {
-        export_account_package_inner(&build_app, None, &build_path)
+        write_quick_share_package(&build_path, &oopz_accounts, &web_sessions)
     })
     .await
     {
@@ -4156,7 +5904,7 @@ async fn start_quick_export(app: AppHandle) -> Result<String, String> {
                 }
             };
             let offer = transfer::offer::OfferSend::new_file_or_folder(
-                "oopz-plus-login-states.oopz+".to_string(),
+                "nea-account-share.nea".to_string(),
                 &package_path,
             )
             .await
@@ -4263,11 +6011,305 @@ async fn start_quick_export(app: AppHandle) -> Result<String, String> {
     Ok(code)
 }
 
+fn validate_shared_steam_id(value: &str) -> bool {
+    value.len() == 17 && value.chars().all(|character| character.is_ascii_digit())
+}
+
+fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, String> {
+    let package_size = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    if package_size == 0 || package_size > MAX_V3_ARCHIVE_BYTES {
+        return Err("NEA 分享包大小无效".to_string());
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("打开 NEA 分享包失败: {error}"))?;
+    let manifest = {
+        let entry = archive
+            .by_name("manifest.json")
+            .map_err(|_| "NEA 分享包缺少清单".to_string())?;
+        if entry.size() == 0 || entry.size() > MAX_SHARE_MANIFEST_BYTES {
+            return Err("NEA 分享清单大小无效".to_string());
+        }
+        let mut raw = Vec::with_capacity(entry.size() as usize);
+        entry
+            .take(MAX_SHARE_MANIFEST_BYTES + 1)
+            .read_to_end(&mut raw)
+            .map_err(|error| format!("读取 NEA 分享清单失败: {error}"))?;
+        if raw.len() as u64 > MAX_SHARE_MANIFEST_BYTES {
+            return Err("NEA 分享清单超过限制".to_string());
+        }
+        serde_json::from_slice::<NeaShareManifest>(&raw)
+            .map_err(|error| format!("NEA 分享清单格式错误: {error}"))?
+    };
+    if manifest.format != NEA_SHARE_FORMAT_V1 {
+        return Err("不支持此 NEA 分享包版本".to_string());
+    }
+    if manifest.web_sessions.len() > MAX_SHARED_WEB_SESSIONS {
+        return Err("NEA 分享包中的网页账号过多".to_string());
+    }
+    let mut steam_ids = HashSet::new();
+    let mut expected_perfect_files = HashSet::new();
+    for item in &manifest.web_sessions {
+        if item.kind != "steam-web" && item.kind != "perfect" {
+            return Err("NEA 分享包包含未知账号类型".to_string());
+        }
+        let steam_id = item
+            .session
+            .steam_id
+            .as_deref()
+            .filter(|value| validate_shared_steam_id(value))
+            .ok_or_else(|| "NEA 分享包包含无效 SteamID".to_string())?;
+        if !steam_ids.insert(steam_id.to_string()) {
+            return Err("NEA 分享包包含重复的 Steam 网页账号".to_string());
+        }
+        if item.cookies.is_empty() || item.cookies.len() > MAX_SHARED_COOKIES_PER_SESSION {
+            return Err(format!("Steam 网页账号 {steam_id} 的 Cookie 数量无效"));
+        }
+        if item.cookies.iter().any(|cookie| cookie.is_empty() || cookie.len() > MAX_SHARED_COOKIE_BYTES) {
+            return Err(format!("Steam 网页账号 {steam_id} 的 Cookie 大小无效"));
+        }
+        let parsed_cookies = item
+            .cookies
+            .iter()
+            .map(|raw| Cookie::parse(raw.clone()).map(Cookie::into_owned))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| format!("Steam 网页账号 {steam_id} 的 Cookie 格式无效"))?;
+        if parsed_cookies.iter().any(|cookie| !is_allowed_steam_cookie(cookie)) {
+            return Err(format!("Steam 网页账号 {steam_id} 包含非 Steam 域 Cookie"));
+        }
+        let cookie_steam_id = parsed_cookies
+            .iter()
+            .find(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
+            .and_then(|cookie| steam_id_from_web_cookie(cookie.value()));
+        if cookie_steam_id.as_deref() != Some(steam_id) {
+            return Err(format!("Steam 网页账号 {steam_id} 的登录态与账号不匹配"));
+        }
+        if item.kind == "steam-web" && (!item.perfect_files.is_empty() || item.perfect_profile.is_some()) {
+            return Err("Steam 网页分享项不应包含完美平台数据".to_string());
+        }
+        for file_name in &item.perfect_files {
+            let relative = safe_relative_path(file_name)?;
+            if item.kind != "perfect" || relative.components().count() != 1 {
+                return Err("完美平台数据库文件名无效".to_string());
+            }
+            if file_name.split('.').next() != Some(steam_id)
+                || !expected_perfect_files.insert((steam_id.to_string(), file_name.clone()))
+            {
+                return Err("完美平台数据库文件清单无效".to_string());
+            }
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("nea-share-import-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let result = (|| -> Result<PreparedQuickImport, String> {
+        let oopz_package = manifest.has_oopz_package.then(|| root.join("oopz-accounts.nea"));
+        let mut found_oopz = false;
+        let mut found_perfect = HashSet::new();
+        let mut perfect_files = Vec::new();
+        let mut total_uncompressed = 0u64;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+            if entry.is_dir() {
+                return Err("NEA 分享包不应包含目录项".to_string());
+            }
+            total_uncompressed = total_uncompressed
+                .checked_add(entry.size())
+                .ok_or_else(|| "NEA 分享包内容大小溢出".to_string())?;
+            if total_uncompressed > MAX_EXPORT_PACKAGE_BYTES {
+                return Err("NEA 分享包解压内容超过限制".to_string());
+            }
+            let enclosed = entry
+                .enclosed_name()
+                .ok_or_else(|| "NEA 分享包包含不安全路径".to_string())?;
+            let name = enclosed
+                .to_str()
+                .ok_or_else(|| "NEA 分享包包含非 Unicode 路径".to_string())?
+                .replace('\\', "/");
+            if name == "manifest.json" {
+                continue;
+            }
+            let target = if name == "oopz/accounts.nea" && manifest.has_oopz_package && !found_oopz {
+                found_oopz = true;
+                oopz_package.clone().expect("oopz target must exist")
+            } else {
+                let parts = name.split('/').collect::<Vec<_>>();
+                if parts.len() != 3 || parts[0] != "perfect" {
+                    return Err("NEA 分享包包含未声明文件".to_string());
+                }
+                let key = (parts[1].to_string(), parts[2].to_string());
+                if !expected_perfect_files.contains(&key) || !found_perfect.insert(key.clone()) {
+                    return Err("NEA 分享包包含未声明或重复的完美平台文件".to_string());
+                }
+                let target = root.join("perfect").join(&key.0).join(&key.1);
+                perfect_files.push((key.0, key.1, target.clone()));
+                target
+            };
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut output = fs::File::create(&target).map_err(|error| error.to_string())?;
+            let written = std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+            if written != entry.size() {
+                return Err("NEA 分享包文件大小不一致".to_string());
+            }
+        }
+        if found_oopz != manifest.has_oopz_package || found_perfect != expected_perfect_files {
+            return Err("NEA 分享包缺少已声明的账号文件".to_string());
+        }
+        Ok(PreparedQuickImport { root: root.clone(), manifest, oopz_package, perfect_files })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&root);
+    }
+    result
+}
+
+fn commit_perfect_share_files(files: &[(String, String, PathBuf)]) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    perfect_arena::stop_for_share_transfer()?;
+    let database_dir = perfect_arena::account_database_dir()
+        .ok_or_else(|| "无法定位完美世界竞技平台数据目录".to_string())?;
+    fs::create_dir_all(&database_dir).map_err(|error| format!("创建完美平台数据目录失败: {error}"))?;
+    for (steam_id, file_name, staged) in files {
+        if !validate_shared_steam_id(steam_id) || file_name.split('.').next() != Some(steam_id) {
+            return Err("完美平台账号文件校验失败".to_string());
+        }
+        let target = database_dir.join(file_name);
+        let temp = database_dir.join(format!("{}.{}.nea.tmp", file_name, Uuid::new_v4()));
+        let backup = database_dir.join(format!("{}.{}.nea.bak", file_name, Uuid::new_v4()));
+        fs::copy(staged, &temp).map_err(|error| format!("写入完美平台账号数据失败: {error}"))?;
+        if target.exists() {
+            fs::rename(&target, &backup).map_err(|error| format!("备份完美平台原账号数据失败: {error}"))?;
+        }
+        if let Err(error) = fs::rename(&temp, &target) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &target);
+            }
+            let _ = fs::remove_file(&temp);
+            return Err(format!("提交完美平台账号数据失败: {error}"));
+        }
+        let _ = fs::remove_file(&backup);
+    }
+    Ok(())
+}
+
+async fn import_quick_share_package(app: &AppHandle, path: &Path) -> Result<QuickImportResult, String> {
+    let prepare_path = path.to_path_buf();
+    let prepared = tauri::async_runtime::spawn_blocking(move || prepare_quick_import_package(&prepare_path))
+        .await
+        .map_err(|error| format!("解析分享包任务异常结束: {error}"))??;
+    let result = async {
+        let mut imported_sessions = Vec::new();
+        for item in &prepared.manifest.web_sessions {
+            let steam_id = item.session.steam_id.as_deref().ok_or_else(|| "分享包缺少 SteamID".to_string())?;
+            let existing = app
+                .state::<AppState>()
+                .data
+                .lock()
+                .map_err(|error| error.to_string())?
+                .steam
+                .web_sessions
+                .iter()
+                .find(|session| session.steam_id.as_deref() == Some(steam_id))
+                .cloned();
+            let new_session = existing.is_none();
+            let mut session = existing.unwrap_or_else(|| {
+                let mut session = item.session.clone();
+                session.id = Uuid::new_v4().to_string();
+                session
+            });
+            session.steam_id = Some(steam_id.to_string());
+            session.last_verified_at = Some(Utc::now().to_rfc3339());
+            if session.display_name.trim().is_empty() {
+                session.display_name = steam_id.to_string();
+            }
+            let label = steam_web_window_label(&session.id);
+            if let Some(existing_window) = app.get_webview_window(&label) {
+                let _ = existing_window.destroy();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let window = build_steam_web_window(app, &session.id, false, false, None)?;
+            let cookie_result = (|| -> Result<(), String> {
+                for raw in &item.cookies {
+                    let cookie = Cookie::parse(raw.clone())
+                        .map_err(|_| format!("Steam 网页账号 {steam_id} 的 Cookie 格式无效"))?
+                        .into_owned();
+                    window
+                        .set_cookie(cookie)
+                        .map_err(|error| format!("恢复 Steam 网页账号 {steam_id} 失败: {error}"))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = cookie_result {
+                let _ = window.destroy();
+                if new_session {
+                    let _ = fs::remove_dir_all(steam_web_session_dir(&session.id)?);
+                }
+                return Err(error);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let restored_steam_id = steam_id_from_web_window(window.clone()).await;
+            let _ = window.destroy();
+            if restored_steam_id?.as_deref() != Some(steam_id) {
+                if new_session {
+                    let _ = fs::remove_dir_all(steam_web_session_dir(&session.id)?);
+                }
+                return Err(format!("恢复 Steam 网页账号 {steam_id} 后校验失败"));
+            }
+            imported_sessions.push((item, session));
+        }
+
+        let mut next_data = app.state::<AppState>().data.lock().map_err(|error| error.to_string())?.clone();
+        let mut steam_web_accounts = 0usize;
+        let mut perfect_accounts = 0usize;
+        for (item, imported) in imported_sessions {
+            if let Some(existing) = next_data.steam.web_sessions.iter_mut().find(|session| session.steam_id == imported.steam_id) {
+                merge_steam_web_session(existing, &imported);
+                existing.last_verified_at = imported.last_verified_at.clone();
+            } else {
+                next_data.steam.web_sessions.push(imported);
+            }
+            let steam_id = item.session.steam_id.as_deref().expect("validated steam id");
+            if item.kind == "perfect" {
+                perfect_accounts += 1;
+                if let Some(profile) = &item.perfect_profile {
+                    next_data.perfect_profiles.insert(steam_id.to_string(), profile.clone());
+                }
+                if item.perfect_unavailable {
+                    next_data.perfect_unavailable_account_ids.insert(steam_id.to_string());
+                }
+            } else {
+                steam_web_accounts += 1;
+            }
+        }
+        save_data(&next_data)?;
+        *app.state::<AppState>().data.lock().map_err(|error| error.to_string())? = next_data;
+        commit_perfect_share_files(&prepared.perfect_files)?;
+        let oopz_accounts = if let Some(path) = &prepared.oopz_package {
+            let import_app = app.clone();
+            let import_path = path.clone();
+            tauri::async_runtime::spawn_blocking(move || import_account_package_inner(&import_app, &import_path))
+                .await
+                .map_err(|error| format!("导入 OOPZ 账号任务异常结束: {error}"))??
+        } else {
+            Vec::new()
+        };
+        update_tray(app);
+        let _ = app.emit("app-data-changed", ());
+        Ok(QuickImportResult { oopz_accounts, steam_web_accounts, perfect_accounts })
+    }
+    .await;
+    let _ = fs::remove_dir_all(&prepared.root);
+    result
+}
+
 async fn receive_wormhole_package(
     app: &AppHandle,
     code: Code,
     target: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mailbox = MailboxConnection::connect(transfer::APP_CONFIG, code, false)
         .await
         .map_err(|e| format!("连接快捷码失败: {}", e))?;
@@ -4283,12 +6325,13 @@ async fn receive_wormhole_package(
     .await
     .map_err(|e| format!("接收请求失败: {}", e))?
     .ok_or_else(|| "对方已取消传输".to_string())?;
-    if !request.file_name().ends_with(".oopz+")
+    let legacy_oopz_package = request.file_name().ends_with(".oopz+");
+    if !(request.file_name().ends_with(".nea") || legacy_oopz_package)
         || request.file_size() == 0
         || request.file_size() > MAX_V3_ARCHIVE_BYTES
     {
         let _ = request.reject().await;
-        return Err("对方发送的不是有效 OOPZ+ 登录态包".to_string());
+        return Err("对方发送的不是有效 NEA 登录态包".to_string());
     }
     let mut file = async_fs::OpenOptions::new()
         .write(true)
@@ -4337,11 +6380,11 @@ async fn receive_wormhole_package(
     file.flush()
         .await
         .map_err(|e| format!("保存接收文件失败: {}", e))?;
-    Ok(())
+    Ok(legacy_oopz_package)
 }
 
 #[tauri::command]
-async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>, String> {
+async fn quick_import(app: AppHandle, code: String) -> Result<QuickImportResult, String> {
     let code = code
         .trim()
         .parse::<Code>()
@@ -4364,7 +6407,7 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
         None,
         None,
     );
-    let package_path = wormhole_temp_package("oopz-plus-receive");
+    let package_path = wormhole_temp_package("nea-receive", "nea");
     let receive_app = app.clone();
     let receive_result = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
         tokio::select! {
@@ -4374,7 +6417,7 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
     })
     .await;
     let result = match receive_result {
-        Ok(Ok(())) => {
+        Ok(Ok(legacy_oopz_package)) => {
             emit_wormhole_status(
                 &app,
                 "importing",
@@ -4383,15 +6426,22 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
                 None,
                 None,
             );
-            let import_app = app.clone();
-            let import_path = package_path.clone();
-            match tauri::async_runtime::spawn_blocking(move || {
-                import_account_package_inner(&import_app, &import_path)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(format!("导入任务异常结束: {}", error)),
+            if legacy_oopz_package {
+                let import_app = app.clone();
+                let import_path = package_path.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    import_account_package_inner(&import_app, &import_path).map(|oopz_accounts| {
+                        QuickImportResult {
+                            oopz_accounts,
+                            steam_web_accounts: 0,
+                            perfect_accounts: 0,
+                        }
+                    })
+                })
+                .await
+                .map_err(|error| format!("导入旧版 OOPZ 分享包任务异常结束: {error}"))?
+            } else {
+                import_quick_share_package(&app, &package_path).await
             }
         }
         Ok(Err(error)) => Err(error),
@@ -4400,11 +6450,16 @@ async fn quick_import(app: AppHandle, code: String) -> Result<Vec<SavedAccount>,
     let _ = fs::remove_file(&package_path);
     finish_wormhole_operation(&app);
     match &result {
-        Ok(accounts) => emit_wormhole_status(
+        Ok(imported) => emit_wormhole_status(
             &app,
             "complete",
             "receive",
-            format!("快捷导入完成，共 {} 个账号", accounts.len()),
+            format!(
+                "快捷导入完成：OOPZ {} 个、Steam 网页 {} 个、完美平台 {} 个",
+                imported.oopz_accounts.len(),
+                imported.steam_web_accounts,
+                imported.perfect_accounts
+            ),
             None,
             None,
         ),
@@ -4438,15 +6493,34 @@ fn delete_account_inner(
     account_id: String,
 ) -> Result<(), String> {
     let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
-    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
-    data.accounts.retain(|a| a.id != account_id);
-    save_data(&data)?;
-    *state.data.lock().map_err(|e| e.to_string())? = data;
-    delete_credential(&account_id);
     let dir = accounts_dir()?.join(&account_id);
-    if dir.exists() {
-        fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
+    let staged = stage_for_deletion(&dir)?;
+    let mut next_data = state.data.lock().map_err(|e| e.to_string())?.clone();
+    if !next_data
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err("账号不存在".to_string());
     }
+    next_data
+        .accounts
+        .retain(|account| account.id != account_id);
+    if let Err(error) = save_data(&next_data) {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err(error);
+    }
+    if let Some(staged) = &staged {
+        mark_staged_deletion_committed(staged);
+    }
+    *state.data.lock().map_err(|e| e.to_string())? = next_data;
+    delete_credential(&account_id);
+    finish_staged_deletion(staged);
     update_tray(&app);
     Ok(())
 }
@@ -4542,6 +6616,7 @@ fn backup_current(paths: &OopzPaths) -> Result<(), String> {
 
 #[tauri::command]
 async fn restore_latest_backup(app: AppHandle) -> Result<SwitchResult, String> {
+    let _activity = acquire_switch_activity(&app)?;
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_task.state::<AppState>();
@@ -4595,6 +6670,7 @@ fn switch_account_inner(
     state: State<AppState>,
     account_id: String,
 ) -> Result<SwitchResult, String> {
+    let _activity = acquire_switch_activity(&app)?;
     let _operation = state
         .switch_operation
         .try_lock()
@@ -4744,6 +6820,7 @@ pub fn run() {
             data: Mutex::new(load_data()),
             account_operation: Mutex::new(()),
             switch_operation: Mutex::new(()),
+            switch_running: AtomicBool::new(false),
             discovery_cancelled: AtomicBool::new(false),
             auto_import_running: AtomicBool::new(false),
             plugin_operation: Mutex::new(()),
@@ -4754,16 +6831,27 @@ pub fn run() {
             update_status: Mutex::new(initial_update_status()),
             wormhole_running: AtomicBool::new(false),
             wormhole_cancelled: AtomicBool::new(false),
+            steam_web_import_running: AtomicBool::new(false),
             main_webview_low_memory: AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
+            get_config_health,
             get_steam_workspace,
             discover_steam,
             refresh_steam_accounts,
+            create_steam_web_session,
+            import_steam_web_accounts_from_text,
+            open_steam_web_session,
+            refresh_steam_web_sessions,
+            set_steam_web_session_note,
+            delete_steam_web_session,
+            switch_perfect_web_account,
             get_perfect_arena_workspace,
+            get_perfect_arena_profiles,
+            set_perfect_account_unavailable,
             discover_perfect_arena,
-            switch_perfect_arena_account,
+            switch_steam_and_perfect_account,
             set_steam_account_note,
             delete_steam_account,
             switch_steam_account,
@@ -4881,12 +6969,12 @@ pub fn run() {
                                 );
                             });
                         }
-                        _ if id.starts_with("perfect-switch:") => {
-                            let account_id = id.trim_start_matches("perfect-switch:").to_string();
+                        _ if id.starts_with("perfect-web:") => {
+                            let session_id = id.trim_start_matches("perfect-web:").to_string();
                             let app_handle = app.clone();
                             thread::spawn(move || {
                                 let result = tauri::async_runtime::block_on(
-                                    switch_perfect_arena_account(app_handle.clone(), account_id),
+                                    switch_perfect_web_account(app_handle.clone(), session_id),
                                 );
                                 let _ = app_handle.emit(
                                     "switch-finished",
@@ -4949,6 +7037,263 @@ fn spawn_watcher() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shared_web_session(steam_id: &str) -> SharedWebSession {
+        SharedWebSession {
+            kind: "steam-web".to_string(),
+            session: steam::SteamWebSession {
+                id: "source-session".to_string(),
+                steam_id: Some(steam_id.to_string()),
+                account_name: Some("tester".to_string()),
+                display_name: "Tester".to_string(),
+                note: None,
+                created_at: now(),
+                last_verified_at: Some(now()),
+            },
+            cookies: vec![format!(
+                "steamLoginSecure={steam_id}%7Ctoken; Domain=store.steampowered.com; Path=/; Secure; HttpOnly"
+            )],
+            perfect_profile: None,
+            perfect_unavailable: false,
+            perfect_files: Vec::new(),
+        }
+    }
+
+    fn write_test_share_package(path: &Path, manifest: &NeaShareManifest, extra_file: Option<&str>) {
+        let file = fs::File::create(path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        archive.start_file("manifest.json", options).unwrap();
+        serde_json::to_writer(&mut archive, manifest).unwrap();
+        if let Some(name) = extra_file {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(b"unexpected").unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn quick_share_manifest_accepts_matching_steam_cookie() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![test_shared_web_session("76561198000000001")],
+        };
+        write_test_share_package(&path, &manifest, None);
+        let prepared = prepare_quick_import_package(&path).unwrap();
+        assert_eq!(prepared.manifest.web_sessions.len(), 1);
+        let _ = fs::remove_dir_all(prepared.root);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_manifest_rejects_cookie_for_another_account() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let mut item = test_shared_web_session("76561198000000001");
+        item.cookies = test_shared_web_session("76561198000000002").cookies;
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![item],
+        };
+        write_test_share_package(&path, &manifest, None);
+        assert!(prepare_quick_import_package(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_package_rejects_undeclared_files() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: Vec::new(),
+        };
+        write_test_share_package(&path, &manifest, Some("unexpected.bin"));
+        assert!(prepare_quick_import_package(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovers_corrupt_config_from_valid_backup() {
+        let root = std::env::temp_dir().join(format!("nea-config-recovery-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        fs::write(&path, "{broken").unwrap();
+        let expected = AppData {
+            schema_version: 7,
+            ..AppData::default()
+        };
+        fs::write(
+            path.with_extension("json.bak"),
+            serde_json::to_string_pretty(&expected).unwrap(),
+        )
+        .unwrap();
+
+        let (recovered, _) = recover_config_file(&path).unwrap();
+        assert_eq!(recovered.schema_version, 7);
+        assert!(parse_app_data_file(&path).is_some());
+        assert!(!CONFIG_WRITES_BLOCKED.load(Ordering::SeqCst));
+        assert!(fs::read_dir(&root).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("config.json.corrupt-")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_deletion_can_be_rolled_back() {
+        let root = std::env::temp_dir().join(format!("nea-delete-rollback-{}", Uuid::new_v4()));
+        let original = root.join("account");
+        let staged = root.join("trash");
+        let marker = root.join("trash.json");
+        fs::create_dir_all(&original).unwrap();
+        fs::write(original.join("state.bin"), b"state").unwrap();
+        fs::rename(&original, &staged).unwrap();
+        fs::write(&marker, b"marker").unwrap();
+        rollback_staged_deletion(&StagedDeletion {
+            original: original.clone(),
+            staged,
+            marker,
+        });
+        assert_eq!(fs::read(original.join("state.bin")).unwrap(), b"state");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovers_interrupted_deletion_transaction() {
+        let root = std::env::temp_dir().join(format!("nea-delete-recovery-{}", Uuid::new_v4()));
+        let trash = root.join("trash");
+        let original = root.join("accounts").join("account-1");
+        let staged = trash.join("operation.data");
+        let marker = trash.join("operation.json");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("state.bin"), b"state").unwrap();
+        fs::write(
+            &marker,
+            serde_json::to_vec(&StagedDeletionMarker {
+                original: original.clone(),
+                staged: staged.clone(),
+                committed: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        recover_staged_deletions(&root);
+        assert_eq!(fs::read(original.join("state.bin")).unwrap(), b"state");
+        assert!(!marker.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_backup_directories_are_bounded() {
+        let root = std::env::temp_dir().join(format!("nea-backup-prune-{}", Uuid::new_v4()));
+        for index in 0..8 {
+            fs::create_dir_all(root.join(index.to_string())).unwrap();
+        }
+        prune_old_directories(&root, 5);
+        assert_eq!(fs::read_dir(&root).unwrap().flatten().count(), 5);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steam_credential_script_does_not_embed_plaintext() {
+        let credentials = SteamCredentialInput {
+            account: "account-name".to_string(),
+            password: "private-password".to_string(),
+        };
+        let script = steam_credential_automation_script(&credentials).unwrap();
+        assert!(!script.contains("account-name"));
+        assert!(!script.contains("private-password"));
+        assert!(script.contains("atob("));
+        assert!(script.contains("location.pathname.toLowerCase().startsWith('/login')"));
+        assert!(script.contains("password.closest('form')"));
+        assert!(script.contains("loginRoot.querySelectorAll('button, input[type=\"submit\"]')"));
+        assert!(script.contains(STEAM_VERIFICATION_WINDOW_TITLE));
+        assert!(script.contains("此账户受到手机验证器保护"));
+        assert!(script.contains("autocomplete === 'one-time-code'"));
+        assert!(!script.contains("document.querySelector('input[type=\"text\"]"));
+
+        let mut password = credentials.password;
+        clear_sensitive_string(&mut password);
+        assert!(password.is_empty());
+    }
+
+    #[test]
+    fn perfect_oauth_automation_keeps_normal_flow_and_has_a_loop_stop_page() {
+        assert!(PERFECT_OAUTH_AUTOMATION_SCRIPT.contains("const accepted ="));
+        assert!(!PERFECT_OAUTH_AUTOMATION_SCRIPT.contains("window.name"));
+        assert!(PERFECT_OAUTH_LOOP_STOP_SCRIPT.contains("已停止重复授权"));
+    }
+
+    #[cfg(feature = "custom-protocol")]
+    #[test]
+    fn production_context_embeds_frontend_entrypoint() {
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let entrypoint = tauri::utils::assets::AssetKey::from("/index.html");
+        let html = context
+            .assets()
+            .get(&entrypoint)
+            .expect("production context must embed /index.html");
+        assert!(html
+            .windows(b"<div id=\"root\"></div>".len())
+            .any(|window| { window == b"<div id=\"root\"></div>" }));
+    }
+
+    #[test]
+    fn steam_web_sessions_deduplicate_by_steam_id_and_keep_account_name() {
+        let old = steam::SteamWebSession {
+            id: "old-session".to_string(),
+            steam_id: Some("76561199000000001".to_string()),
+            account_name: None,
+            display_name: "76561199000000001".to_string(),
+            note: Some("保留备注".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_verified_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        let imported = steam::SteamWebSession {
+            id: "new-session".to_string(),
+            steam_id: Some("76561199000000001".to_string()),
+            account_name: Some("steam-login-name".to_string()),
+            display_name: "steam-login-name".to_string(),
+            note: None,
+            created_at: "2026-01-02T00:00:00Z".to_string(),
+            last_verified_at: Some("2026-01-02T00:00:00Z".to_string()),
+        };
+
+        let (sessions, removed) =
+            deduplicate_steam_web_sessions(vec![old, imported], Some("new-session"));
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "new-session");
+        assert_eq!(
+            sessions[0].account_name.as_deref(),
+            Some("steam-login-name")
+        );
+        assert_eq!(sessions[0].note.as_deref(), Some("保留备注"));
+        assert_eq!(
+            steam_web_session_primary_name(&sessions[0]),
+            "steam-login-name"
+        );
+        assert_eq!(removed, vec!["old-session"]);
+    }
+
+    #[test]
+    fn extracts_only_steam64_from_secure_login_cookie() {
+        assert_eq!(
+            steam_id_from_web_cookie("76561199198704913%7C%7Csecret").as_deref(),
+            Some("76561199198704913")
+        );
+        assert_eq!(
+            steam_id_from_web_cookie("76561199198704913||secret").as_deref(),
+            Some("76561199198704913")
+        );
+        assert!(steam_id_from_web_cookie("not-a-cookie").is_none());
+    }
 
     fn test_account(id: &str, uid: &str) -> serde_json::Value {
         serde_json::json!({

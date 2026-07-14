@@ -42,7 +42,8 @@ html.overlay-root body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -90,9 +91,28 @@ button.primary {
 }
 
 .app-rail {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   padding: 76px 8px 18px;
   background: #eaf4f8;
+}
+
+.global-share-button {
+  display: grid;
+  width: 48px;
+  height: 42px;
+  margin-top: auto;
+  place-items: center;
+  border-color: transparent;
+  background: transparent;
+  color: #52616a;
+}
+
+.global-share-button:hover:not(:disabled) {
+  border-color: #c6d9df;
+  background: #fff;
+  color: #20272b;
 }
 
 .app-list {
@@ -223,10 +243,250 @@ button.primary {
   overflow-wrap: anywhere;
 }
 
+.share-center-backdrop {
+  padding: 32px;
+}
+
+.share-center {
+  display: grid;
+  grid-template-rows: auto auto minmax(180px, 1fr) auto;
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 64px));
+  overflow: hidden;
+  border: 1px solid #d3dce1;
+  border-radius: 10px;
+  background: #f8fafb;
+  box-shadow: 0 24px 70px rgba(20, 28, 34, 0.28);
+}
+
+.share-center-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid #e1e7ea;
+  background: #fff;
+}
+
+.share-center-header h2,
+.share-center-header p {
+  margin: 0;
+}
+
+.share-center-header h2 {
+  color: #20272b;
+  font-size: 17px;
+}
+
+.share-center-header p {
+  margin-top: 5px;
+  color: #6d7980;
+  font-size: 12px;
+}
+
+.share-center-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-bottom: 1px solid #e3e8eb;
+  background: #f8fafb;
+}
+
+.share-center-toolbar span {
+  margin-left: auto;
+  color: #68757d;
+  font-size: 12px;
+}
+
+.share-tree {
+  overflow-y: auto;
+  padding: 12px 20px 18px;
+}
+
+.share-tree-platform {
+  overflow: hidden;
+  margin-bottom: 10px;
+  border: 1px solid #dce3e7;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.share-tree-platform[data-disabled="true"] {
+  background: #f6f8f9;
+}
+
+.share-tree-parent,
+.share-tree-parent-select,
+.share-tree-children label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.share-tree-perfect-parent {
+  justify-content: space-between;
+}
+
+.share-tree-parent-select,
+.share-available-filter {
+  gap: 9px;
+}
+
+.share-available-filter {
+  display: flex;
+  align-items: center;
+  color: #59676f;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.share-tree-parent {
+  min-height: 42px;
+  padding: 7px 12px;
+  background: #f7f9fa;
+}
+
+.share-tree-parent img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+}
+
+.share-tree-parent strong {
+  color: #273138;
+  font-size: 13px;
+}
+
+.share-tree-parent span {
+  margin-left: auto;
+  color: #748087;
+  font-size: 11px;
+}
+
+.share-tree-parent .unsupported-badge,
+.share-tree-children em {
+  color: #8a9297;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.share-tree-children {
+  padding: 3px 12px 7px 43px;
+}
+
+.share-tree-children label {
+  min-height: 36px;
+  border-top: 1px solid #eef1f3;
+}
+
+.share-tree-children label:first-child {
+  border-top: 0;
+}
+
+.share-tree-children label > span {
+  display: grid;
+  min-width: 0;
+}
+
+.share-tree-children label strong,
+.share-tree-children label small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-tree-children label strong {
+  color: #303a40;
+  font-size: 12px;
+}
+
+.share-tree-children label small,
+.share-tree-empty {
+  color: #839097;
+  font-size: 10px;
+}
+
+.share-perfect-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 3px;
+}
+
+.share-perfect-meta b {
+  color: #66747c;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.share-perfect-meta b[data-danger="true"] {
+  color: #b42318;
+}
+
+.share-tree-children label[data-unavailable="true"] {
+  background: rgba(180, 35, 24, 0.025);
+}
+
+.share-tree-children em {
+  margin-left: auto;
+}
+
+.share-tree-empty {
+  padding: 10px 0;
+}
+
+.share-center-transfer {
+  display: grid;
+  gap: 8px;
+  padding: 14px 20px 16px;
+  border-top: 1px solid #dfe5e8;
+  background: #fff;
+}
+
+.share-center-transfer progress {
+  width: 100%;
+  height: 6px;
+  accent-color: #2563eb;
+}
+
+.share-dedupe-note {
+  margin: 0;
+  color: #7a858c;
+  font-size: 11px;
+}
+
 .confirm-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.steam-text-import-dialog {
+  width: min(520px, 100%);
+}
+
+.steam-text-import-dialog textarea {
+  display: block;
+  width: 100%;
+  height: 240px;
+  margin: 0 0 16px;
+  resize: vertical;
+  border: 1px solid #cbd2d9;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fbfcfd;
+  color: #20272b;
+  font: 13px/20px Consolas, "Courier New", monospace;
+  letter-spacing: 0;
+  outline: none;
+}
+
+.steam-text-import-dialog textarea:focus {
+  border-color: #3f78b5;
+  box-shadow: 0 0 0 2px rgba(63, 120, 181, 0.14);
 }
 
 button.primary.danger-confirm {
@@ -708,6 +968,312 @@ button.primary.danger-confirm {
   background: #fff;
 }
 
+.perfect-switcher {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.perfect-switcher-header {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.perfect-switcher-header h2 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 20px;
+  letter-spacing: 0;
+}
+
+.perfect-filter-bar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 132px auto auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #e1e5e8;
+  border-radius: 7px;
+  background: #f8f9fa;
+}
+
+.perfect-filter-bar > input,
+.perfect-filter-bar > select {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid #d8dde2;
+  border-radius: 6px;
+  padding: 0 9px;
+  color: #202124;
+  background: #fff;
+  outline: none;
+}
+
+.perfect-filter-bar > input:focus,
+.perfect-filter-bar > select:focus {
+  border-color: #7ba4b6;
+  box-shadow: 0 0 0 2px rgba(74, 126, 148, 0.1);
+}
+
+.perfect-filter-bar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: #4c555d;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.perfect-filter-bar label input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #2563eb;
+}
+
+.perfect-account-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 10px;
+  min-width: 0;
+}
+
+.perfect-grid-empty {
+  grid-column: 1 / -1;
+}
+
+.perfect-account-card {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 10px;
+  min-width: 0;
+  min-height: 172px;
+  border: 1px solid #dde3e7;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(31, 48, 58, 0.05);
+}
+
+.perfect-card-menu-wrap {
+  position: absolute;
+  z-index: 3;
+  top: 6px;
+  right: 6px;
+}
+
+.perfect-card-menu-button {
+  width: 26px;
+  height: 26px;
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.perfect-card-menu {
+  position: absolute;
+  top: 28px;
+  right: 0;
+  width: 132px;
+  border: 1px solid #d8dde2;
+  border-radius: 7px;
+  padding: 4px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(31, 48, 58, 0.16);
+}
+
+.perfect-card-menu button {
+  width: 100%;
+  height: 28px;
+  border: 0;
+  padding: 0 7px;
+  text-align: left;
+  font-size: 11px;
+}
+
+.perfect-account-card[data-selected="true"] {
+  border-color: #8fb1c0;
+  box-shadow: 0 0 0 1px rgba(74, 126, 148, 0.12);
+}
+
+.perfect-account-card[data-current="true"] {
+  background: #f4f9fa;
+}
+
+.perfect-account-card[data-high-risk="true"] {
+  border-color: #e3aaa5;
+}
+
+.perfect-card-identity {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.perfect-card-identity:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+}
+
+.perfect-card-avatar {
+  position: relative;
+  display: block;
+  width: 38px;
+  height: 38px;
+  border-radius: 7px;
+  background: #e5ebf0;
+  overflow: hidden;
+}
+
+.perfect-card-avatar img {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.perfect-card-name {
+  min-width: 0;
+}
+
+.perfect-card-name strong,
+.perfect-card-name small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.perfect-card-name strong {
+  color: #20262b;
+  font-size: 13px;
+}
+
+.perfect-card-name small {
+  margin-top: 3px;
+  color: #7a838b;
+  font-size: 10px;
+}
+
+.perfect-current-badge {
+  border-radius: 4px;
+  padding: 2px 5px;
+  background: #dcebed;
+  color: #315864;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.perfect-card-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  border-top: 1px solid #edf0f2;
+  padding-top: 9px;
+}
+
+.perfect-card-metrics > span {
+  min-width: 0;
+}
+
+.perfect-card-metrics small {
+  display: block;
+  color: #7a838b;
+  font-size: 10px;
+}
+
+.perfect-card-metrics strong {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+  margin-top: 3px;
+  overflow: hidden;
+  color: #20262b;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.perfect-card-metrics em {
+  color: #6b7280;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.perfect-reputation[data-level="danger"] strong,
+.perfect-reputation[data-level="低优先"] strong {
+  color: #b42318;
+}
+
+.perfect-reputation[data-level="风险观察"] strong {
+  color: #a15c00;
+}
+
+.perfect-reputation[data-level="良好"] strong {
+  color: #347343;
+}
+
+.perfect-reputation[data-level="优秀"] strong {
+  color: #008a78;
+}
+
+.perfect-reputation[data-level="pending"] strong {
+  color: #7a838b;
+  font-weight: 600;
+}
+
+.perfect-account-card .steam-account-note {
+  align-self: end;
+  margin: 0;
+}
+
+.perfect-account-card .steam-account-note input {
+  height: 28px;
+  font-size: 11px;
+}
+
+.perfect-account-card .steam-account-note button {
+  height: 28px;
+  padding-inline: 7px;
+  font-size: 11px;
+}
+
+.perfect-card-actions {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.perfect-card-actions button {
+  min-width: 0;
+  padding-inline: 5px;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .account-details dt {
   color: #6b7280;
 }
@@ -1035,6 +1601,10 @@ button.primary.danger-confirm {
 
   .status {
     max-width: 48vw;
+  }
+
+  .perfect-filter-bar {
+    grid-template-columns: minmax(0, 1fr) 120px;
   }
 }
 

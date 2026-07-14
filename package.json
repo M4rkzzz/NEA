@@ -1,11 +1,16 @@
 {
   "name": "nea",
   "private": true,
-  "version": "1.2.2",
+  "version": "1.2.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:app": "tauri dev",
+    "check:fast": "tsc --noEmit && cargo check --manifest-path src-tauri/Cargo.toml",
     "build": "tsc && vite build",
+    "build:app-fast": "tauri build --debug --no-bundle",
+    "build:msi": "tauri build --bundles msi",
+    "verify:full": "npm run build && cargo test --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
     "preview": "vite preview",
     "tauri": "tauri"
   },

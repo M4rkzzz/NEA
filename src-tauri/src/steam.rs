@@ -33,12 +33,28 @@ pub struct SteamAccount {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamWebSession {
+    pub id: String,
+    pub steam_id: Option<String>,
+    #[serde(default)]
+    pub account_name: Option<String>,
+    pub display_name: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub created_at: String,
+    pub last_verified_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SteamWorkspace {
     pub installation: Option<SteamInstallation>,
     pub accounts: Vec<SteamAccount>,
     pub current_account_id: Option<String>,
+    #[serde(default)]
+    pub web_sessions: Vec<SteamWebSession>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +229,39 @@ fn users(root: &BTreeMap<String, VdfValue>) -> Result<&BTreeMap<String, VdfValue
 pub struct SteamAdapter;
 
 impl SteamAdapter {
+    pub fn auto_login_user() -> Option<String> {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Valve\\Steam")
+            .ok()?
+            .get_value::<String, _>("AutoLoginUser")
+            .ok()
+    }
+
+    pub fn restore_login_state(
+        installation: &SteamInstallation,
+        backup: &Path,
+        auto_login_user: Option<&str>,
+    ) -> Result<(), String> {
+        let loginusers = PathBuf::from(&installation.install_dir)
+            .join("config")
+            .join("loginusers.vdf");
+        fs::copy(backup.join("loginusers.vdf"), loginusers)
+            .map_err(|error| format!("恢复 Steam 登录状态失败: {error}"))?;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey("Software\\Valve\\Steam")
+            .map_err(|error| format!("打开 Steam 注册表失败: {error}"))?;
+        match auto_login_user {
+            Some(value) => key
+                .set_value("AutoLoginUser", &value)
+                .map_err(|error| format!("恢复 Steam 自动登录账号失败: {error}"))?,
+            None => {
+                let _ = key.delete_value("AutoLoginUser");
+            }
+        }
+        Ok(())
+    }
+
     fn registry_install_path() -> Option<PathBuf> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         if let Ok(key) = hkcu.open_subkey("Software\\Valve\\Steam") {
