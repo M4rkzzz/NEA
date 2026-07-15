@@ -8260,11 +8260,10 @@ async fn start_quick_export(
                     );
                 },
                 move |transferred, total| {
-                    let percent = if total == 0 {
-                        0
-                    } else {
-                        transferred.saturating_mul(100) / total
-                    };
+                    let percent = transferred
+                        .saturating_mul(100)
+                        .checked_div(total)
+                        .unwrap_or(0);
                     if progress_marker.swap(percent, Ordering::Relaxed) != percent {
                         emit_wormhole_status(
                             &progress_app,
@@ -8743,11 +8742,10 @@ async fn receive_wormhole_package(
                 );
             },
             move |transferred, total| {
-                let percent = if total == 0 {
-                    0
-                } else {
-                    transferred.saturating_mul(100) / total
-                };
+                let percent = transferred
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0);
                 if progress_marker.swap(percent, Ordering::Relaxed) != percent {
                     emit_wormhole_status(
                         &progress_app,
