@@ -409,11 +409,10 @@ function App() {
 
   function identityCapabilityBadges(identity?: SteamIdentity) {
     if (!identity) return null;
+    if (!identity.capabilities.clientLogin && !identity.capabilities.credential) return null;
     return <span className="identity-capabilities" aria-label="账号能力">
-      <b data-active={identity.capabilities.clientLogin || undefined}>客户端态</b>
-      <b data-active={identity.capabilities.webLogin || undefined}>网页态</b>
-      <b data-active={identity.capabilities.credential || undefined}>账密</b>
-      <b data-active={identity.capabilities.perfectProfile || undefined}>完美资料</b>
+      {identity.capabilities.clientLogin && <b>客户端登录</b>}
+      {identity.capabilities.credential && <b>账密</b>}
     </span>;
   }
 
@@ -423,9 +422,7 @@ function App() {
 
   function toggleSteamCredential(credential: SteamSavedCredential) {
     const key = steamCredentialKey(credential);
-    setVisibleSteamCredentials((current) => current.includes(key)
-      ? current.filter((value) => value !== key)
-      : [...current, key]);
+    setVisibleSteamCredentials((current) => current.includes(key) ? [] : [key]);
   }
 
   function credentialVisible(credential: SteamSavedCredential) {
@@ -913,7 +910,7 @@ function App() {
   }
 
   function selectSteamWebSession(session: SteamWebSession) {
-    setSelectedSteamWebSessionId(session.id);
+    setSelectedSteamWebSessionId((current) => current === session.id ? null : session.id);
     setSteamWebNoteDraft(session.note || "");
   }
 
@@ -1335,14 +1332,16 @@ function App() {
                 <span><small>玩家身份</small><strong>{profile?.playerIdentity || "待检测"}</strong></span>
                 <span className="perfect-reputation" data-level={requiresVerification || unavailable ? "danger" : profile?.reputationLevel || "pending"}><small>信誉等级</small><strong>{reputationLabel}{reputationDetail != null ? <em>{reputationDetail}</em> : null}</strong></span>
               </div>
-              {selected && <div className="steam-account-note"><input value={steamWebNoteDraft} onChange={(event) => setSteamWebNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamWebSessionNote(session))} disabled={busy}>保存</button></div>}
-              {credential && credentialDetails(credential)}
+              {(selected || Boolean(credential && credentialVisible(credential))) && <div className="perfect-card-overlay-details">
+                {selected && <div className="steam-account-note"><input value={steamWebNoteDraft} onChange={(event) => setSteamWebNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamWebSessionNote(session))} disabled={busy}>保存</button></div>}
+                {credential && credentialDetails(credential)}
+              </div>}
               <div className="perfect-card-actions" data-has-credential={Boolean(credential) || undefined}>
                 {credential && credentialEye(credential, profile?.nickname || session.displayName)}
                 <button className="icon-button danger" onClick={() => setPendingDeleteSteamWebSession(session)} disabled={busy} aria-label={`删除 ${session.displayName}`} title="删除账号"><Trash2 size={16} /></button>
-                <button className={canSyncSteam ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || !perfectWorkspace.installation || !data.steam.installation} title={canSyncSteam ? "同步切换 Steam 客户端与完美账号" : "没有匹配的 Steam 登录态或已保存账号密码"}>同步切号</button>
+                <button className={canSyncSteam ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || !perfectWorkspace.installation || !data.steam.installation} title={canSyncSteam ? "同步切换 Steam 客户端与完美账号" : "没有匹配的 Steam 登录态或已保存账号密码"}>同步</button>
                 {session.steamId
-                  ? <button className={current ? "" : "primary"} onClick={() => handleAction(() => switchPerfectWebAccount(session))} disabled={busy || current || !perfectWorkspace.installation}>{current ? "当前登录" : "快速切换"}</button>
+                  ? <button className={current ? "" : "primary"} onClick={() => handleAction(() => switchPerfectWebAccount(session))} disabled={busy || current || !perfectWorkspace.installation}>{current ? "当前" : "切换"}</button>
                   : <button onClick={() => handleAction(() => openSteamWebSession(session))} disabled={busy}>登录</button>}
               </div>
             </article>

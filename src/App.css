@@ -925,21 +925,15 @@ button.primary.danger-confirm {
 }
 
 .identity-capabilities b {
-  border: 1px solid #dce3e7;
+  border: 1px solid #bfd5de;
   border-radius: 999px;
   padding: 0 5px;
-  background: #f4f6f7;
-  color: #9aa3a8;
+  background: #edf6f8;
+  color: #426d7e;
   font-size: 9px;
   font-weight: 500;
   line-height: 15px;
   white-space: nowrap;
-}
-
-.identity-capabilities b[data-active="true"] {
-  border-color: #bfd5de;
-  background: #edf6f8;
-  color: #426d7e;
 }
 
 .perfect-card-name .identity-capabilities {
@@ -1096,13 +1090,13 @@ button.primary.danger-confirm {
 .perfect-account-card {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
-  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
   min-width: 0;
-  min-height: 172px;
+  height: 188px;
   border: 1px solid #dde3e7;
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px;
   background: #fff;
   box-shadow: 0 1px 2px rgba(31, 48, 58, 0.05);
 }
@@ -1157,14 +1151,14 @@ button.primary.danger-confirm {
 
 .perfect-card-identity {
   display: grid;
-  grid-template-columns: 38px minmax(0, 1fr) auto;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
   height: auto;
   min-width: 0;
   border: 0;
-  padding: 0;
+  padding: 0 27px 0 0;
   background: transparent;
   text-align: left;
 }
@@ -1177,8 +1171,8 @@ button.primary.danger-confirm {
 .perfect-card-avatar {
   position: relative;
   display: block;
-  width: 38px;
-  height: 38px;
+  width: 36px;
+  height: 36px;
   border-radius: 7px;
   background: #e5ebf0;
   overflow: hidden;
@@ -1229,7 +1223,7 @@ button.primary.danger-confirm {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
   border-top: 1px solid #edf0f2;
-  padding-top: 9px;
+  padding-top: 7px;
 }
 
 .perfect-card-metrics > span {
@@ -1302,14 +1296,37 @@ button.primary.danger-confirm {
 
 .perfect-card-actions {
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 27px minmax(0, 1fr) minmax(0, 1fr);
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
 }
 
 .perfect-card-actions[data-has-credential="true"] {
-  grid-template-columns: 30px 30px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 27px 27px minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.perfect-card-actions .icon-button {
+  width: 27px;
+  min-width: 27px;
+  height: 28px;
+}
+
+.perfect-card-overlay-details {
+  position: absolute;
+  z-index: 4;
+  right: 8px;
+  bottom: 42px;
+  left: 8px;
+  display: grid;
+  gap: 6px;
+  max-height: 112px;
+  overflow-y: auto;
+  border: 1px solid #ccd7dc;
+  border-radius: 7px;
+  padding: 7px;
+  background: rgba(250, 252, 253, 0.98);
+  box-shadow: 0 8px 22px rgba(31, 48, 58, 0.18);
 }
 
 .credential-eye {
@@ -1373,8 +1390,9 @@ button.primary.danger-confirm {
 }
 
 .perfect-card-actions button {
+  height: 28px;
   min-width: 0;
-  padding-inline: 5px;
+  padding-inline: 3px;
   overflow: hidden;
   font-size: 11px;
   text-overflow: ellipsis;
@@ -1483,21 +1501,21 @@ button.primary.danger-confirm {
 
 html[data-theme="dark"] {
   color-scheme: dark;
-  background: #14181b;
+  background: #171717;
 }
 
 html[data-theme="dark"] :root,
 html[data-theme="dark"] body,
 html[data-theme="dark"] .shell {
   color: #e4e8eb;
-  background: #14181b;
+  background: #171717;
 }
 
 html[data-theme="dark"] .window-titlebar,
 html[data-theme="dark"] .app-layout,
 html[data-theme="dark"] .app-rail,
 html[data-theme="dark"] .sidebar {
-  background: #182126;
+  background: #1b2428;
 }
 
 html[data-theme="dark"] .window-brand img {
@@ -1505,10 +1523,11 @@ html[data-theme="dark"] .window-brand img {
 }
 
 html[data-theme="dark"] .workspace {
-  background: #111619;
+  background: #171717;
 }
 
 html[data-theme="dark"] .panel,
+html[data-theme="dark"] .metric,
 html[data-theme="dark"] .account-row,
 html[data-theme="dark"] .perfect-account-card,
 html[data-theme="dark"] .confirm-dialog,
@@ -1517,8 +1536,8 @@ html[data-theme="dark"] .share-center-header,
 html[data-theme="dark"] .share-center-transfer,
 html[data-theme="dark"] .share-tree-platform,
 html[data-theme="dark"] .perfect-card-menu {
-  border-color: #343d43;
-  background: #1a2024;
+  border-color: #353535;
+  background: #212121;
   color: #e4e8eb;
 }
 
@@ -1532,14 +1551,14 @@ html[data-theme="dark"] button,
 html[data-theme="dark"] input,
 html[data-theme="dark"] select,
 html[data-theme="dark"] textarea {
-  border-color: #3b454b;
-  background: #20272c;
+  border-color: #424242;
+  background: #292929;
   color: #e7ebed;
 }
 
 html[data-theme="dark"] button:hover:not(:disabled) {
-  border-color: #536068;
-  background: #293238;
+  border-color: #5a5a5a;
+  background: #333;
   color: #fff;
 }
 
@@ -1552,8 +1571,8 @@ html[data-theme="dark"] button.primary {
 html[data-theme="dark"] .app-list button[data-active="true"],
 html[data-theme="dark"] .global-share-button:hover:not(:disabled),
 html[data-theme="dark"] .feature-list button[data-active="true"] {
-  border-color: #46535a;
-  background: #29343a;
+  border-color: #4b565b;
+  background: #2b3539;
   color: #f2f5f6;
   box-shadow: none;
 }
@@ -1567,7 +1586,7 @@ html[data-theme="dark"] .plugin-health,
 html[data-theme="dark"] .quick-transfer-status,
 html[data-theme="dark"] .account-main small,
 html[data-theme="dark"] .perfect-card-name small {
-  color: #9da8ae;
+  color: #a6a6a6;
 }
 
 html[data-theme="dark"] .sidebar-app-name,
@@ -1587,8 +1606,8 @@ html[data-theme="dark"] .share-tree-children label strong {
 html[data-theme="dark"] .account-row[data-selected="true"],
 html[data-theme="dark"] .perfect-account-card[data-current="true"],
 html[data-theme="dark"] .perfect-account-card[data-selected="true"] {
-  border-color: #52666f;
-  background: #202b30;
+  border-color: #59666c;
+  background: #282d2f;
 }
 
 html[data-theme="dark"] .perfect-filter-bar,
@@ -1597,8 +1616,8 @@ html[data-theme="dark"] .share-tree-parent,
 html[data-theme="dark"] .steam-credential-details,
 html[data-theme="dark"] .empty,
 html[data-theme="dark"] .notice {
-  border-color: #343e44;
-  background: #20272b;
+  border-color: #3d3d3d;
+  background: #252525;
   color: #b9c2c7;
 }
 
@@ -1609,15 +1628,40 @@ html[data-theme="dark"] .plugin-health {
 }
 
 html[data-theme="dark"] .identity-capabilities b {
-  border-color: #3b464c;
-  background: #242c31;
-  color: #77838a;
-}
-
-html[data-theme="dark"] .identity-capabilities b[data-active="true"] {
   border-color: #456573;
   background: #20343d;
   color: #9cc9db;
+}
+
+html[data-theme="dark"] .perfect-card-overlay-details {
+  border-color: #444;
+  background: rgba(38, 38, 38, 0.98);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
+}
+
+html[data-theme="dark"] .perfect-reputation[data-level="danger"] strong,
+html[data-theme="dark"] .perfect-reputation[data-level="低优先"] strong {
+  color: #ff7676;
+}
+
+html[data-theme="dark"] .perfect-reputation[data-level="风险观察"] strong {
+  color: #f0ad63;
+}
+
+html[data-theme="dark"] .perfect-reputation[data-level="良好"] strong {
+  color: #7bd88f;
+}
+
+html[data-theme="dark"] .perfect-reputation[data-level="优秀"] strong {
+  color: #45d6c1;
+}
+
+html[data-theme="dark"] .perfect-reputation[data-level="pending"] strong {
+  color: #929a9e;
+}
+
+html[data-theme="dark"] .perfect-reputation em {
+  color: #9ba3a7;
 }
 
 html[data-theme="dark"] .steam-credential-details code,
