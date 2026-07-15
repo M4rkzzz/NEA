@@ -447,6 +447,24 @@ impl SteamAdapter {
             .map(|_| ())
             .map_err(|error| format!("启动 Steam 失败: {}", error))
     }
+
+    pub fn start_with_credentials(
+        installation: &AppInstallation,
+        account_name: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        if account_name.trim().is_empty() || password.is_empty() {
+            return Err("Steam 账号或密码为空".to_string());
+        }
+        Command::new(&installation.executable)
+            .current_dir(&installation.data_dir)
+            .arg("-login")
+            .arg(account_name)
+            .arg(password)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("使用账号密码启动 Steam 失败: {}", error))
+    }
 }
 
 impl AppAdapter for SteamAdapter {

@@ -917,6 +917,35 @@ button.primary.danger-confirm {
   color: #6b7280;
 }
 
+.identity-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+}
+
+.identity-capabilities b {
+  border: 1px solid #dce3e7;
+  border-radius: 999px;
+  padding: 0 5px;
+  background: #f4f6f7;
+  color: #9aa3a8;
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+.identity-capabilities b[data-active="true"] {
+  border-color: #bfd5de;
+  background: #edf6f8;
+  color: #426d7e;
+}
+
+.perfect-card-name .identity-capabilities {
+  margin-top: 4px;
+}
+
 .account-row-main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1279,6 +1308,70 @@ button.primary.danger-confirm {
   min-width: 0;
 }
 
+.perfect-card-actions[data-has-credential="true"] {
+  grid-template-columns: 30px 30px minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.credential-eye {
+  color: #4f6773;
+}
+
+.steam-credential-details {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px;
+  margin: 7px 0 2px 44px;
+  padding: 7px 9px;
+  border: 1px solid #dce4e8;
+  border-radius: 6px;
+  background: #f7fafb;
+}
+
+.perfect-account-card .steam-credential-details {
+  margin: 0;
+}
+
+.steam-credential-details span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.steam-credential-details small {
+  color: #7a858c;
+  font-size: 10px;
+}
+
+.steam-credential-details code {
+  overflow: hidden;
+  color: #26343b;
+  font: 11px/16px Consolas, "Courier New", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.steam-import-duplicate-notice {
+  display: grid;
+  gap: 5px;
+  margin: -4px 0 14px;
+  border: 1px solid #e1c88d;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: #fff9e9;
+  color: #5f4a1e;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.steam-import-duplicate-notice strong {
+  font-size: 12px;
+}
+
+.steam-import-duplicate-notice small {
+  color: #7b6739;
+}
+
 .perfect-card-actions button {
   min-width: 0;
   padding-inline: 5px;
@@ -1386,6 +1479,170 @@ button.primary.danger-confirm {
 .update-percent strong {
   color: #1d4ed8;
   font-variant-numeric: tabular-nums;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  background: #14181b;
+}
+
+html[data-theme="dark"] :root,
+html[data-theme="dark"] body,
+html[data-theme="dark"] .shell {
+  color: #e4e8eb;
+  background: #14181b;
+}
+
+html[data-theme="dark"] .window-titlebar,
+html[data-theme="dark"] .app-layout,
+html[data-theme="dark"] .app-rail,
+html[data-theme="dark"] .sidebar {
+  background: #182126;
+}
+
+html[data-theme="dark"] .window-brand img {
+  filter: invert(1) grayscale(1) brightness(1.65);
+}
+
+html[data-theme="dark"] .workspace {
+  background: #111619;
+}
+
+html[data-theme="dark"] .panel,
+html[data-theme="dark"] .account-row,
+html[data-theme="dark"] .perfect-account-card,
+html[data-theme="dark"] .confirm-dialog,
+html[data-theme="dark"] .share-center,
+html[data-theme="dark"] .share-center-header,
+html[data-theme="dark"] .share-center-transfer,
+html[data-theme="dark"] .share-tree-platform,
+html[data-theme="dark"] .perfect-card-menu {
+  border-color: #343d43;
+  background: #1a2024;
+  color: #e4e8eb;
+}
+
+html[data-theme="dark"] .panel,
+html[data-theme="dark"] .account-row,
+html[data-theme="dark"] .perfect-account-card {
+  box-shadow: none;
+}
+
+html[data-theme="dark"] button,
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  border-color: #3b454b;
+  background: #20272c;
+  color: #e7ebed;
+}
+
+html[data-theme="dark"] button:hover:not(:disabled) {
+  border-color: #536068;
+  background: #293238;
+  color: #fff;
+}
+
+html[data-theme="dark"] button.primary {
+  border-color: #3b74e7;
+  background: #2d68dd;
+  color: #fff;
+}
+
+html[data-theme="dark"] .app-list button[data-active="true"],
+html[data-theme="dark"] .global-share-button:hover:not(:disabled),
+html[data-theme="dark"] .feature-list button[data-active="true"] {
+  border-color: #46535a;
+  background: #29343a;
+  color: #f2f5f6;
+  box-shadow: none;
+}
+
+html[data-theme="dark"] .feature-list button svg,
+html[data-theme="dark"] .global-share-button,
+html[data-theme="dark"] .status,
+html[data-theme="dark"] .paths dt,
+html[data-theme="dark"] .metric span,
+html[data-theme="dark"] .plugin-health,
+html[data-theme="dark"] .quick-transfer-status,
+html[data-theme="dark"] .account-main small,
+html[data-theme="dark"] .perfect-card-name small {
+  color: #9da8ae;
+}
+
+html[data-theme="dark"] .sidebar-app-name,
+html[data-theme="dark"] .topbar h2,
+html[data-theme="dark"] .panel h2,
+html[data-theme="dark"] .panel h3,
+html[data-theme="dark"] .account-main strong,
+html[data-theme="dark"] .perfect-card-name strong,
+html[data-theme="dark"] .perfect-card-metrics strong,
+html[data-theme="dark"] .confirm-dialog p,
+html[data-theme="dark"] .share-center-header h2,
+html[data-theme="dark"] .share-tree-parent strong,
+html[data-theme="dark"] .share-tree-children label strong {
+  color: #eef1f3;
+}
+
+html[data-theme="dark"] .account-row[data-selected="true"],
+html[data-theme="dark"] .perfect-account-card[data-current="true"],
+html[data-theme="dark"] .perfect-account-card[data-selected="true"] {
+  border-color: #52666f;
+  background: #202b30;
+}
+
+html[data-theme="dark"] .perfect-filter-bar,
+html[data-theme="dark"] .share-center-toolbar,
+html[data-theme="dark"] .share-tree-parent,
+html[data-theme="dark"] .steam-credential-details,
+html[data-theme="dark"] .empty,
+html[data-theme="dark"] .notice {
+  border-color: #343e44;
+  background: #20272b;
+  color: #b9c2c7;
+}
+
+html[data-theme="dark"] .share-tree-children label,
+html[data-theme="dark"] .account-details,
+html[data-theme="dark"] .plugin-health {
+  border-color: #30383d;
+}
+
+html[data-theme="dark"] .identity-capabilities b {
+  border-color: #3b464c;
+  background: #242c31;
+  color: #77838a;
+}
+
+html[data-theme="dark"] .identity-capabilities b[data-active="true"] {
+  border-color: #456573;
+  background: #20343d;
+  color: #9cc9db;
+}
+
+html[data-theme="dark"] .steam-credential-details code,
+html[data-theme="dark"] .quick-code {
+  color: #e2e8eb;
+}
+
+html[data-theme="dark"] .confirm-backdrop {
+  background: rgba(0, 0, 0, 0.58);
+}
+
+html[data-theme="dark"] .steam-import-duplicate-notice {
+  border-color: #685b33;
+  background: #302b1e;
+  color: #e5d8ad;
+}
+
+html[data-theme="dark"] .auto-hide-scrollbar.is-scrolling {
+  scrollbar-color: rgba(166, 180, 188, 0.52) transparent;
+}
+
+html[data-theme="dark"].overlay-root,
+html[data-theme="dark"].overlay-root body,
+html[data-theme="dark"].overlay-root #root {
+  background: transparent;
 }
 
 .segmented-control {

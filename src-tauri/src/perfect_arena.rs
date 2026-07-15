@@ -11,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     net::TcpStream,
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -20,7 +21,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use sysinfo::{ProcessRefreshKind, Signal, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use winreg::{enums::*, RegKey};
 
 const EXECUTABLE_NAME: &str = "完美世界竞技平台.exe";
@@ -769,26 +770,37 @@ pub fn ensure_games_stopped() -> Result<(), String> {
 }
 
 fn stop(installation: &PerfectArenaInstallation) -> Result<(), String> {
-    let mut system = process_system();
-    for process in system.processes().values() {
-        if is_platform_process(process, installation) {
-            let _ = process
-                .kill_with(Signal::Term)
-                .unwrap_or_else(|| process.kill());
-        }
-    }
-    for _ in 0..24 {
-        thread::sleep(Duration::from_millis(250));
-        system.refresh_processes_specifics(ProcessRefreshKind::new().with_exe(UpdateKind::Always));
-        if !system
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    for _ in 0..40 {
+        let system = process_system();
+        let pids = system
             .processes()
-            .values()
-            .any(|process| is_platform_process(process, installation))
-        {
+            .iter()
+            .filter_map(|(pid, process)| {
+                is_platform_process(process, installation).then_some(pid.as_u32())
+            })
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
             return Ok(());
         }
+        for pid in pids {
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        thread::sleep(Duration::from_millis(250));
     }
-    Err("完美世界竞技平台无法完全退出，已中止切号".to_string())
+    let remaining = process_system()
+        .processes()
+        .values()
+        .filter(|process| is_platform_process(process, installation))
+        .count();
+    Err(format!(
+        "完美世界竞技平台仍有 {remaining} 个进程无法关闭，已安全中止切号"
+    ))
 }
 
 fn start(installation: &PerfectArenaInstallation) -> Result<(), String> {
@@ -796,7 +808,12 @@ fn start(installation: &PerfectArenaInstallation) -> Result<(), String> {
         .current_dir(&installation.install_dir)
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("启动完美世界竞技平台失败: {}", error))
+        .map_err(|error| {
+            error.raw_os_error().map_or_else(
+                || "启动完美世界竞技平台失败，请尝试手动启动一次".to_string(),
+                |code| format!("启动完美世界竞技平台失败（系统错误代码 {code}）"),
+            )
+        })
 }
 
 fn wait_for_oauth_callback(timeout: Duration) -> Result<(), String> {
@@ -819,7 +836,9 @@ fn wait_for_oauth_callback(timeout: Duration) -> Result<(), String> {
 
 pub fn prepare_oauth_login(installation: &PerfectArenaInstallation) -> Result<SystemTime, String> {
     ensure_games_stopped()?;
-    stop(installation)?;
+    if is_running(installation) {
+        stop(installation)?;
+    }
     let started_at = SystemTime::now();
     start(installation)?;
     wait_for_oauth_callback(Duration::from_secs(30))?;
