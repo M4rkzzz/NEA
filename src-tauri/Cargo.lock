@@ -2824,6 +2824,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "nea"
+version = "1.2.6"
+dependencies = [
+ "aes",
+ "async-fs",
+ "base64 0.22.1",
+ "chrono",
+ "ecb",
+ "futures",
+ "keyring",
+ "magic-wormhole",
+ "notify",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "uuid",
+ "webview2-com",
+ "windows 0.52.0",
+ "windows-core 0.61.2",
+ "winreg 0.52.0",
+ "zip",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3119,39 +3152,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "oopz-plus"
-version = "1.2.5"
-dependencies = [
- "aes",
- "async-fs",
- "base64 0.22.1",
- "chrono",
- "ecb",
- "futures",
- "keyring",
- "magic-wormhole",
- "notify",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tokio",
- "uuid",
- "webview2-com",
- "windows 0.52.0",
- "windows-core 0.61.2",
- "winreg 0.52.0",
- "zip",
-]
 
 [[package]]
 name = "opaque-debug"

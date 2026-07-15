@@ -61,8 +61,6 @@ type SteamIdentity = {
   clientAccountId?: string;
   webSessionId?: string;
   capabilities: {
-    clientLogin: boolean;
-    clientRemembered: boolean;
     webLogin: boolean;
     credential: boolean;
     perfectProfile: boolean;
@@ -130,13 +128,36 @@ type SteamBulkImportResult = {
   imported: number;
   failed: number;
   skippedExisting: number;
+  skippedExistingAccounts: string[];
   skippedDuplicateInput: number;
+  invalidCredentialAccounts: string[];
+  tokenProtectedAccounts: string[];
   verificationRequiredAccounts: string[];
 };
 
-type SteamImportPreview = {
-  existingAccounts: string[];
-  duplicateInputAccounts: string[];
+type SteamCapabilityCompletionResult = {
+  checked: number;
+  processed: number;
+  alreadyComplete: number;
+  webCompleted: number;
+  cancelled: boolean;
+  verificationRequiredAccounts: string[];
+  failedAccounts: string[];
+};
+
+type SteamCapabilityStatus = {
+  running: boolean;
+  paused: boolean;
+  cancelling: boolean;
+};
+
+type StorageOptimizationResult = {
+  beforeBytes: number;
+  afterBytes: number;
+  freedBytes: number;
+  optimizedSessions: number;
+  removedOrphanSessions: number;
+  cachedPerfectAvatars: number;
 };
 
 type OopzPaths = {
@@ -188,6 +209,7 @@ type WormholeStatus = {
   code?: string;
   transferred?: number;
   total?: number;
+  packageBytes?: number;
 };
 
 type QuickShareSelection = {
@@ -265,6 +287,20 @@ function perfectScoreLabel(score?: number) {
   return rank && score != null ? `${rank}${score}` : "待检测";
 }
 
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "未知大小";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
+
 function AccountAvatar({ account, className = "", ready = false }: { account: SavedAccount; className?: string; ready?: boolean }) {
   const src = account.avatarUrl?.trim() || "";
   const [failedSrc, setFailedSrc] = useState("");
@@ -309,19 +345,20 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [wormholeStatus, setWormholeStatus] = useState<WormholeStatus | null>(null);
   const [quickCode, setQuickCode] = useState("");
+  const [quickPackageBytes, setQuickPackageBytes] = useState<number | null>(null);
   const [receiveCode, setReceiveCode] = useState("");
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<SavedAccount | null>(null);
-  const [pendingDeleteSteamAccount, setPendingDeleteSteamAccount] = useState<SteamAccount | null>(null);
   const [pendingDeleteSteamWebSession, setPendingDeleteSteamWebSession] = useState<SteamWebSession | null>(null);
   const [showSteamTextImport, setShowSteamTextImport] = useState(false);
   const [steamTextImportDraft, setSteamTextImportDraft] = useState("");
-  const [steamImportPreview, setSteamImportPreview] = useState<{
-    accounts: Array<{ account: string; password: string }>;
-    preview: SteamImportPreview;
-  } | null>(null);
   const [visibleSteamCredentials, setVisibleSteamCredentials] = useState<string[]>([]);
   const [selectedSteamId, setSelectedSteamId] = useState<string | null>(null);
   const [steamNoteDraft, setSteamNoteDraft] = useState("");
+  const [steamSearch, setSteamSearch] = useState("");
+  const [steamWebFilter, setSteamWebFilter] = useState("all");
+  const [steamClientFilter, setSteamClientFilter] = useState("all");
+  const [steamCredentialFilter, setSteamCredentialFilter] = useState("all");
+  const [steamCapabilityStatus, setSteamCapabilityStatus] = useState<SteamCapabilityStatus>({ running: false, paused: false, cancelling: false });
   const [selectedSteamWebSessionId, setSelectedSteamWebSessionId] = useState<string | null>(null);
   const [steamWebNoteDraft, setSteamWebNoteDraft] = useState("");
   const [perfectWorkspace, setPerfectWorkspace] = useState<PerfectArenaWorkspace>({ accounts: [], running: false });
@@ -385,6 +422,23 @@ function App() {
       return true;
     });
   }, [data.perfectUnavailableAccountIds, data.steam.webSessions, perfectAvailableOnly, perfectPendingOnly, perfectProfiles, perfectScoreFilter, perfectSearch]);
+  const filteredSteamIdentities = useMemo(() => {
+    const query = steamSearch.trim().toLocaleLowerCase();
+    return (data.steamIdentities || []).filter((identity) => {
+      const methods = identity.capabilities;
+      if (!methods.webLogin && !methods.credential) return false;
+      if (steamWebFilter !== "all" && methods.webLogin !== (steamWebFilter === "yes")) return false;
+      if (steamClientFilter !== "all" && methods.credential !== (steamClientFilter === "yes")) return false;
+      if (steamCredentialFilter !== "all" && methods.credential !== (steamCredentialFilter === "yes")) return false;
+      if (!query) return true;
+      const perfectName = identity.steamId ? perfectProfiles[identity.steamId]?.nickname : undefined;
+      return [identity.displayName, identity.steamId, identity.accountName, identity.note, perfectName]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase()
+        .includes(query);
+    });
+  }, [data.steamIdentities, perfectProfiles, steamClientFilter, steamCredentialFilter, steamSearch, steamWebFilter]);
 
   function findSteamIdentity(steamId?: string, accountName?: string, webSessionId?: string, clientAccountId?: string) {
     const normalizedAccount = accountName?.trim().toLocaleLowerCase();
@@ -409,10 +463,17 @@ function App() {
 
   function identityCapabilityBadges(identity?: SteamIdentity) {
     if (!identity) return null;
-    if (!identity.capabilities.clientLogin && !identity.capabilities.credential) return null;
-    return <span className="identity-capabilities" aria-label="账号能力">
-      {identity.capabilities.clientLogin && <b>客户端登录</b>}
-      {identity.capabilities.credential && <b>账密</b>}
+    if (!identity.capabilities.credential) return null;
+    return <span className="identity-capabilities" aria-label="可用登录方式">
+      <b>账密登录客户端</b>
+    </span>;
+  }
+
+  function steamLoginMethods(identity: SteamIdentity) {
+    return <span className="steam-capability-boundary" aria-label="可用登录方式">
+      <b data-available={identity.capabilities.webLogin || undefined}>网页登录 {identity.capabilities.webLogin ? "可直接打开" : "需要登录"}</b>
+      <b data-available={identity.capabilities.credential || undefined}>Steam 客户端 {identity.capabilities.credential ? "可账密登录" : "缺少账密"}</b>
+      <b data-available={identity.capabilities.credential || undefined}>账号密码 {identity.capabilities.credential ? "已保存" : "未保存"}</b>
     </span>;
   }
 
@@ -583,8 +644,8 @@ function App() {
       multiple: false,
       filters: [
         { name: "NEA 登录态包", extensions: ["nea"] },
-        { name: "OOPZ+ 登录态包", extensions: ["oopz+"] },
-        { name: "旧版 OOPZ+ 登录数据", extensions: ["json", "txt"] },
+        { name: "NEA OOPZ 登录态包", extensions: ["oopz+"] },
+        { name: "旧版 OOPZ 登录数据", extensions: ["json", "txt"] },
       ],
     });
     if (!source || Array.isArray(source)) return;
@@ -641,6 +702,7 @@ function App() {
 
   async function startQuickShare() {
     setQuickCode("");
+    setQuickPackageBytes(null);
     setWormholeStatus({ state: "preparing", direction: "send", message: "正在准备快捷分享..." });
     try {
       const code = await invoke<string>("start_quick_export", { selection: shareSelection });
@@ -650,7 +712,10 @@ function App() {
       const message = errorMessage(error);
       const cancelled = message.includes("已取消");
       setWormholeStatus({ state: cancelled ? "cancelled" : "error", direction: "send", message });
-      if (cancelled) setQuickCode("");
+      if (cancelled) {
+        setQuickCode("");
+        setQuickPackageBytes(null);
+      }
       setMessage(message);
     }
   }
@@ -771,13 +836,6 @@ function App() {
     setMessage(status.message);
   }
 
-  async function discoverSteam() {
-    const workspace = await runTask("正在搜索 Steam...", () => invoke<SteamWorkspace>("discover_steam"));
-    setData((current) => ({ ...current, steam: workspace }));
-    await refreshPerfectArena();
-    setMessage("Steam 账号已刷新");
-  }
-
   async function refreshPerfectArena() {
     const [workspace, profiles] = await Promise.all([
       invoke<PerfectArenaWorkspace>("get_perfect_arena_workspace"),
@@ -811,27 +869,88 @@ function App() {
     setMessage(unavailable ? "已标记为不可用账号" : "已恢复为可用账号");
   }
 
-  async function switchSteamAccount(account: SteamAccount) {
-    const result = await runTask("正在切换 Steam 账号...", () => invoke<SwitchResult>("switch_steam_account", { accountId: account.id }));
+  async function switchSteamAccount(identity: SteamIdentity) {
+    if (!identity.steamId) return;
+    const result = await runTask("正在使用已保存账密登录 Steam 客户端...", () => invoke<SwitchResult>("switch_steam_account", { accountId: identity.steamId }));
     setMessage(result.message);
   }
 
-  async function deleteSteamAccount(account: SteamAccount) {
-    await runTask("正在删除 Steam 账号快照...", () => invoke("delete_steam_account", { accountId: account.id }));
-    setPendingDeleteSteamAccount(null);
-    setMessage("Steam 账号快照已删除");
+  function selectSteamIdentity(identity: SteamIdentity) {
+    setSelectedSteamId((current) => current === identity.id ? null : identity.id);
+    setSteamNoteDraft(identity.note || "");
   }
 
-  function selectSteamAccount(account: SteamAccount) {
-    setSelectedSteamId(account.id);
-    setSteamNoteDraft(account.note || "");
-  }
-
-  async function saveSteamNote(account: SteamAccount) {
-    const workspace = await runTask("正在保存 Steam 账号备注...", () => invoke<SteamWorkspace>("set_steam_account_note", { accountId: account.id, note: steamNoteDraft }));
-    setData((current) => ({ ...current, steam: workspace }));
-    await refreshPerfectArena();
+  async function saveSteamIdentityNote(identity: SteamIdentity) {
+    const next = await runTask("正在保存 Steam 账号备注...", () => invoke<AppData>("set_steam_identity_note", { identityId: identity.id, note: steamNoteDraft }));
+    setData(next);
     setMessage("Steam 账号备注已保存");
+  }
+
+  async function completeSteamCapabilities() {
+    setSteamCapabilityStatus({ running: true, paused: false, cancelling: false });
+    try {
+      const result = await runTask("正在逐个检查并补全 Steam 网页登录...", () =>
+        invoke<SteamCapabilityCompletionResult>("complete_steam_capabilities"),
+      );
+      const latest = await invoke<AppData>("get_app_data");
+      setData(latest);
+      const verification = result.verificationRequiredAccounts.length > 0
+        ? `，需验证 ${result.verificationRequiredAccounts.length}（${result.verificationRequiredAccounts.join("、")}）`
+        : "";
+      const failed = result.failedAccounts.length > 0
+        ? `，失败 ${result.failedAccounts.length}（${result.failedAccounts.join("；")}）`
+        : "";
+      const prefix = result.cancelled ? `网页登录补全已取消：已处理 ${result.processed}/${result.checked}` : `网页登录检查完成：检查 ${result.checked}`;
+      setMessage(`${prefix}，无需处理 ${result.alreadyComplete}，新增网页登录 ${result.webCompleted}${verification}${failed}`);
+    } finally {
+      invoke<SteamCapabilityStatus>("get_steam_capability_status")
+        .then(setSteamCapabilityStatus)
+        .catch(() => setSteamCapabilityStatus({ running: false, paused: false, cancelling: false }));
+    }
+  }
+
+  async function toggleSteamCapabilityPause() {
+    try {
+      const status = await invoke<SteamCapabilityStatus>("set_steam_capability_paused", { paused: !steamCapabilityStatus.paused });
+      setSteamCapabilityStatus(status);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  }
+
+  async function cancelSteamCapabilityCompletion() {
+    try {
+      const status = await invoke<SteamCapabilityStatus>("cancel_steam_capability_completion");
+      setSteamCapabilityStatus(status);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  }
+
+  async function refreshSteamUnified() {
+    const warnings: string[] = [];
+    try {
+      await invoke<SteamWorkspace>("discover_steam");
+    } catch (error) {
+      warnings.push(`客户端：${errorMessage(error)}`);
+    }
+    if (data.steam.webSessions.length > 0) {
+      try {
+        await invoke<SteamWorkspace>("refresh_steam_web_sessions");
+      } catch (error) {
+        warnings.push(`网页：${errorMessage(error)}`);
+      }
+    }
+    const latest = await invoke<AppData>("get_app_data");
+    setData(latest);
+    setMessage(warnings.length > 0 ? `Steam 账号已刷新；${warnings.join("；")}` : "Steam 账号已刷新");
+  }
+
+  async function optimizeStorage() {
+    const result = await runTask("正在整理 NEA 存储并清理可重建缓存...", () =>
+      invoke<StorageOptimizationResult>("optimize_storage"),
+    );
+    setMessage(`存储整理完成：释放 ${formatFileSize(result.freedBytes)}，优化 ${result.optimizedSessions} 个网页会话，清理 ${result.removedOrphanSessions} 个孤立目录，头像缓存 ${result.cachedPerfectAvatars} 个`);
   }
 
   async function createSteamWebSession() {
@@ -868,20 +987,11 @@ function App() {
       setMessage("没有可导入的 Steam 网页账号");
       return;
     }
-    const preview = await runTask("正在检测重复 Steam 网页账号...", () =>
-      invoke<SteamImportPreview>("preview_steam_web_import", { accounts: accounts.map((entry) => entry.account) }),
-    );
-    if (preview.existingAccounts.length > 0 || preview.duplicateInputAccounts.length > 0) {
-      setSteamImportPreview({ accounts, preview });
-      setMessage(`检测到 ${preview.existingAccounts.length} 个已有账号`);
-      return;
-    }
-    await executeSteamWebImport(accounts, false);
+    await executeSteamWebImport(accounts, true);
   }
 
   async function executeSteamWebImport(accounts: Array<{ account: string; password: string }>, skipExisting: boolean) {
     setShowSteamTextImport(false);
-    setSteamImportPreview(null);
     setSteamTextImportDraft("");
     const result = await runTask("正在批量导入 Steam 网页账号...", () =>
       invoke<SteamBulkImportResult>("import_steam_web_accounts_from_text", { accounts, skipExisting }),
@@ -890,23 +1000,27 @@ function App() {
     const verificationSummary = result.verificationRequiredAccounts.length > 0
       ? `，需验证已跳过 ${result.verificationRequiredAccounts.length}（${result.verificationRequiredAccounts.join("、")}）`
       : "";
+    const invalidCredentialSummary = result.invalidCredentialAccounts.length > 0
+      ? `，账号或密码错误 ${result.invalidCredentialAccounts.length}（${result.invalidCredentialAccounts.join("、")}）`
+      : "";
+    const tokenSummary = result.tokenProtectedAccounts.length > 0
+      ? `，有令牌 ${result.tokenProtectedAccounts.length}（${result.tokenProtectedAccounts.join("、")}）`
+      : "";
+    const otherFailed = Math.max(0, result.failed - result.invalidCredentialAccounts.length - result.tokenProtectedAccounts.length);
+    const skippedAccounts = result.skippedExistingAccounts.length > 0
+      ? `（${result.skippedExistingAccounts.join("、")}）`
+      : "";
     const skippedSummary = result.skippedExisting > 0 || result.skippedDuplicateInput > 0
-      ? `，跳过已有 ${result.skippedExisting}、重复输入 ${result.skippedDuplicateInput}`
+      ? `，按 Steam64 跳过已有 ${result.skippedExisting}${skippedAccounts}（缺失账密已补存，已有账密未覆盖）、重复输入 ${result.skippedDuplicateInput}`
       : "";
     setMessage(result.failed > 0 || result.verificationRequiredAccounts.length > 0 || skippedSummary
-      ? `Steam 网页账号导入完成：成功 ${result.imported}${skippedSummary}${verificationSummary}，其他失败 ${result.failed}`
+      ? `Steam 网页账号导入完成：成功 ${result.imported}${skippedSummary}${invalidCredentialSummary}${tokenSummary}${verificationSummary}，其他失败 ${otherFailed}`
       : `已导入 ${result.imported} 个 Steam 网页账号`);
   }
 
   async function openSteamWebSession(session: SteamWebSession) {
     await runTask("正在打开 Steam 网页账号...", () => invoke("open_steam_web_session", { sessionId: session.id }));
     setMessage(`已打开 ${session.displayName}`);
-  }
-
-  async function refreshSteamWebSessions() {
-    const workspace = await runTask("正在识别 Steam 网页账号...", () => invoke<SteamWorkspace>("refresh_steam_web_sessions"));
-    setData((current) => ({ ...current, steam: workspace }));
-    setMessage("Steam 网页账号已刷新");
   }
 
   function selectSteamWebSession(session: SteamWebSession) {
@@ -922,7 +1036,8 @@ function App() {
 
   async function deleteSteamWebSession(session: SteamWebSession) {
     await runTask("正在删除 Steam 网页账号...", () => invoke("delete_steam_web_session", { sessionId: session.id }));
-    setData((current) => ({ ...current, steam: { ...current.steam, webSessions: current.steam.webSessions.filter((item) => item.id !== session.id) } }));
+    const latest = await invoke<AppData>("get_app_data");
+    setData(latest);
     setPendingDeleteSteamWebSession(null);
     if (selectedSteamWebSessionId === session.id) setSelectedSteamWebSessionId(null);
     setMessage("Steam 网页账号已删除");
@@ -992,6 +1107,7 @@ function App() {
       setUpdateStatus(status);
       if (status.state === "updated" || status.state === "error") setMessage(status.message);
     }).catch(() => undefined);
+    invoke<SteamCapabilityStatus>("get_steam_capability_status").then(setSteamCapabilityStatus).catch(() => undefined);
     refreshPluginStatus().catch(() => undefined);
     refreshPerfectArena().catch(() => undefined);
 
@@ -1034,6 +1150,20 @@ function App() {
     keepListener(listen<string>("steam-bulk-import-progress", (event) => {
       setMessage(event.payload);
     }));
+    keepListener(listen<string>("steam-client-switch-progress", (event) => {
+      setMessage(event.payload);
+    }));
+    keepListener(listen<string>("steam-capability-progress", (event) => {
+      setMessage(event.payload);
+    }));
+    keepListener(listen<SteamCapabilityStatus>("steam-capability-state", (event) => {
+      setSteamCapabilityStatus(event.payload);
+    }));
+    keepListener(listen<StorageOptimizationResult>("storage-optimized", (event) => {
+      if (event.payload.freedBytes > 0) {
+        setMessage(`后台存储整理完成，已释放 ${formatFileSize(event.payload.freedBytes)}`);
+      }
+    }));
     keepListener(listen<string>("plugin-environment-finished", (event) => {
       refreshPluginStatus().catch(() => undefined);
       if (event.payload) setMessage(event.payload);
@@ -1045,7 +1175,11 @@ function App() {
     keepListener(listen<WormholeStatus>("wormhole-status", (event) => {
       setWormholeStatus(event.payload);
       if (event.payload.code) setQuickCode(event.payload.code);
-      if (event.payload.state === "cancelled") setQuickCode("");
+      if (typeof event.payload.packageBytes === "number") setQuickPackageBytes(event.payload.packageBytes);
+      if (event.payload.state === "cancelled") {
+        setQuickCode("");
+        setQuickPackageBytes(null);
+      }
       setMessage(event.payload.message);
     }));
     return () => {
@@ -1067,20 +1201,18 @@ function App() {
   }, [activeApp, activeFeature]);
 
   useEffect(() => {
-    if (!pendingDeleteAccount && !pendingDeleteSteamAccount && !pendingDeleteSteamWebSession && !showSteamTextImport && !showShareCenter) return;
+    if (!pendingDeleteAccount && !pendingDeleteSteamWebSession && !showSteamTextImport && !showShareCenter) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) {
         setPendingDeleteAccount(null);
-        setPendingDeleteSteamAccount(null);
         setPendingDeleteSteamWebSession(null);
         setShowSteamTextImport(false);
-        setSteamImportPreview(null);
         if (!wormholeActive) setShowShareCenter(false);
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [pendingDeleteAccount, pendingDeleteSteamAccount, pendingDeleteSteamWebSession, showSteamTextImport, showShareCenter, wormholeActive, busy]);
+  }, [pendingDeleteAccount, pendingDeleteSteamWebSession, showSteamTextImport, showShareCenter, wormholeActive, busy]);
 
   useEffect(() => () => {
     scrollTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -1207,7 +1339,7 @@ function App() {
   const steamOverview = (
     <section className="content-stack">
       <div className="panel">
-        <div className="panel-title"><h2>Steam 状态</h2></div>
+        <div className="panel-title"><h2>Steam 状态</h2><div className="actions"><button onClick={() => handleAction(optimizeStorage)} disabled={busy}>整理存储</button></div></div>
         <dl className="paths">
           <dt>程序</dt><dd>{data.steam.installation?.executable || "未设置"}</dd>
           <dt>安装目录</dt><dd>{data.steam.installation?.installDir || "未设置"}</dd>
@@ -1218,39 +1350,44 @@ function App() {
 
   const steamSwitcher = (
     <section className="content-stack">
-      <div className="panel">
-        <div className="panel-title"><h2>Steam 网页账号</h2><div className="actions"><button onClick={() => handleAction(refreshSteamWebSessions)} disabled={busy || data.steam.webSessions.length === 0}>刷新账号</button><button onClick={() => setShowSteamTextImport(true)} disabled={busy}>从文本导入</button><button className="primary" onClick={() => handleAction(createSteamWebSession)} disabled={busy}>新增</button></div></div>
-        <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
-          {data.steam.webSessions.length === 0 && <div className="empty">暂无 Steam 网页账号。</div>}
-          {data.steam.webSessions.map((session) => {
-            const identity = findSteamIdentity(session.steamId, session.accountName, session.id);
-            const credential = findSteamCredential(session.steamId, session.accountName, session.id);
-            return <div className="account-row" data-selected={selectedSteamWebSessionId === session.id} key={session.id}>
-              <div className="account-row-main">
-                <button className="account-main" onClick={() => selectSteamWebSession(session)} aria-expanded={selectedSteamWebSessionId === session.id}><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{identity?.displayName || session.accountName || session.displayName}</strong><small>{identity?.steamId ? `SteamID: ${identity.steamId}` : "等待登录识别"}{identity?.note ? ` · ${identity.note}` : ""}</small>{identityCapabilityBadges(identity)}</span></button>
-                <div className="account-actions">{credential && credentialEye(credential, session.displayName)}<button className="icon-button danger" onClick={() => setPendingDeleteSteamWebSession(session)} disabled={busy} aria-label={`删除 ${session.displayName} 的网页会话`} title="删除网页账号"><Trash2 size={16} /></button><button className={session.steamId ? "primary" : ""} onClick={() => handleAction(() => openSteamWebSession(session))} disabled={busy}>{session.steamId ? "打开" : "登录"}</button></div>
-              </div>
-              {credential && credentialDetails(credential)}
-              {selectedSteamWebSessionId === session.id && <div className="steam-account-note"><input value={steamWebNoteDraft} onChange={(event) => setSteamWebNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamWebSessionNote(session))} disabled={busy}>保存备注</button></div>}
-            </div>
-          })}
+      <div className="panel steam-unified-panel">
+        <div className="panel-title steam-unified-title"><h2>Steam 账号</h2><div className="actions"><button onClick={() => handleAction(refreshSteamUnified)} disabled={busy}>刷新</button><button onClick={() => setShowSteamTextImport(true)} disabled={busy}>从文本导入</button>{steamCapabilityStatus.running ? <><button onClick={() => void toggleSteamCapabilityPause()} disabled={steamCapabilityStatus.cancelling}>{steamCapabilityStatus.paused ? "继续补全" : "暂停补全"}</button><button className="primary danger-confirm" onClick={() => void cancelSteamCapabilityCompletion()} disabled={steamCapabilityStatus.cancelling}>{steamCapabilityStatus.cancelling ? "取消中" : "取消补全"}</button></> : <button onClick={() => handleAction(completeSteamCapabilities)} disabled={busy || !(data.steamCredentials?.length)}>检查并补全网页登录</button>}<button className="primary" onClick={() => handleAction(createSteamWebSession)} disabled={busy}>新增网页登录</button></div></div>
+        <div className="steam-filter-bar">
+          <input type="search" value={steamSearch} onChange={(event) => setSteamSearch(event.target.value)} placeholder="搜索 Steam 名称、ID、账号或完美ID" aria-label="搜索 Steam 账号" />
+          <select value={steamWebFilter} onChange={(event) => setSteamWebFilter(event.target.value)} aria-label="筛选网页登录"><option value="all">全部网页状态</option><option value="yes">有网页登录</option><option value="no">无网页登录</option></select>
+          <select value={steamClientFilter} onChange={(event) => setSteamClientFilter(event.target.value)} aria-label="筛选客户端账密"><option value="all">全部客户端账密</option><option value="yes">可账密登录客户端</option><option value="no">缺少客户端账密</option></select>
+          <select value={steamCredentialFilter} onChange={(event) => setSteamCredentialFilter(event.target.value)} aria-label="筛选账号密码"><option value="all">全部账密状态</option><option value="yes">有账号密码</option><option value="no">无账号密码</option></select>
         </div>
-      </div>
-      <div className="panel">
-        <div className="panel-title"><h2>Steam 客户端账号</h2><div className="actions"><button onClick={() => handleAction(discoverSteam)} disabled={busy}>搜索并刷新</button></div></div>
-        <div className="account-list account-list-compact auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
-          {data.steam.accounts.length === 0 && <div className="empty">未发现 Steam 账号，请先关闭 Steam 后点击刷新，或完成一次登录。</div>}
-          {data.steam.accounts.map((account) => {
-            const identity = findSteamIdentity(account.id, account.accountName, undefined, account.id);
-            const credential = findSteamCredential(account.id, account.accountName, undefined, account.id);
-            return <div className="account-row" data-selected={data.steam.currentAccountId === account.id || selectedSteamId === account.id} key={account.id}>
+        <div className="account-list steam-identity-list auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
+          {filteredSteamIdentities.length === 0 && <div className="empty">没有符合条件的 Steam 账号。</div>}
+          {filteredSteamIdentities.map((identity) => {
+            const session = identity.webSessionId
+              ? data.steam.webSessions.find((item) => item.id === identity.webSessionId)
+              : data.steam.webSessions.find((item) => Boolean(identity.steamId && item.steamId === identity.steamId));
+            const credential = findSteamCredential(identity.steamId, identity.accountName, identity.webSessionId, identity.clientAccountId);
+            const current = Boolean(identity.steamId && data.steam.currentAccountId === identity.steamId);
+            const profile = identity.steamId ? perfectProfiles[identity.steamId] : undefined;
+            const numericFallback = Boolean(identity.steamId && identity.displayName.trim() === identity.steamId);
+            const accountNameFallback = Boolean(
+              identity.accountName
+              && identity.displayName.trim().toLocaleLowerCase() === identity.accountName.trim().toLocaleLowerCase(),
+            );
+            const label = !numericFallback && !accountNameFallback && identity.displayName.trim()
+              ? identity.displayName
+              : identity.steamId ? `Steam ${identity.steamId}` : "Steam 账号";
+            return <div className="account-row steam-identity-row" data-selected={current || selectedSteamId === identity.id} key={identity.id}>
               <div className="account-row-main">
-                <button className="account-main" onClick={() => selectSteamAccount(account)} aria-expanded={selectedSteamId === account.id}><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{identity?.displayName || account.displayName}</strong><small>{identity?.accountName || account.accountName} · {identity?.steamId || account.id}{identity?.note ? ` · ${identity.note}` : ""}</small>{identityCapabilityBadges(identity)}</span></button>
-                <div className="account-actions">{credential && credentialEye(credential, account.displayName)}<button className="icon-button danger" onClick={() => setPendingDeleteSteamAccount(account)} disabled={busy} aria-label={`删除 ${account.displayName} 的 NEA 快照`} title="删除账号快照"><Trash2 size={16} /></button><button className={account.mostRecent ? "" : "primary"} onClick={() => handleAction(() => switchSteamAccount(account))} disabled={busy || account.mostRecent}>{account.mostRecent ? "当前登录" : "快速切号"}</button></div>
+                <button className="account-main" onClick={() => selectSteamIdentity(identity)} aria-expanded={selectedSteamId === identity.id}><span className="avatar-wrap"><span className="avatar-fallback">S</span></span><span><strong>{label}</strong><span className="steam-identity-meta"><small>{identity.steamId ? `SteamID64: ${identity.steamId}` : "缺乏 SteamID64"}</small><small>完美ID: {profile?.nickname || "未检测"}</small>{identity.note && <small>备注: {identity.note}</small>}</span>{steamLoginMethods(identity)}</span></button>
+                <div className="account-actions steam-identity-actions">
+                  {credential && credentialEye(credential, label)}
+                  {session && <button className="icon-button danger" onClick={() => setPendingDeleteSteamWebSession(session)} disabled={busy} aria-label={`删除 ${label} 的网页登录`} title="删除网页登录"><Trash2 size={16} /></button>}
+                  <button onClick={() => session && handleAction(() => openSteamWebSession(session))} disabled={busy || !session}>{session ? "打开网页" : "网页未登录"}</button>
+                  <button className={credential && identity.steamId && !current ? "primary" : ""} onClick={() => identity.steamId && credential && handleAction(() => switchSteamAccount(identity))} disabled={busy || !identity.steamId || !credential || current}>{current ? "客户端已登录" : credential && identity.steamId ? "账密打开客户端" : credential ? "待识别 SteamID" : "缺少账密"}</button>
+                </div>
               </div>
               {credential && credentialDetails(credential)}
-              {selectedSteamId === account.id && <div className="steam-account-note"><input value={steamNoteDraft} onChange={(event) => setSteamNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamNote(account))} disabled={busy}>保存备注</button></div>}
-            </div>
+              {selectedSteamId === identity.id && <div className="steam-account-note"><input value={steamNoteDraft} onChange={(event) => setSteamNoteDraft(event.target.value)} maxLength={120} placeholder="添加账号备注" /><button onClick={() => handleAction(() => saveSteamIdentityNote(identity))} disabled={busy}>保存备注</button></div>}
+            </div>;
           })}
         </div>
       </div>
@@ -1301,14 +1438,9 @@ function App() {
         {filteredPerfectSessions.map((session) => {
           const current = Boolean(session.steamId && session.steamId === perfectWorkspace.currentAccountId);
           const profile = session.steamId ? perfectProfiles[session.steamId] : undefined;
-          const matchingSteamAccount = session.steamId ? data.steam.accounts.find((account) => account.id === session.steamId) : undefined;
           const identity = findSteamIdentity(session.steamId, session.accountName, session.id);
           const credential = findSteamCredential(session.steamId, session.accountName, session.id);
-          const canSyncSteam = Boolean(
-            identity?.capabilities.clientRemembered
-            || credential
-            || matchingSteamAccount?.mostRecent,
-          );
+          const canSyncSteam = Boolean(credential || Boolean(session.steamId && data.steam.currentAccountId === session.steamId));
           const selected = selectedSteamWebSessionId === session.id;
           const requiresVerification = Boolean(profile?.highRisk || profile?.reputationRequiresVerification);
           const unavailable = Boolean(session.steamId && data.perfectUnavailableAccountIds?.includes(session.steamId));
@@ -1324,7 +1456,7 @@ function App() {
               </div>}
               <button className="perfect-card-identity" onClick={() => selectSteamWebSession(session)} aria-expanded={selected}>
                 <span className="perfect-card-avatar">{profile?.avatarUrl ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" /> : <span className="avatar-fallback">P</span>}</span>
-                <span className="perfect-card-name"><strong>{identity?.displayName || profile?.nickname || session.accountName || session.displayName}</strong><small>{identity?.steamId || session.steamId || "等待登录识别"}</small>{identityCapabilityBadges(identity)}</span>
+                <span className="perfect-card-name"><strong>{profile?.nickname || identity?.displayName || session.accountName || session.displayName}</strong><small>{identity?.steamId || session.steamId || "等待登录识别"}</small>{identityCapabilityBadges(identity)}</span>
                 {current && <span className="perfect-current-badge">当前</span>}
               </button>
               <div className="perfect-card-metrics">
@@ -1339,7 +1471,7 @@ function App() {
               <div className="perfect-card-actions" data-has-credential={Boolean(credential) || undefined}>
                 {credential && credentialEye(credential, profile?.nickname || session.displayName)}
                 <button className="icon-button danger" onClick={() => setPendingDeleteSteamWebSession(session)} disabled={busy} aria-label={`删除 ${session.displayName}`} title="删除账号"><Trash2 size={16} /></button>
-                <button className={canSyncSteam ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || !perfectWorkspace.installation || !data.steam.installation} title={canSyncSteam ? "同步切换 Steam 客户端与完美账号" : "没有匹配的 Steam 登录态或已保存账号密码"}>同步</button>
+                <button className={canSyncSteam ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || !perfectWorkspace.installation || !data.steam.installation} title={canSyncSteam ? "使用已保存账密登录 Steam 客户端并切换完美账号" : "该账号没有已保存账号密码"}>同步</button>
                 {session.steamId
                   ? <button className={current ? "" : "primary"} onClick={() => handleAction(() => switchPerfectWebAccount(session))} disabled={busy || current || !perfectWorkspace.installation}>{current ? "当前" : "切换"}</button>
                   : <button onClick={() => handleAction(() => openSteamWebSession(session))} disabled={busy}>登录</button>}
@@ -1469,6 +1601,7 @@ function App() {
               <div className="quick-transfer-row">
                 <button className="primary" onClick={() => void startQuickShare()} disabled={busy || wormholeActive || selectedShareCount === 0}>生成分享码</button>
                 {quickCode && <code className="quick-code">{quickCode}</code>}
+                {quickCode && quickPackageBytes !== null && <span className="quick-package-size">文件 {formatFileSize(quickPackageBytes)}</span>}
                 {quickCode && <button onClick={() => copyText(quickCode)}>复制代码</button>}
                 {wormholeActive && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus?.state === "cancelling"}>取消</button>}
               </div>
@@ -1494,14 +1627,6 @@ function App() {
           </div>
         </div>
       )}
-      {pendingDeleteSteamAccount && (
-        <div className="confirm-backdrop" onMouseDown={() => !busy && setPendingDeleteSteamAccount(null)}>
-          <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="steam-delete-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
-            <p id="steam-delete-confirm-title">确定删除账号“{pendingDeleteSteamAccount.displayName}”吗？</p>
-            <div className="confirm-actions"><button className="primary danger-confirm" onClick={() => handleAction(() => deleteSteamAccount(pendingDeleteSteamAccount))} disabled={busy} autoFocus>确定</button><button onClick={() => setPendingDeleteSteamAccount(null)} disabled={busy}>取消</button></div>
-          </div>
-        </div>
-      )}
       {pendingDeleteSteamWebSession && (
         <div className="confirm-backdrop" onMouseDown={() => !busy && setPendingDeleteSteamWebSession(null)}>
           <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="steam-web-delete-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -1511,12 +1636,12 @@ function App() {
         </div>
       )}
       {showSteamTextImport && (
-        <div className="confirm-backdrop" onMouseDown={() => { if (!busy) { setShowSteamTextImport(false); setSteamImportPreview(null); } }}>
+        <div className="confirm-backdrop" onMouseDown={() => { if (!busy) setShowSteamTextImport(false); }}>
           <div className="confirm-dialog steam-text-import-dialog" role="dialog" aria-modal="true" aria-labelledby="steam-text-import-title" onMouseDown={(event) => event.stopPropagation()}>
             <p id="steam-text-import-title">从文本导入 Steam 网页账号</p>
-            <textarea value={steamTextImportDraft} onChange={(event) => { setSteamTextImportDraft(event.target.value); setSteamImportPreview(null); }} placeholder={"账号 密码\n账号 密码"} autoFocus spellCheck={false} />
-            {steamImportPreview && <div className="steam-import-duplicate-notice"><strong>导入前检测到重复账号</strong><span>已有账号 {steamImportPreview.preview.existingAccounts.length} 个{steamImportPreview.preview.existingAccounts.length > 0 ? `：${steamImportPreview.preview.existingAccounts.join("、")}` : ""}</span>{steamImportPreview.preview.duplicateInputAccounts.length > 0 && <span>文本内重复 {steamImportPreview.preview.duplicateInputAccounts.length} 个：{steamImportPreview.preview.duplicateInputAccounts.join("、")}</span>}<small>是否跳过这些账号并继续导入其余账号？输入的账号密码仍会更新并保存在本机。</small></div>}
-            <div className="confirm-actions">{steamImportPreview ? <button className="primary" onClick={() => handleAction(() => executeSteamWebImport(steamImportPreview.accounts, true))} disabled={busy}>跳过并继续</button> : <button className="primary" onClick={() => handleAction(importSteamWebAccountsFromText)} disabled={busy || !steamTextImportDraft.trim()}>检测并导入</button>}<button onClick={() => { setShowSteamTextImport(false); setSteamImportPreview(null); }} disabled={busy}>取消</button></div>
+            <textarea value={steamTextImportDraft} onChange={(event) => setSteamTextImportDraft(event.target.value)} placeholder={"账号 密码\n账号 密码"} autoFocus spellCheck={false} />
+            <small className="steam-import-parallel-hint">一次最多导入 100 个账号，同时打开最多 4 个独立登录窗口；优先解析 Steam64，仅跳过已有有效网页登录态的账号，只有客户端态时会继续补齐网页能力。</small>
+            <div className="confirm-actions"><button className="primary" onClick={() => handleAction(importSteamWebAccountsFromText)} disabled={busy || !steamTextImportDraft.trim()}>查询 Steam64 并导入</button><button onClick={() => setShowSteamTextImport(false)} disabled={busy}>取消</button></div>
           </div>
         </div>
       )}

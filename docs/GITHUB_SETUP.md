@@ -1,38 +1,18 @@
-# GitHub 仓库发布资料
+# NEA GitHub 发布资料
 
-本文件用于创建 GitHub 仓库首页、简介、Topics 和首个 Release。
+本项目的正式名称、仓库名和发布资产统一使用 `NEA`。
 
-## 推荐仓库名
+## 仓库信息
 
-GitHub 仓库名建议使用：
+- 仓库：`M4rkzzz/NEA`
+- 简介：`NEA（Not Enough Accounts）— Windows 本地多平台账号切换与登录状态管理工具，支持 OOPZ、Steam 和完美世界竞技平台。`
+- Release：`https://github.com/M4rkzzz/NEA/releases/latest`
 
-```text
-oopz-plus
-```
-
-原因：GitHub 仓库名不建议使用 `+`，用 `oopz-plus` 更稳定，也方便命令行和链接传播。
-
-## 仓库简介
+推荐 Topics：
 
 ```text
-OOPZ+ 是面向 Windows 的 OOPZ 附属增强工具，提供账号快速切换、托盘切号和插件浮层模式。
-```
-
-## Website / 主页链接
-
-发布 Release 后可填写：
-
-```text
-https://github.com/<你的用户名>/oopz-plus/releases/latest
-```
-
-## Topics
-
-建议添加以下 topics：
-
-```text
-oopz
-oopz-plus
+nea
+not-enough-accounts
 account-switcher
 tauri
 react
@@ -40,66 +20,52 @@ typescript
 rust
 windows
 desktop-app
-system-tray
-plugin-mode
-account-management
+steam
+oopz
+perfect-world-arena
 ```
 
-## 首个 Release
+## 发布约定
 
-Tag：
+- Tag 使用 `v<major>.<minor>.<patch>`，例如 `v1.2.6`。
+- Release 标题使用 `NEA <tag>`，例如 `NEA v1.2.6`。
+- 安装包使用 `NEA_<version>_x64_en-US.msi`。
+- Release 说明保存在 `.github/releases/<tag>.md`。
+- 正式发布前同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 和 README 版本。
+
+## 本地发布检查
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm run verify:full
+pnpm run build:msi
+```
+
+安装包生成于：
 
 ```text
-v1.0.0
+src-tauri/target/release/bundle/msi/
 ```
 
-Release 标题：
+## GitHub Actions
 
-```text
-OOPZ+ 1.0.0
+推送 `v*` Tag 会触发 `.github/workflows/release.yml`：
+
+1. 安装 pnpm、Node.js 与 Rust。
+2. 运行完整验证。
+3. 构建 Windows MSI。
+4. 使用同名 Release 说明发布安装包。
+
+发布前必须先创建对应的 `.github/releases/<tag>.md`，否则工作流会主动失败，避免发布错误版本的说明。
+
+## 手动发布
+
+在 GitHub CLI 已登录的环境中：
+
+```powershell
+$tag = "v1.2.6"
+$version = $tag.TrimStart("v")
+gh release create $tag "src-tauri/target/release/bundle/msi/NEA_${version}_x64_en-US.msi" --repo M4rkzzz/NEA --title "NEA $tag" --notes-file ".github/releases/$tag.md"
 ```
 
-Release 附件：
-
-```text
-src-tauri/target/release/bundle/msi/OOPZ+_1.0.0_x64_en-US.msi
-```
-
-Release 内容使用：
-
-```text
-.github/releases/v1.0.0.md
-```
-
-## 使用 GitHub CLI 发布
-
-需要安装 GitHub 官方 CLI，并登录账号：
-
-```bash
-gh auth login
-```
-
-创建仓库并推送：
-
-```bash
-git init
-git add .
-git commit -m "发布 OOPZ+ 1.0.0"
-gh repo create oopz-plus --public --source . --remote origin --push --description "OOPZ+ 是面向 Windows 的 OOPZ 附属增强工具，提供账号快速切换、托盘切号和插件浮层模式。"
-```
-
-设置 topics：
-
-```bash
-gh repo edit --add-topic oopz --add-topic oopz-plus --add-topic account-switcher --add-topic tauri --add-topic react --add-topic typescript --add-topic rust --add-topic windows --add-topic desktop-app --add-topic system-tray --add-topic plugin-mode --add-topic account-management
-```
-
-创建首个 Release：
-
-```bash
-gh release create v1.0.0 "src-tauri/target/release/bundle/msi/OOPZ+_1.0.0_x64_en-US.msi" --title "OOPZ+ 1.0.0" --notes-file ".github/releases/v1.0.0.md"
-```
-
-## 重要说明
-
-当前机器没有可用的 GitHub 授权环境变量，且 `gh` 命令不是 GitHub 官方 CLI。需要先安装并登录 GitHub 官方 CLI，或提供可用的 `GITHUB_TOKEN` / `GH_TOKEN` 后才能自动创建远程仓库和 Release。
+旧版安装包名、数据目录、凭据服务、快捷方式和 `.oopz+` 文件只保留在兼容迁移代码中，不再作为当前发布名称使用。

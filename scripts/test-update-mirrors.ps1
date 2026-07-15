@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.1.8",
+    [string]$Version = "1.2.6",
     [ValidateRange(1, 16)]
     [int]$SampleMiB = 2,
     [ValidateRange(5, 120)]
@@ -38,7 +38,7 @@ $results = foreach ($entry in $mirrors.GetEnumerator()) {
         --show-error `
         --max-time $TimeoutSeconds `
         --range "0-$rangeEnd" `
-        --user-agent "OOPZ-Plus-Mirror-Test" `
+        --user-agent "NEA-Mirror-Test" `
         --output NUL `
         --write-out $format `
         $entry.Value 2>&1

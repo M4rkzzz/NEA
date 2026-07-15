@@ -1,15 +1,18 @@
 use crate::adapters::{AccountIdentity, AppAdapter, AppInstallation};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     thread,
     time::Duration,
 };
 use sysinfo::{ProcessRefreshKind, Signal, System, UpdateKind};
 use winreg::{enums::*, RegKey};
+
+static LOGINUSERS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -150,18 +153,16 @@ fn escape_vdf(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn write_object(output: &mut String, object: &BTreeMap<String, VdfValue>, depth: usize) {
+fn write_vdf_object(output: &mut String, object: &BTreeMap<String, VdfValue>, depth: usize) {
     let indent = "\t".repeat(depth);
     for (key, value) in object {
         match value {
-            VdfValue::Text(text) => {
-                output.push_str(&format!(
-                    "{}\"{}\"\t\t\"{}\"\n",
-                    indent,
-                    escape_vdf(key),
-                    escape_vdf(text)
-                ));
-            }
+            VdfValue::Text(text) => output.push_str(&format!(
+                "{}\"{}\"\t\t\"{}\"\n",
+                indent,
+                escape_vdf(key),
+                escape_vdf(text)
+            )),
             VdfValue::Object(child) => {
                 output.push_str(&format!(
                     "{}\"{}\"\n{}{{\n",
@@ -169,7 +170,7 @@ fn write_object(output: &mut String, object: &BTreeMap<String, VdfValue>, depth:
                     escape_vdf(key),
                     indent
                 ));
-                write_object(output, child, depth + 1);
+                write_vdf_object(output, child, depth + 1);
                 output.push_str(&format!("{}}}\n", indent));
             }
         }
@@ -178,21 +179,14 @@ fn write_object(output: &mut String, object: &BTreeMap<String, VdfValue>, depth:
 
 fn serialize_vdf(object: &BTreeMap<String, VdfValue>) -> String {
     let mut output = String::new();
-    write_object(&mut output, object, 0);
+    write_vdf_object(&mut output, object, 0);
     output
 }
 
-fn text<'a>(object: &'a BTreeMap<String, VdfValue>, key: &str) -> Option<&'a str> {
-    object
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(key))
-        .and_then(|(_, value)| match value {
-            VdfValue::Text(value) => Some(value.as_str()),
-            _ => None,
-        })
-}
-
-fn set_text(object: &mut BTreeMap<String, VdfValue>, key: &str, value: &str) {
+fn set_text(object: &mut BTreeMap<String, VdfValue>, key: &str, value: &str) -> bool {
+    if text(object, key) == Some(value) {
+        return false;
+    }
     if let Some(existing) = object
         .keys()
         .find(|name| name.eq_ignore_ascii_case(key))
@@ -202,6 +196,7 @@ fn set_text(object: &mut BTreeMap<String, VdfValue>, key: &str, value: &str) {
     } else {
         object.insert(key.to_string(), VdfValue::Text(value.to_string()));
     }
+    true
 }
 
 fn users_mut(
@@ -214,6 +209,32 @@ fn users_mut(
             _ => None,
         })
         .ok_or_else(|| "Steam loginusers.vdf 缺少 users 对象".to_string())
+}
+
+fn replace_text_atomically(path: &Path, contents: &str) -> Result<(), String> {
+    let staging = path.with_extension("vdf.nea-new");
+    let backup = path.with_extension("vdf.nea-backup");
+    fs::write(&staging, contents).map_err(|error| format!("写入 Steam 临时配置失败: {error}"))?;
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(|error| format!("清理 Steam 临时备份失败: {error}"))?;
+    }
+    fs::rename(path, &backup).map_err(|error| format!("备份 Steam 配置失败: {error}"))?;
+    if let Err(error) = fs::rename(&staging, path) {
+        let _ = fs::rename(&backup, path);
+        return Err(format!("替换 Steam 配置失败: {error}"));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+fn text<'a>(object: &'a BTreeMap<String, VdfValue>, key: &str) -> Option<&'a str> {
+    object
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| match value {
+            VdfValue::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
 }
 
 fn users(root: &BTreeMap<String, VdfValue>) -> Result<&BTreeMap<String, VdfValue>, String> {
@@ -229,37 +250,102 @@ fn users(root: &BTreeMap<String, VdfValue>) -> Result<&BTreeMap<String, VdfValue
 pub struct SteamAdapter;
 
 impl SteamAdapter {
-    pub fn auto_login_user() -> Option<String> {
-        RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey("Software\\Valve\\Steam")
-            .ok()?
-            .get_value::<String, _>("AutoLoginUser")
-            .ok()
+    pub fn account_id32(steam_id64: &str) -> Option<u32> {
+        let steam_id = steam_id64.parse::<u64>().ok()?;
+        (steam_id64.len() == 17).then_some((steam_id & u32::MAX as u64) as u32)
     }
 
-    pub fn restore_login_state(
+    pub fn active_user_account_id() -> Option<u32> {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Valve\\Steam\\ActiveProcess")
+            .ok()?
+            .get_value::<u32, _>("ActiveUser")
+            .ok()
+            .filter(|account_id| *account_id != 0)
+    }
+
+    pub fn is_account_active(steam_id64: &str) -> bool {
+        Self::account_id32(steam_id64)
+            .is_some_and(|account_id| Self::active_user_account_id() == Some(account_id))
+    }
+
+    pub fn client_is_running() -> bool {
+        steam_client_running(&process_system())
+    }
+
+    pub fn processes_are_running() -> bool {
+        steam_process_running(&process_system())
+    }
+
+    pub fn is_account_logged_in(steam_id64: &str) -> bool {
+        Self::client_is_running() && Self::is_account_active(steam_id64)
+    }
+
+    pub fn suppress_accounts_from_native_switcher(
         installation: &SteamInstallation,
-        backup: &Path,
-        auto_login_user: Option<&str>,
-    ) -> Result<(), String> {
-        let loginusers = PathBuf::from(&installation.install_dir)
+        steam_ids: &HashSet<String>,
+    ) -> Result<usize, String> {
+        if steam_ids.is_empty() {
+            return Ok(0);
+        }
+        let _write_guard = LOGINUSERS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = PathBuf::from(&installation.install_dir)
             .join("config")
             .join("loginusers.vdf");
-        fs::copy(backup.join("loginusers.vdf"), loginusers)
-            .map_err(|error| format!("恢复 Steam 登录状态失败: {error}"))?;
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (key, _) = hkcu
-            .create_subkey("Software\\Valve\\Steam")
-            .map_err(|error| format!("打开 Steam 注册表失败: {error}"))?;
-        match auto_login_user {
-            Some(value) => key
-                .set_value("AutoLoginUser", &value)
-                .map_err(|error| format!("恢复 Steam 自动登录账号失败: {error}"))?,
-            None => {
-                let _ = key.delete_value("AutoLoginUser");
+        let raw = fs::read_to_string(&path)
+            .map_err(|error| format!("读取 Steam 原生账号列表失败: {error}"))?;
+        let mut root = parse_vdf(&raw)?;
+        let mut changed_accounts = 0usize;
+        for (steam_id, value) in users_mut(&mut root)? {
+            if !steam_ids.contains(steam_id) {
+                continue;
             }
+            let VdfValue::Object(account) = value else {
+                continue;
+            };
+            let changed = set_text(account, "RememberPassword", "0")
+                | set_text(account, "AllowAutoLogin", "0")
+                | set_text(account, "MostRecent", "0")
+                | set_text(account, "Timestamp", "0");
+            changed_accounts += usize::from(changed);
         }
-        Ok(())
+        if changed_accounts > 0 {
+            replace_text_atomically(&path, &serialize_vdf(&root))?;
+        }
+        Ok(changed_accounts)
+    }
+
+    pub fn keep_account_out_of_native_switcher(
+        installation: SteamInstallation,
+        steam_id: String,
+    ) -> Result<(), String> {
+        let steam_ids = HashSet::from([steam_id.clone()]);
+        let immediate_result = if Self::processes_are_running() {
+            Ok(())
+        } else {
+            Self::suppress_accounts_from_native_switcher(&installation, &steam_ids).map(|_| ())
+        };
+        thread::spawn(move || {
+            let mut system = process_system();
+            loop {
+                while steam_process_running(&system) {
+                    thread::sleep(Duration::from_secs(2));
+                    refresh_processes(&mut system);
+                }
+                // Steam may flush loginusers.vdf immediately after its last process exits,
+                // or briefly have no process while another NEA switch is starting.
+                thread::sleep(Duration::from_millis(800));
+                refresh_processes(&mut system);
+                if steam_process_running(&system) {
+                    continue;
+                }
+                let _ = Self::suppress_accounts_from_native_switcher(&installation, &steam_ids);
+                break;
+            }
+        });
+        immediate_result
     }
 
     fn registry_install_path() -> Option<PathBuf> {
@@ -344,77 +430,21 @@ impl SteamAdapter {
         Ok(accounts)
     }
 
-    pub fn activate_account(
+    pub fn read_accounts_stable(
         installation: &SteamInstallation,
-        steam_id: &str,
-    ) -> Result<String, String> {
-        let path = PathBuf::from(&installation.install_dir)
-            .join("config")
-            .join("loginusers.vdf");
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| format!("读取 Steam 登录状态失败: {}", error))?;
-        let mut root = parse_vdf(&raw)?;
-        let account_name = select_account(&mut root, steam_id)?;
-        let staging = path.with_extension("vdf.nea-new");
-        let backup = path.with_extension("vdf.nea-backup");
-        fs::write(&staging, serialize_vdf(&root))
-            .map_err(|error| format!("写入 Steam 登录状态失败: {}", error))?;
-        if backup.exists() {
-            fs::remove_file(&backup)
-                .map_err(|error| format!("清理 Steam 临时备份失败: {}", error))?;
+    ) -> Result<Vec<SteamAccount>, String> {
+        let mut last_error = None;
+        for attempt in 0..10 {
+            match Self::read_accounts(installation) {
+                Ok(accounts) => return Ok(accounts),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 9 {
+                thread::sleep(Duration::from_millis(200));
+            }
         }
-        fs::rename(&path, &backup)
-            .map_err(|error| format!("备份 Steam 登录状态失败: {}", error))?;
-        if let Err(error) = fs::rename(&staging, &path) {
-            let _ = fs::rename(&backup, &path);
-            return Err(format!("替换 Steam 登录状态失败: {}", error));
-        }
-        let _ = fs::remove_file(backup);
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (key, _) = hkcu
-            .create_subkey("Software\\Valve\\Steam")
-            .map_err(|error| error.to_string())?;
-        key.set_value("AutoLoginUser", &account_name)
-            .map_err(|error| format!("设置 Steam 自动登录账号失败: {}", error))?;
-        Ok(account_name)
+        Err(last_error.unwrap_or_else(|| "读取 Steam 账号列表失败".to_string()))
     }
-
-    pub fn snapshot_login_state(
-        installation: &SteamInstallation,
-        destination: &Path,
-    ) -> Result<(), String> {
-        fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-        let source = PathBuf::from(&installation.install_dir)
-            .join("config")
-            .join("loginusers.vdf");
-        fs::copy(source, destination.join("loginusers.vdf"))
-            .map_err(|error| format!("备份 Steam 登录状态失败: {}", error))?;
-        Ok(())
-    }
-}
-
-fn select_account(root: &mut BTreeMap<String, VdfValue>, steam_id: &str) -> Result<String, String> {
-    let list = users_mut(root)?;
-    let mut selected = None;
-    for (id, value) in list.iter_mut() {
-        let VdfValue::Object(account) = value else {
-            continue;
-        };
-        let active = id == steam_id;
-        set_text(account, "MostRecent", if active { "1" } else { "0" });
-        let remembered = text(account, "RememberPassword") == Some("1");
-        set_text(
-            account,
-            "AllowAutoLogin",
-            if active && remembered { "1" } else { "0" },
-        );
-        if active {
-            selected = text(account, "AccountName").map(str::to_string);
-            set_text(account, "WantsOfflineMode", "0");
-            set_text(account, "SkipOfflineModeWarning", "1");
-        }
-    }
-    selected.ok_or_else(|| "目标 Steam 账号已不存在".to_string())
 }
 
 fn process_system() -> System {
@@ -430,24 +460,18 @@ fn steam_process_running(system: &System) -> bool {
     })
 }
 
+fn steam_client_running(system: &System) -> bool {
+    system
+        .processes()
+        .values()
+        .any(|process| process.name().eq_ignore_ascii_case("steam.exe"))
+}
+
 fn refresh_processes(system: &mut System) {
     system.refresh_processes_specifics(ProcessRefreshKind::new());
 }
 
 impl SteamAdapter {
-    pub fn start_with_login(
-        installation: &AppInstallation,
-        account_name: &str,
-    ) -> Result<(), String> {
-        Command::new(&installation.executable)
-            .current_dir(&installation.data_dir)
-            .arg("-login")
-            .arg(account_name)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("启动 Steam 失败: {}", error))
-    }
-
     pub fn start_with_credentials(
         installation: &AppInstallation,
         account_name: &str,
@@ -490,9 +514,13 @@ impl AppAdapter for SteamAdapter {
             executable: installation.executable.to_string_lossy().to_string(),
             valid: true,
         };
-        Ok(Self::read_accounts(&workspace)?
+        if !Self::client_is_running() {
+            return Ok(None);
+        }
+        let active_user = Self::active_user_account_id();
+        Ok(Self::read_accounts_stable(&workspace)?
             .into_iter()
-            .find(|account| account.most_recent)
+            .find(|account| Self::account_id32(&account.id) == active_user)
             .map(|account| AccountIdentity {
                 external_id: account.id,
                 display_name: account.display_name,
@@ -507,7 +535,7 @@ impl AppAdapter for SteamAdapter {
             executable: installation.executable.to_string_lossy().to_string(),
             valid: true,
         };
-        Ok(Self::read_accounts(&workspace)?
+        Ok(Self::read_accounts_stable(&workspace)?
             .into_iter()
             .map(|account| AccountIdentity {
                 external_id: account.id,
@@ -572,10 +600,7 @@ impl AppAdapter for SteamAdapter {
             .map_err(|error| format!("启动 Steam 失败: {}", error))
     }
     fn is_running(&self, _installation: &AppInstallation) -> bool {
-        process_system()
-            .processes()
-            .values()
-            .any(|process| process.name().eq_ignore_ascii_case("steam.exe"))
+        Self::client_is_running()
     }
 }
 
@@ -584,11 +609,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_updates_loginusers_vdf() {
+    fn parses_loginusers_vdf_as_read_only_metadata() {
         let input = "\"users\"\n{\n\"1\" { \"AccountName\" \"one\" \"PersonaName\" \"One\" \"MostRecent\" \"1\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"1\" }\n\"2\" { \"AccountName\" \"two\" \"MostRecent\" \"0\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"0\" }\n}";
-        let mut root = parse_vdf(input).unwrap();
+        let root = parse_vdf(input).unwrap();
         assert_eq!(users(&root).unwrap().len(), 2);
-        assert_eq!(select_account(&mut root, "2").unwrap(), "two");
         let list = users(&root).unwrap();
         let VdfValue::Object(first) = list.get("1").unwrap() else {
             panic!()
@@ -596,16 +620,93 @@ mod tests {
         let VdfValue::Object(second) = list.get("2").unwrap() else {
             panic!()
         };
-        assert_eq!(text(first, "MostRecent"), Some("0"));
-        assert_eq!(text(first, "AllowAutoLogin"), Some("0"));
-        assert_eq!(text(second, "MostRecent"), Some("1"));
-        assert_eq!(text(second, "AllowAutoLogin"), Some("1"));
-        let reparsed = parse_vdf(&serialize_vdf(&root)).unwrap();
-        assert_eq!(users(&reparsed).unwrap().len(), 2);
+        assert_eq!(text(first, "AccountName"), Some("one"));
+        assert_eq!(text(first, "PersonaName"), Some("One"));
+        assert_eq!(text(second, "AccountName"), Some("two"));
+    }
+
+    #[test]
+    fn steam_id64_maps_to_the_active_user_account_id() {
+        assert_eq!(SteamAdapter::account_id32("76561197960265728"), Some(0));
+        assert_eq!(
+            SteamAdapter::account_id32("76561199198704913"),
+            Some(1_238_439_185)
+        );
+        assert!(SteamAdapter::account_id32("invalid").is_none());
     }
 
     #[test]
     fn rejects_unclosed_vdf() {
         assert!(parse_vdf("\"users\" { \"1\" {").is_err());
+    }
+
+    #[test]
+    fn suppresses_only_managed_accounts_from_the_native_switcher() {
+        let root =
+            std::env::temp_dir().join(format!("nea-steam-native-list-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("loginusers.vdf"),
+            "\"users\"\n{\n\"76561198000000001\" { \"AccountName\" \"managed\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"1\" \"MostRecent\" \"1\" \"Timestamp\" \"999\" }\n\"76561198000000002\" { \"AccountName\" \"native\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"1\" \"MostRecent\" \"0\" \"Timestamp\" \"888\" }\n\"76561198000000003\" { \"AccountName\" \"native2\" \"RememberPassword\" \"1\" \"AllowAutoLogin\" \"1\" \"MostRecent\" \"0\" \"Timestamp\" \"777\" }\n}",
+        )
+        .unwrap();
+        let installation = SteamInstallation {
+            install_dir: root.to_string_lossy().to_string(),
+            executable: root.join("steam.exe").to_string_lossy().to_string(),
+            valid: true,
+        };
+
+        assert_eq!(
+            SteamAdapter::suppress_accounts_from_native_switcher(
+                &installation,
+                &HashSet::from(["76561198000000001".to_string()]),
+            )
+            .unwrap(),
+            1
+        );
+        let parsed =
+            parse_vdf(&fs::read_to_string(config.join("loginusers.vdf")).unwrap()).unwrap();
+        let accounts = users(&parsed).unwrap();
+        let VdfValue::Object(managed) = accounts.get("76561198000000001").unwrap() else {
+            panic!()
+        };
+        let VdfValue::Object(native) = accounts.get("76561198000000002").unwrap() else {
+            panic!()
+        };
+        for key in [
+            "RememberPassword",
+            "AllowAutoLogin",
+            "MostRecent",
+            "Timestamp",
+        ] {
+            assert_eq!(text(managed, key), Some("0"));
+        }
+        assert_eq!(text(native, "RememberPassword"), Some("1"));
+        assert_eq!(text(native, "Timestamp"), Some("888"));
+
+        let handles = ["76561198000000002", "76561198000000003"].map(|steam_id| {
+            let installation = installation.clone();
+            thread::spawn(move || {
+                SteamAdapter::suppress_accounts_from_native_switcher(
+                    &installation,
+                    &HashSet::from([steam_id.to_string()]),
+                )
+                .unwrap();
+            })
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let parsed =
+            parse_vdf(&fs::read_to_string(config.join("loginusers.vdf")).unwrap()).unwrap();
+        for steam_id in ["76561198000000002", "76561198000000003"] {
+            let VdfValue::Object(account) = users(&parsed).unwrap().get(steam_id).unwrap() else {
+                panic!()
+            };
+            assert_eq!(text(account, "RememberPassword"), Some("0"));
+            assert_eq!(text(account, "Timestamp"), Some("0"));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }
