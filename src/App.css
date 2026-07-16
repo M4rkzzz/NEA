@@ -74,6 +74,36 @@ button.primary {
   color: #fff;
 }
 
+button.primary:hover:not(:disabled) {
+  border-color: #1d4ed8;
+  background: #1d4ed8;
+  color: #fff;
+}
+
+button.primary.danger-confirm,
+button.primary.danger-confirm:hover:not(:disabled) {
+  border-color: #c42b1c;
+  background: #c42b1c;
+  color: #fff;
+}
+
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .shell {
   height: 100vh;
   display: grid;
@@ -228,6 +258,8 @@ button.primary {
 
 .confirm-dialog {
   width: min(360px, 100%);
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
   border: 1px solid #d8dde2;
   border-radius: 8px;
   padding: 20px;
@@ -243,13 +275,21 @@ button.primary {
   overflow-wrap: anywhere;
 }
 
+.confirm-description {
+  display: block;
+  margin: -12px 0 18px;
+  color: #66737a;
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .share-center-backdrop {
   padding: 32px;
 }
 
 .share-center {
   display: grid;
-  grid-template-rows: auto auto minmax(180px, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(760px, 100%);
   max-height: min(760px, calc(100vh - 64px));
   overflow: hidden;
@@ -471,7 +511,7 @@ button.primary {
 .steam-text-import-dialog textarea {
   display: block;
   width: 100%;
-  height: 240px;
+  height: clamp(120px, 40dvh, 240px);
   margin: 0 0 16px;
   resize: vertical;
   border: 1px solid #cbd2d9;
@@ -482,6 +522,16 @@ button.primary {
   font: 13px/20px Consolas, "Courier New", monospace;
   letter-spacing: 0;
   outline: none;
+}
+
+.steam-import-inline-error {
+  margin: -6px 0 12px;
+  border: 1px solid #e5aaa5;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fff1f0;
+  color: #a1261c;
+  font-size: 12px;
 }
 
 .steam-text-import-dialog textarea:focus {
@@ -499,11 +549,6 @@ button.primary {
 
 html[data-theme="dark"] .steam-import-parallel-hint {
   color: #929b9f;
-}
-
-button.primary.danger-confirm {
-  border-color: #c42b1c;
-  background: #c42b1c;
 }
 
 .auto-hide-scrollbar {
@@ -652,6 +697,10 @@ button.primary.danger-confirm {
 
 .status[data-busy="true"] {
   color: #1d4ed8;
+}
+
+.mobile-feature-tabs {
+  display: none;
 }
 
 .content-stack {
@@ -929,6 +978,25 @@ button.primary.danger-confirm {
   color: #6b7280;
 }
 
+.actionable-empty {
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+}
+
+.actionable-empty > strong {
+  color: #303940;
+  font-size: 13px;
+}
+
+.actionable-empty > span {
+  line-height: 18px;
+}
+
+.actionable-empty .actions {
+  margin-top: 5px;
+}
+
 .identity-capabilities {
   display: flex;
   flex-wrap: wrap;
@@ -968,13 +1036,141 @@ button.primary.danger-confirm {
   font-size: 11px;
 }
 
+.steam-import-active,
+.steam-import-result,
+.steam-pending-sessions {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 9px;
+  border: 1px solid #cddde4;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f4f9fb;
+}
+
+.steam-import-active {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  border-color: #9ec6d5;
+  background: #eff8fb;
+}
+
+.steam-import-active > span {
+  display: grid;
+  gap: 2px;
+}
+
+.steam-import-active small {
+  color: #66757d;
+  font-size: 11px;
+}
+
+.steam-import-result > header,
+.steam-pending-sessions > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.steam-import-result > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.steam-import-result > header span,
+.steam-pending-sessions > header span {
+  color: #66757d;
+  font-size: 11px;
+}
+
+.steam-import-result-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 6px;
+}
+
+.steam-import-result-metrics > span {
+  display: grid;
+  gap: 1px;
+  border: 1px solid #dce5e9;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fff;
+  color: #68757d;
+  font-size: 10px;
+}
+
+.steam-import-result-metrics strong {
+  color: #34434a;
+  font-size: 16px;
+}
+
+.steam-import-result-metrics [data-state="success"] strong {
+  color: #177245;
+}
+
+.steam-import-result-metrics [data-state="warning"] strong {
+  color: #9a5b00;
+}
+
+.steam-import-result-metrics [data-state="error"] strong {
+  color: #b42318;
+}
+
+.steam-import-result details {
+  border-top: 1px solid #dce5e9;
+  padding-top: 7px;
+}
+
+.steam-import-result summary {
+  color: #3d5966;
+  cursor: pointer;
+}
+
+.steam-import-account-list {
+  margin: 7px 0;
+  color: #586970;
+  font-size: 11px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.steam-pending-sessions {
+  border-color: #e2cf9f;
+  background: #fffaf0;
+}
+
+.steam-pending-sessions > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  border-top: 1px solid #eadfc4;
+  padding-top: 7px;
+}
+
+.steam-pending-sessions > div > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.steam-pending-sessions small {
+  overflow: hidden;
+  color: #7a6a45;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .steam-identity-list {
   max-height: min(520px, 65vh);
 }
 
 .steam-filter-bar {
   display: grid;
-  grid-template-columns: minmax(190px, 1fr) repeat(3, minmax(125px, auto));
+  grid-template-columns: minmax(190px, 1fr) repeat(2, minmax(135px, auto));
   gap: 7px;
   margin-bottom: 9px;
   padding: 8px;
@@ -1171,7 +1367,7 @@ button.primary.danger-confirm {
 
 .perfect-account-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   align-items: stretch;
   gap: 10px;
   min-width: 0;
@@ -1191,7 +1387,7 @@ button.primary.danger-confirm {
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
   min-width: 0;
-  height: 188px;
+  min-height: 188px;
   border: 1px solid #dde3e7;
   border-radius: 8px;
   padding: 9px;
@@ -1680,6 +1876,23 @@ html[data-theme="dark"] button.primary {
   color: #fff;
 }
 
+html[data-theme="dark"] button.primary:hover:not(:disabled) {
+  border-color: #4b82ee;
+  background: #245ac7;
+  color: #fff;
+}
+
+html[data-theme="dark"] button.primary.danger-confirm,
+html[data-theme="dark"] button.primary.danger-confirm:hover:not(:disabled) {
+  border-color: #d14a3b;
+  background: #b9382a;
+  color: #fff;
+}
+
+html[data-theme="dark"] :where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline-color: #7cb0ff;
+}
+
 html[data-theme="dark"] .app-list button[data-active="true"],
 html[data-theme="dark"] .global-share-button:hover:not(:disabled),
 html[data-theme="dark"] .feature-list button[data-active="true"] {
@@ -1715,6 +1928,10 @@ html[data-theme="dark"] .share-tree-children label strong {
   color: #eef1f3;
 }
 
+html[data-theme="dark"] .confirm-description {
+  color: #aeb8bd;
+}
+
 html[data-theme="dark"] .account-row[data-selected="true"],
 html[data-theme="dark"] .perfect-account-card[data-current="true"],
 html[data-theme="dark"] .perfect-account-card[data-selected="true"] {
@@ -1731,6 +1948,50 @@ html[data-theme="dark"] .notice {
   border-color: #3d3d3d;
   background: #252525;
   color: #b9c2c7;
+}
+
+html[data-theme="dark"] .perfect-filter-bar label {
+  color: #c4ccd0;
+}
+
+html[data-theme="dark"] .actionable-empty > strong {
+  color: #e2e8eb;
+}
+
+html[data-theme="dark"] .steam-import-active,
+html[data-theme="dark"] .steam-import-result,
+html[data-theme="dark"] .steam-pending-sessions {
+  border-color: #3c4a50;
+  background: #202729;
+}
+
+html[data-theme="dark"] .steam-import-result-metrics > span {
+  border-color: #3b4549;
+  background: #252b2e;
+  color: #a8b1b6;
+}
+
+html[data-theme="dark"] .steam-import-result-metrics strong {
+  color: #e5eaec;
+}
+
+html[data-theme="dark"] .steam-import-result > header span,
+html[data-theme="dark"] .steam-pending-sessions > header span,
+html[data-theme="dark"] .steam-import-account-list,
+html[data-theme="dark"] .steam-import-active small,
+html[data-theme="dark"] .steam-pending-sessions small {
+  color: #aab5ba;
+}
+
+html[data-theme="dark"] .steam-import-result details,
+html[data-theme="dark"] .steam-pending-sessions > div {
+  border-color: #3b4549;
+}
+
+html[data-theme="dark"] .steam-import-inline-error {
+  border-color: #70413d;
+  background: #321f1e;
+  color: #ffb4ab;
 }
 
 html[data-theme="dark"] .share-tree-children label,
@@ -1910,6 +2171,17 @@ html[data-theme="dark"] .steam-filter-bar select {
   border-color: #3b4246;
   background: #202426;
   color: #d9dddf;
+}
+
+html[data-theme="dark"] .mobile-feature-tabs {
+  background: #202628;
+}
+
+html[data-theme="dark"] .mobile-feature-tabs button[data-active="true"] {
+  border-color: #465156;
+  background: #2b3438;
+  color: #f1f4f5;
+  box-shadow: none;
 }
 
 html[data-theme="dark"] .steam-capability-boundary b[data-available="true"] {
@@ -2120,11 +2392,6 @@ html[data-theme="dark"].overlay-root #root {
     grid-template-columns: 56px 144px minmax(0, 1fr);
   }
 
-  .switcher-grid,
-  .summary-grid {
-    grid-template-columns: 1fr;
-  }
-
   .hero-panel {
     align-items: flex-start;
     flex-direction: column;
@@ -2173,6 +2440,10 @@ html[data-theme="dark"].overlay-root #root {
   .steam-unified-title {
     flex-wrap: wrap;
   }
+
+  .switcher-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 640px) {
@@ -2181,15 +2452,12 @@ html[data-theme="dark"].overlay-root #root {
   }
 
   .app-layout {
-    grid-template-columns: 52px 138px minmax(0, 1fr);
+    grid-template-columns: 52px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }
 
   .sidebar {
-    height: 100%;
-    max-height: none;
-    border-right: 0;
-    overflow-y: auto;
+    display: none;
   }
 
   .steam-filter-bar {
@@ -2209,7 +2477,69 @@ html[data-theme="dark"].overlay-root #root {
   .workspace {
     height: auto;
     min-height: 0;
-    border-radius: 14px 14px 0 0;
+    border-radius: 14px 0 0 0;
+    padding: 12px;
+  }
+
+  .workspace[data-contained-scroll="true"] {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .topbar {
+    display: grid;
+    gap: 2px;
+    min-height: 34px;
+    margin-bottom: 5px;
+  }
+
+  .topbar h2 {
+    font-size: 17px;
+    line-height: 22px;
+  }
+
+  .status {
+    width: 100%;
+    max-width: 100%;
+    min-height: 18px;
+    font-size: 11px;
+  }
+
+  .mobile-feature-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+    margin-bottom: 9px;
+    border-radius: 7px;
+    padding: 3px;
+    background: #eef3f5;
+  }
+
+  .mobile-feature-tabs button {
+    display: flex;
+    height: 30px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .mobile-feature-tabs button[data-active="true"] {
+    border-color: #d7e0e4;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(31, 48, 58, 0.08);
+  }
+
+  .steam-import-result-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .steam-pending-sessions > div {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .steam-pending-sessions > div .icon-button {
+    grid-column: 2;
   }
 
   .account-row-main {
@@ -2227,6 +2557,15 @@ html[data-theme="dark"].overlay-root #root {
 }
 
 @media (max-height: 520px) {
+  .confirm-backdrop,
+  .share-center-backdrop {
+    padding: 8px;
+  }
+
+  .share-center {
+    max-height: calc(100dvh - 16px);
+  }
+
   .sidebar {
     padding-top: 52px;
     padding-bottom: 10px;
@@ -2235,5 +2574,19 @@ html[data-theme="dark"].overlay-root #root {
   .workspace {
     padding-top: 10px;
     padding-bottom: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .spin-icon,
+  .spinner {
+    animation: none;
   }
 }

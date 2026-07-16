@@ -469,6 +469,8 @@ struct AppState {
     wormhole_running: AtomicBool,
     wormhole_cancelled: AtomicBool,
     steam_web_import_running: AtomicBool,
+    steam_bulk_import_running: AtomicBool,
+    steam_bulk_import_cancelled: AtomicBool,
     steam_import_duplicate_sessions: Mutex<HashMap<String, String>>,
     steam_capability_running: AtomicBool,
     steam_capability_paused: AtomicBool,
@@ -481,6 +483,10 @@ struct SwitchActivityGuard {
 }
 
 struct SteamWebImportGuard {
+    app: AppHandle,
+}
+
+struct SteamBulkImportGuard {
     app: AppHandle,
 }
 
@@ -506,6 +512,31 @@ fn acquire_steam_web_import(app: &AppHandle) -> Result<SteamWebImportGuard, Stri
         return Err("已有 Steam 网页账号批量导入正在进行".to_string());
     }
     Ok(SteamWebImportGuard { app: app.clone() })
+}
+
+impl Drop for SteamBulkImportGuard {
+    fn drop(&mut self) {
+        let state = self.app.state::<AppState>();
+        state
+            .steam_bulk_import_cancelled
+            .store(false, Ordering::SeqCst);
+        state
+            .steam_bulk_import_running
+            .store(false, Ordering::SeqCst);
+        let _ = self.app.emit("steam-bulk-import-state", false);
+    }
+}
+
+fn acquire_steam_bulk_import(app: &AppHandle) -> Result<SteamBulkImportGuard, String> {
+    let state = app.state::<AppState>();
+    if state.steam_bulk_import_running.swap(true, Ordering::SeqCst) {
+        return Err("已有 Steam 网页账号批量导入正在进行".to_string());
+    }
+    state
+        .steam_bulk_import_cancelled
+        .store(false, Ordering::SeqCst);
+    let _ = app.emit("steam-bulk-import-state", true);
+    Ok(SteamBulkImportGuard { app: app.clone() })
 }
 
 fn steam_capability_status(app: &AppHandle) -> SteamCapabilityStatus {
@@ -1438,10 +1469,18 @@ fn migrate_avatar_sources(data: &mut AppData) {
 }
 
 fn save_data(data: &AppData) -> Result<(), String> {
+    save_data_inner(data, false)
+}
+
+fn save_verified_recovery_data(data: &AppData) -> Result<(), String> {
+    save_data_inner(data, true)
+}
+
+fn save_data_inner(data: &AppData, allow_blocked_recovery: bool) -> Result<(), String> {
     let _write_guard = CONFIG_WRITE_LOCK
         .lock()
         .map_err(|error| format!("配置写入锁异常: {error}"))?;
-    if CONFIG_WRITES_BLOCKED.load(Ordering::SeqCst) {
+    if CONFIG_WRITES_BLOCKED.load(Ordering::SeqCst) && !allow_blocked_recovery {
         return Err("NEA 配置文件损坏且无法自动恢复，已阻止写入以保护现有账号数据".to_string());
     }
     ensure_storage()?;
@@ -1470,6 +1509,7 @@ fn save_data(data: &AppData) -> Result<(), String> {
     *LAST_INTERNAL_CONFIG_BYTES
         .lock()
         .map_err(|error| format!("配置写入状态锁异常: {error}"))? = Some(raw);
+    CONFIG_WRITES_BLOCKED.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -2412,6 +2452,18 @@ fn commit_prepared_dir(prepared: &Path, dst: &Path) -> Result<(), String> {
     }
     if had_dst {
         let _ = fs::remove_dir_all(old);
+    }
+    Ok(())
+}
+
+fn rollback_replaced_dir(dst: &Path, previous: &Path, had_dst: bool) -> Result<(), String> {
+    if dst.exists() {
+        fs::remove_dir_all(dst)
+            .map_err(|error| format!("移除未提交目录失败 {}: {}", dst.display(), error))?;
+    }
+    if had_dst {
+        fs::rename(previous, dst)
+            .map_err(|error| format!("恢复原目录失败 {}: {}", dst.display(), error))?;
     }
     Ok(())
 }
@@ -3404,12 +3456,15 @@ struct SteamCredentialInput {
 struct SteamBulkImportResult {
     imported: usize,
     failed: usize,
+    cancelled: usize,
     skipped_existing: usize,
     skipped_existing_accounts: Vec<String>,
     skipped_duplicate_input: usize,
     invalid_credential_accounts: Vec<String>,
     token_protected_accounts: Vec<String>,
     verification_required_accounts: Vec<String>,
+    failed_accounts: Vec<String>,
+    cancelled_accounts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -5040,6 +5095,30 @@ struct SteamImportAccountResult {
     outcome: SteamImportAccountOutcome,
 }
 
+fn steam_import_is_cancelled(app: &AppHandle, capability_controlled: bool) -> bool {
+    let state = app.state::<AppState>();
+    if capability_controlled {
+        state.steam_capability_cancelled.load(Ordering::SeqCst)
+    } else {
+        state.steam_bulk_import_cancelled.load(Ordering::SeqCst)
+    }
+}
+
+fn steam_web_import_session_is_verified(app: &AppHandle, session_id: &str) -> bool {
+    app.state::<AppState>()
+        .data
+        .lock()
+        .ok()
+        .is_some_and(|data| {
+            data.steam
+                .web_sessions
+                .iter()
+                .find(|saved| saved.id == session_id)
+                .and_then(|saved| saved.steam_id.as_ref())
+                .is_some()
+        })
+}
+
 async fn import_single_steam_web_account(
     app: AppHandle,
     mut credentials: SteamCredentialInput,
@@ -5051,6 +5130,13 @@ async fn import_single_steam_web_account(
 ) -> SteamImportAccountResult {
     let account_label = credentials.account.clone();
     if capability_controlled && !wait_for_steam_capability_permission(&app).await {
+        clear_sensitive_string(&mut credentials.password);
+        return SteamImportAccountResult {
+            account: account_label,
+            outcome: SteamImportAccountOutcome::Cancelled,
+        };
+    }
+    if steam_import_is_cancelled(&app, capability_controlled) {
         clear_sensitive_string(&mut credentials.password);
         return SteamImportAccountResult {
             account: account_label,
@@ -5112,15 +5198,7 @@ async fn import_single_steam_web_account(
         );
         SteamImportAccountOutcome::Failed
     } else {
-        let detected = loop {
-            if capability_controlled
-                && app
-                    .state::<AppState>()
-                    .steam_capability_cancelled
-                    .load(Ordering::SeqCst)
-            {
-                break SteamImportAccountOutcome::Cancelled;
-            }
+        let mut detected = loop {
             let duplicate_detected = {
                 let state = app.state::<AppState>();
                 state
@@ -5133,22 +5211,15 @@ async fn import_single_steam_web_account(
             if duplicate_detected {
                 break SteamImportAccountOutcome::SkippedExisting;
             }
-            let recognized = {
-                let state = app.state::<AppState>();
-                state.data.lock().ok().is_some_and(|data| {
-                    data.steam
-                        .web_sessions
-                        .iter()
-                        .find(|saved| saved.id == session.id)
-                        .and_then(|saved| saved.steam_id.as_ref())
-                        .is_some()
-                })
-            };
-            if recognized {
+            if steam_web_import_session_is_verified(&app, &session.id) {
                 break SteamImportAccountOutcome::Verified;
             }
             let Some(window) = app.get_webview_window(&steam_web_window_label(&session.id)) else {
-                break SteamImportAccountOutcome::Failed;
+                break if steam_import_is_cancelled(&app, capability_controlled) {
+                    SteamImportAccountOutcome::Cancelled
+                } else {
+                    SteamImportAccountOutcome::Failed
+                };
             };
             let native_title = window.title().ok();
             let current_url = window.url().ok();
@@ -5158,10 +5229,20 @@ async fn import_single_steam_web_account(
             {
                 break outcome;
             }
+            if steam_import_is_cancelled(&app, capability_controlled) {
+                break SteamImportAccountOutcome::Cancelled;
+            }
             tokio::time::sleep(Duration::from_millis(350)).await;
         };
         if !matches!(detected, SteamImportAccountOutcome::Verified) {
-            let _ = discard_unverified_steam_web_session(&app, &session.id).await;
+            if steam_web_import_session_is_verified(&app, &session.id) {
+                detected = SteamImportAccountOutcome::Verified;
+            } else {
+                let _ = discard_unverified_steam_web_session(&app, &session.id).await;
+                if steam_web_import_session_is_verified(&app, &session.id) {
+                    detected = SteamImportAccountOutcome::Verified;
+                }
+            }
         }
         detected
     };
@@ -5195,12 +5276,31 @@ fn preview_steam_web_import(
 }
 
 #[tauri::command]
+fn cancel_steam_web_import(app: AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    if !state.steam_bulk_import_running.load(Ordering::SeqCst) {
+        return false;
+    }
+    if !state
+        .steam_bulk_import_cancelled
+        .swap(true, Ordering::SeqCst)
+    {
+        let _ = app.emit(
+            "steam-bulk-import-progress",
+            "正在取消 Steam 网页账号导入...",
+        );
+    }
+    true
+}
+
+#[tauri::command]
 async fn import_steam_web_accounts_from_text(
     app: AppHandle,
     accounts: Vec<SteamCredentialInput>,
     _skip_existing: bool,
 ) -> Result<SteamBulkImportResult, String> {
     let _import_guard = acquire_steam_web_import(&app)?;
+    let _bulk_import_guard = acquire_steam_bulk_import(&app)?;
     if accounts.is_empty() {
         return Err("没有可导入的 Steam 网页账号".to_string());
     }
@@ -5302,9 +5402,11 @@ async fn import_steam_web_accounts_from_text(
     let total = accounts_to_import.len();
     let mut imported = 0usize;
     let mut failed = 0usize;
+    let mut cancelled_accounts = Vec::new();
     let mut invalid_credential_accounts = Vec::new();
     let mut token_protected_accounts = Vec::new();
     let mut verification_required_accounts = Vec::new();
+    let mut failed_accounts = Vec::new();
     let mut credential_rollback_accounts = Vec::new();
     let started = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
@@ -5341,9 +5443,14 @@ async fn import_steam_web_accounts_from_text(
             SteamImportAccountOutcome::VerificationRequired => {
                 verification_required_accounts.push(result.account);
             }
-            SteamImportAccountOutcome::Failed | SteamImportAccountOutcome::Cancelled => {
+            SteamImportAccountOutcome::Failed => {
                 failed += 1;
-                credential_rollback_accounts.push(result.account);
+                credential_rollback_accounts.push(result.account.clone());
+                failed_accounts.push(result.account);
+            }
+            SteamImportAccountOutcome::Cancelled => {
+                credential_rollback_accounts.push(result.account.clone());
+                cancelled_accounts.push(result.account);
             }
         }
     }
@@ -5371,12 +5478,15 @@ async fn import_steam_web_accounts_from_text(
     Ok(SteamBulkImportResult {
         imported,
         failed,
+        cancelled: cancelled_accounts.len(),
         skipped_existing: skipped_existing_accounts.len(),
         skipped_existing_accounts,
         skipped_duplicate_input: preview.duplicate_input_accounts.len(),
         invalid_credential_accounts,
         token_protected_accounts,
         verification_required_accounts,
+        failed_accounts,
+        cancelled_accounts,
     })
 }
 
@@ -5622,6 +5732,53 @@ async fn delete_steam_web_session(app: AppHandle, session_id: String) -> Result<
     update_tray(&app);
     let _ = app.emit("app-data-changed", ());
     Ok(())
+}
+
+#[tauri::command]
+fn delete_steam_saved_credential(app: AppHandle, identity_id: String) -> Result<AppData, String> {
+    let _activity = acquire_switch_activity(&app)?;
+    let _import_guard = acquire_steam_web_import(&app)?;
+    let state = app.state::<AppState>();
+    commit_app_data_update(&state, |data| {
+        reconcile_steam_identities(data);
+        let identity = data
+            .steam_identities
+            .iter()
+            .find(|identity| identity.id == identity_id)
+            .cloned()
+            .ok_or_else(|| "Steam 账号不存在".to_string())?;
+        let normalized_account = identity
+            .account_name
+            .as_deref()
+            .map(normalized_steam_account_name);
+        let before = data.steam_credentials.len();
+        data.steam_credentials.retain(|credential| {
+            let same_steam_id = identity
+                .steam_id
+                .as_deref()
+                .is_some_and(|steam_id| credential.steam_id.as_deref() == Some(steam_id));
+            let same_account = normalized_account.as_deref().is_some_and(|account| {
+                normalized_steam_account_name(&credential.account_name) == account
+            });
+            !same_steam_id && !same_account
+        });
+        if data.steam_credentials.len() == before {
+            return Err("该 Steam 账号没有已保存账密".to_string());
+        }
+        if let Some(steam_id) = identity.steam_id {
+            data.steam_native_switcher_exclusions.remove(&steam_id);
+        }
+        reconcile_saved_steam_credentials(data);
+        Ok(())
+    })?;
+    let latest = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    update_tray(&app);
+    let _ = app.emit("app-data-changed", ());
+    Ok(latest)
 }
 
 fn perfect_profile_is_complete(profile: &perfect_arena::PerfectArenaProfile) -> bool {
@@ -6476,7 +6633,9 @@ async fn complete_steam_capabilities(
         .web_sessions
         .is_empty();
     if has_web_sessions {
-        let _ = refresh_steam_web_sessions(app.clone()).await;
+        refresh_steam_web_sessions(app.clone())
+            .await
+            .map_err(|error| format!("无法验证现有 Steam 网页登录状态，已停止补全：{error}"))?;
     }
     let credentials = {
         let state = app.state::<AppState>();
@@ -6985,13 +7144,44 @@ async fn import_account(app: AppHandle, uid: String) -> Result<SavedAccount, Str
     .map_err(|e| e.to_string())?
 }
 
+fn merge_imported_oopz_accounts(
+    accounts: &mut Vec<SavedAccount>,
+    imported: &[SavedAccount],
+) -> Result<(), String> {
+    for incoming in imported {
+        let id_position = accounts.iter().position(|saved| saved.id == incoming.id);
+        let uid_position = incoming.uid.as_ref().and_then(|uid| {
+            accounts
+                .iter()
+                .position(|saved| saved.uid.as_ref() == Some(uid))
+        });
+        match (id_position, uid_position) {
+            (Some(id_index), Some(uid_index)) if id_index != uid_index => {
+                return Err(format!(
+                    "OOPZ 账号在导入期间发生身份冲突，请重新导入：{}",
+                    incoming.display_name
+                ));
+            }
+            (Some(index), _) => accounts[index] = incoming.clone(),
+            (None, Some(_)) => {
+                return Err(format!(
+                    "OOPZ 账号在导入期间发生变化，请重新导入：{}",
+                    incoming.display_name
+                ));
+            }
+            (None, None) => accounts.push(incoming.clone()),
+        }
+    }
+    Ok(())
+}
+
 fn import_account_inner(
     app: AppHandle,
     state: State<AppState>,
     uid: String,
 ) -> Result<SavedAccount, String> {
     let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
-    let mut data = state.data.lock().map_err(|e| e.to_string())?.clone();
+    let data = state.data.lock().map_err(|e| e.to_string())?.clone();
     let paths = paths_from_config(&data.config)?;
     let roaming_src = PathBuf::from(&paths.roaming_data_dir).join(&uid);
     let local_src = PathBuf::from(&paths.local_sandbox_dir).join(&uid);
@@ -7018,11 +7208,74 @@ fn import_account_inner(
         .and_then(download_avatar_data_url);
     let id = existing_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let snapshot = account_snapshot_dir(&id)?;
-    copy_dir_recursive(&roaming_src, &snapshot.join("roaming").join(&uid))?;
-    copy_dir_recursive(&local_src, &snapshot.join("local_sandbox").join(&uid))?;
+    let snapshot_parent = snapshot
+        .parent()
+        .ok_or_else(|| "账号快照目录无效".to_string())?;
+    fs::create_dir_all(snapshot_parent).map_err(|error| error.to_string())?;
+    let transaction_id = Uuid::new_v4();
+    let prepared_snapshot = snapshot_parent.join(format!(".nea-import-{transaction_id}"));
+    let previous_snapshot = snapshot_parent.join(format!(".nea-before-import-{transaction_id}"));
+    let preparation = (|| -> Result<(), String> {
+        if snapshot.exists() {
+            copy_dir_contents(&snapshot, &prepared_snapshot)?;
+        } else {
+            fs::create_dir_all(&prepared_snapshot).map_err(|error| error.to_string())?;
+        }
+        copy_dir_recursive(&roaming_src, &prepared_snapshot.join("roaming").join(&uid))?;
+        copy_dir_recursive(
+            &local_src,
+            &prepared_snapshot.join("local_sandbox").join(&uid),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        let _ = fs::remove_dir_all(&prepared_snapshot);
+        return Err(error);
+    }
+    let had_snapshot = snapshot.exists();
+    if had_snapshot {
+        if let Err(error) = fs::rename(&snapshot, &previous_snapshot) {
+            let _ = fs::remove_dir_all(&prepared_snapshot);
+            return Err(format!("暂存原账号快照失败: {error}"));
+        }
+    }
+    if let Err(error) = fs::rename(&prepared_snapshot, &snapshot) {
+        let rollback = rollback_replaced_dir(&snapshot, &previous_snapshot, had_snapshot).err();
+        let _ = fs::remove_dir_all(&prepared_snapshot);
+        return match rollback {
+            Some(rollback) => Err(format!("替换账号快照失败: {error}；恢复失败: {rollback}")),
+            None => Err(format!("替换账号快照失败: {error}")),
+        };
+    }
+
+    let previous_secret = has_login_state.then(|| read_secret_raw(&id));
+    let rollback_import = || -> Result<(), String> {
+        let mut first_error = None;
+        if let Some(previous) = &previous_secret {
+            if let Some(raw) = previous {
+                if let Err(error) = write_secret_raw(&id, raw) {
+                    first_error.get_or_insert(error);
+                }
+            } else {
+                delete_credential(&id);
+            }
+        }
+        if let Err(error) = rollback_replaced_dir(&snapshot, &previous_snapshot, had_snapshot) {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
+    };
     if has_login_state {
-        if let Some(login) = registry_login {
-            store_oopz_login(&id, &login)?;
+        if let Some(login) = registry_login.as_deref() {
+            if let Err(error) = store_oopz_login(&id, login) {
+                let rollback = rollback_import().err();
+                return match rollback {
+                    Some(rollback) => {
+                        Err(format!("保存账号凭据失败: {error}；恢复失败: {rollback}"))
+                    }
+                    None => Err(error),
+                };
+            }
         }
     }
 
@@ -7068,15 +7321,25 @@ fn import_account_inner(
             .and_then(|a| a.last_used_at.clone()),
     };
 
-    if let Some(pos) = data.accounts.iter().position(|a| a.id == id) {
-        data.accounts[pos] = account.clone();
-    } else {
-        data.accounts.push(account.clone());
+    let committed = commit_app_data_update(&state, |latest| {
+        merge_imported_oopz_accounts(&mut latest.accounts, std::slice::from_ref(&account))?;
+        Ok(account.clone())
+    });
+    let committed = match committed {
+        Ok(committed) => committed,
+        Err(error) => {
+            let rollback = rollback_import().err();
+            return match rollback {
+                Some(rollback) => Err(format!("{error}；恢复账号快照失败: {rollback}")),
+                None => Err(error),
+            };
+        }
+    };
+    if had_snapshot {
+        let _ = fs::remove_dir_all(&previous_snapshot);
     }
-    save_data(&data)?;
-    *state.data.lock().map_err(|e| e.to_string())? = data;
     update_tray(&app);
-    Ok(account)
+    Ok(committed)
 }
 
 fn collect_export_paths(
@@ -7426,6 +7689,31 @@ fn rollback_snapshot_entry(
     Ok(())
 }
 
+fn restore_oopz_accounts_from_import_backup(
+    root: &Path,
+    journal: &ImportJournal,
+) -> Result<(), String> {
+    let original_data = if journal.config_existed {
+        let backup = root.join("config.backup");
+        parse_app_data_file(&backup)
+            .map(|(data, _)| data)
+            .ok_or_else(|| "无法读取导入前的 OOPZ 账号配置".to_string())?
+    } else {
+        AppData::default()
+    };
+    let config = config_path()?;
+    let (mut latest, requires_verified_recovery) = match recover_config_file(&config) {
+        Some((data, _)) => (data, false),
+        None => (original_data.clone(), true),
+    };
+    latest.accounts = original_data.accounts;
+    if requires_verified_recovery {
+        save_verified_recovery_data(&latest)
+    } else {
+        save_data(&latest)
+    }
+}
+
 fn rollback_import_transaction(root: &Path, journal: &ImportJournal) -> Result<(), String> {
     let mut first_error = None;
     for entry in &journal.entries {
@@ -7450,14 +7738,8 @@ fn rollback_import_transaction(root: &Path, journal: &ImportJournal) -> Result<(
             }
         }
     }
-    let config = config_path()?;
-    let config_backup = root.join("config.backup");
-    if journal.config_existed && config_backup.exists() {
-        if let Err(error) = fs::copy(config_backup, config) {
-            first_error.get_or_insert_with(|| error.to_string());
-        }
-    } else if !journal.config_existed {
-        let _ = fs::remove_file(config);
+    if let Err(error) = restore_oopz_accounts_from_import_backup(root, journal) {
+        first_error.get_or_insert(error);
     }
     cleanup_transaction_credentials(journal);
     if let Some(error) = first_error {
@@ -7501,7 +7783,6 @@ fn recover_import_transactions() {
 fn commit_prepared_import(
     app: &AppHandle,
     root: &Path,
-    mut data: AppData,
     prepared: Vec<PreparedImportAccount>,
 ) -> Result<Vec<SavedAccount>, String> {
     let config = config_path()?;
@@ -7576,24 +7857,18 @@ fn commit_prepared_import(
         write_import_journal(root, &journal)?;
         for item in &prepared {
             store_oopz_login(&item.account.id, &item.oopz_login)?;
-            if let Some(pos) = data
-                .accounts
-                .iter()
-                .position(|account| account.id == item.account.id)
-            {
-                data.accounts[pos] = item.account.clone();
-            } else {
-                data.accounts.push(item.account.clone());
-            }
         }
-        save_data(&data)?;
-        *app.state::<AppState>()
-            .data
-            .lock()
-            .map_err(|e| e.to_string())? = data;
+        let imported = prepared
+            .iter()
+            .map(|item| item.account.clone())
+            .collect::<Vec<_>>();
+        let state = app.state::<AppState>();
+        commit_app_data_update(&state, |latest| {
+            merge_imported_oopz_accounts(&mut latest.accounts, &imported)
+        })?;
         journal.status = "committed".to_string();
         write_import_journal(root, &journal)?;
-        Ok(prepared.iter().map(|item| item.account.clone()).collect())
+        Ok(imported)
     })();
 
     match commit_result {
@@ -7806,7 +8081,7 @@ fn import_account_package_inner(app: &AppHandle, path: &Path) -> Result<Vec<Save
         }
     };
     let config = data.config.clone();
-    let imported = commit_prepared_import(app, &root, data, prepared)?;
+    let imported = commit_prepared_import(app, &root, prepared)?;
     update_tray(app);
     ensure_plugin_runtime_for_oopz(&config);
     let _ = app.emit("app-data-changed", ());
@@ -8892,6 +9167,24 @@ fn delete_account_inner(
         }
         return Err("账号不存在".to_string());
     }
+    let deleting_uid = next_data
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .and_then(|account| account.uid.as_deref());
+    let actual_current_uid = current_registry_login()
+        .as_deref()
+        .and_then(uid_from_registry_login);
+    let deleting_current = deleting_uid.is_some_and(|uid| {
+        actual_current_uid.as_deref() == Some(uid)
+            || next_data.current_login_uid.as_deref() == Some(uid)
+    });
+    if deleting_current {
+        if let Some(staged) = &staged {
+            rollback_staged_deletion(staged);
+        }
+        return Err("当前登录账号不能删除，请先切换账号或退出 OOPZ".to_string());
+    }
     next_data
         .accounts
         .retain(|account| account.id != account_id);
@@ -8934,11 +9227,14 @@ fn open_oopz_inner(state: State<AppState>) -> Result<(), String> {
 
 fn close_oopz_if_running() -> Result<(), String> {
     let mut system = process_system();
-    let pids: Vec<_> = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| is_oopz_process_name(process.name()).then_some(*pid))
-        .collect();
+    let running_pids = |system: &System| {
+        system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| is_oopz_process_name(process.name()).then_some(*pid))
+            .collect::<Vec<_>>()
+    };
+    let pids = running_pids(&system);
 
     if pids.is_empty() {
         return Ok(());
@@ -8955,15 +9251,25 @@ fn close_oopz_if_running() -> Result<(), String> {
     thread::sleep(Duration::from_millis(1200));
     refresh_process_system(&mut system);
 
-    for pid in pids {
+    for pid in running_pids(&system) {
         if let Some(process) = system.process(pid) {
             if is_oopz_process_name(process.name()) {
                 let _ = process.kill();
             }
         }
     }
-
-    Ok(())
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(250));
+        refresh_process_system(&mut system);
+        if running_pids(&system).is_empty() {
+            return Ok(());
+        }
+    }
+    let remaining = running_pids(&system);
+    Err(format!(
+        "无法安全关闭 OOPZ（仍有 {} 个进程），已取消切号以避免账号数据损坏",
+        remaining.len()
+    ))
 }
 
 fn backup_current(paths: &OopzPaths) -> Result<(), String> {
@@ -8973,6 +9279,7 @@ fn backup_current(paths: &OopzPaths) -> Result<(), String> {
     let staging = backup_parent.join(format!(".nea-backup-{}", Uuid::new_v4()));
     fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     let Some(login) = current_registry_login() else {
+        fs::write(staging.join("logged_out"), b"1").map_err(|e| e.to_string())?;
         return commit_prepared_dir(&staging, &backup);
     };
     let write_result = (|| -> Result<(), String> {
@@ -9006,13 +9313,13 @@ async fn restore_latest_backup(app: AppHandle) -> Result<SwitchResult, String> {
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_for_task.state::<AppState>();
-        restore_latest_backup_inner(state)
+        restore_latest_backup_inner(&state)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn restore_latest_backup_inner(state: State<AppState>) -> Result<SwitchResult, String> {
+fn restore_latest_backup_inner(state: &AppState) -> Result<SwitchResult, String> {
     let data = state.data.lock().map_err(|e| e.to_string())?;
     let paths = paths_from_config(&data.config)?;
     drop(data);
@@ -9027,7 +9334,9 @@ fn restore_latest_backup_inner(state: State<AppState>) -> Result<SwitchResult, S
         Path::new(&paths.local_sandbox_dir),
     )?;
     let login_backup = backup.join("registry_login.txt");
-    if login_backup.exists() {
+    if backup.join("logged_out").exists() {
+        clear_registry_login()?;
+    } else if login_backup.exists() {
         let login = fs::read_to_string(login_backup).map_err(|e| e.to_string())?;
         write_registry_login(login.trim())?;
     }
@@ -9093,14 +9402,22 @@ fn switch_account_inner(
     }
 
     let Some(oopz_login) = read_oopz_login(&account.id) else {
-        let mut data = state.data.lock().map_err(|e| e.to_string())?;
-        if let Some(pos) = data.accounts.iter().position(|a| a.id == account.id) {
-            data.accounts[pos].has_login_state = false;
-            data.accounts[pos].updated_at = now();
-            save_data(&data)?;
-        }
-        drop(data);
+        commit_app_data_update(&state, |data| {
+            if let Some(saved) = data
+                .accounts
+                .iter_mut()
+                .find(|saved| saved.id == account.id)
+            {
+                saved.has_login_state = false;
+                saved.updated_at = now();
+            }
+            Ok(())
+        })?;
         update_tray(&app);
+        detach_plugin_overlay(&app);
+        close_oopz_if_running()?;
+        backup_current(&paths)?;
+        clear_registry_login()?;
         Command::new(paths.oopz_exe_path)
             .spawn()
             .map_err(|e| e.to_string())?;
@@ -9129,19 +9446,30 @@ fn switch_account_inner(
     detach_plugin_overlay(&app);
     close_oopz_if_running()?;
     backup_current(&paths)?;
-    copy_dir_recursive(
-        &roaming_snapshot,
-        &PathBuf::from(&paths.roaming_data_dir).join(&uid),
-    )?;
-    copy_dir_recursive(
-        &local_snapshot,
-        &PathBuf::from(&paths.local_sandbox_dir).join(&uid),
-    )?;
-    write_registry_login(&oopz_login)?;
-    verify_registry_login_uid(&uid)?;
-    Command::new(paths.oopz_exe_path)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let apply_result = (|| -> Result<(), String> {
+        copy_dir_recursive(
+            &roaming_snapshot,
+            &PathBuf::from(&paths.roaming_data_dir).join(&uid),
+        )?;
+        copy_dir_recursive(
+            &local_snapshot,
+            &PathBuf::from(&paths.local_sandbox_dir).join(&uid),
+        )?;
+        write_registry_login(&oopz_login)?;
+        verify_registry_login_uid(&uid)?;
+        Command::new(&paths.oopz_exe_path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = apply_result {
+        return match restore_latest_backup_inner(&state) {
+            Ok(_) => Err(format!("切号失败，已恢复切换前账号：{error}")),
+            Err(rollback_error) => Err(format!(
+                "切号失败：{error}；自动恢复也失败：{rollback_error}"
+            )),
+        };
+    }
     schedule_avatar_refresh(app.clone(), uid.clone());
     ensure_plugin_runtime_after_oopz_start(config);
 
@@ -9218,6 +9546,8 @@ pub fn run() {
             wormhole_running: AtomicBool::new(false),
             wormhole_cancelled: AtomicBool::new(false),
             steam_web_import_running: AtomicBool::new(false),
+            steam_bulk_import_running: AtomicBool::new(false),
+            steam_bulk_import_cancelled: AtomicBool::new(false),
             steam_import_duplicate_sessions: Mutex::new(HashMap::new()),
             steam_capability_running: AtomicBool::new(false),
             steam_capability_paused: AtomicBool::new(false),
@@ -9234,11 +9564,13 @@ pub fn run() {
             create_steam_web_session,
             preview_steam_web_import,
             import_steam_web_accounts_from_text,
+            cancel_steam_web_import,
             open_steam_web_session,
             refresh_steam_web_sessions,
             set_steam_web_session_note,
             set_steam_identity_note,
             delete_steam_web_session,
+            delete_steam_saved_credential,
             get_steam_capability_status,
             set_steam_capability_paused,
             cancel_steam_capability_completion,
@@ -10581,6 +10913,61 @@ mod tests {
         assert!(safe_relative_path("roaming/user/data.json").is_ok());
         assert!(safe_relative_path("../config.json").is_err());
         assert!(safe_relative_path("C:\\Windows\\system.ini").is_err());
+    }
+
+    #[test]
+    fn oopz_import_merge_updates_only_matching_accounts_and_rejects_identity_conflicts() {
+        let existing: SavedAccount =
+            serde_json::from_value(test_account("existing", "uid-existing")).unwrap();
+        let unrelated: SavedAccount =
+            serde_json::from_value(test_account("unrelated", "uid-unrelated")).unwrap();
+        let mut accounts = vec![existing.clone(), unrelated.clone()];
+        let mut updated = existing.clone();
+        updated.display_name = "updated".to_string();
+
+        merge_imported_oopz_accounts(&mut accounts, std::slice::from_ref(&updated)).unwrap();
+
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].display_name, "updated");
+        assert_eq!(accounts[1].display_name, unrelated.display_name);
+
+        let mut conflicting = updated;
+        conflicting.id = "different-id".to_string();
+        assert!(merge_imported_oopz_accounts(&mut accounts, &[conflicting]).is_err());
+    }
+
+    #[test]
+    fn oopz_import_commit_preserves_latest_non_oopz_state() {
+        let imported: SavedAccount =
+            serde_json::from_value(test_account("imported", "uid-imported")).unwrap();
+        let mut latest = AppData::default();
+        latest
+            .steam_native_switcher_exclusions
+            .insert("76561198000000000".to_string());
+        latest
+            .perfect_unavailable_account_ids
+            .insert("76561198000000001".to_string());
+        latest.config.plugin_mode_enabled = true;
+        let data = Mutex::new(latest);
+
+        commit_data_update_with(
+            &data,
+            |current| {
+                merge_imported_oopz_accounts(&mut current.accounts, std::slice::from_ref(&imported))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let committed = data.lock().unwrap();
+        assert_eq!(committed.accounts.len(), 1);
+        assert!(committed.config.plugin_mode_enabled);
+        assert!(committed
+            .steam_native_switcher_exclusions
+            .contains("76561198000000000"));
+        assert!(committed
+            .perfect_unavailable_account_ids
+            .contains("76561198000000001"));
     }
 
     #[test]

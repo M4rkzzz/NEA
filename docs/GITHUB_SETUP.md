@@ -27,8 +27,8 @@ perfect-world-arena
 
 ## 发布约定
 
-- Tag 使用 `v<major>.<minor>.<patch>`，例如 `v1.2.6`。
-- Release 标题使用 `NEA <tag>`，例如 `NEA v1.2.6`。
+- Tag 使用 `v<major>.<minor>.<patch>`，例如 `v1.2.7`。
+- Release 标题使用 `NEA <tag>`，例如 `NEA v1.2.7`。
 - 安装包使用 `NEA_<version>_x64_en-US.msi`。
 - Release 说明保存在 `.github/releases/<tag>.md`。
 - 正式发布前同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 和 README 版本。
@@ -63,7 +63,7 @@ src-tauri/target/release/bundle/msi/
 在 GitHub CLI 已登录的环境中：
 
 ```powershell
-$tag = "v1.2.6"
+$tag = "v1.2.7"
 $version = $tag.TrimStart("v")
 gh release create $tag "src-tauri/target/release/bundle/msi/NEA_${version}_x64_en-US.msi" --repo M4rkzzz/NEA --title "NEA $tag" --notes-file ".github/releases/$tag.md"
 ```

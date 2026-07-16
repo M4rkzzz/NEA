@@ -1,11 +1,11 @@
 use crate::adapters::{AccountIdentity, AppAdapter, AppInstallation};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{mpsc, Mutex, OnceLock},
     thread,
     time::Duration,
 };
@@ -13,6 +13,8 @@ use sysinfo::{ProcessRefreshKind, Signal, System, UpdateKind};
 use winreg::{enums::*, RegKey};
 
 static LOGINUSERS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static NATIVE_SWITCHER_WORKER: OnceLock<mpsc::Sender<(SteamInstallation, String)>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -327,24 +329,14 @@ impl SteamAdapter {
         } else {
             Self::suppress_accounts_from_native_switcher(&installation, &steam_ids).map(|_| ())
         };
-        thread::spawn(move || {
-            let mut system = process_system();
-            loop {
-                while steam_process_running(&system) {
-                    thread::sleep(Duration::from_secs(2));
-                    refresh_processes(&mut system);
-                }
-                // Steam may flush loginusers.vdf immediately after its last process exits,
-                // or briefly have no process while another NEA switch is starting.
-                thread::sleep(Duration::from_millis(800));
-                refresh_processes(&mut system);
-                if steam_process_running(&system) {
-                    continue;
-                }
-                let _ = Self::suppress_accounts_from_native_switcher(&installation, &steam_ids);
-                break;
-            }
+        let sender = NATIVE_SWITCHER_WORKER.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || native_switcher_worker(receiver));
+            sender
         });
+        sender
+            .send((installation, steam_id))
+            .map_err(|_| "Steam 原生账号清理任务已停止".to_string())?;
         immediate_result
     }
 
@@ -444,6 +436,93 @@ impl SteamAdapter {
             }
         }
         Err(last_error.unwrap_or_else(|| "读取 Steam 账号列表失败".to_string()))
+    }
+}
+
+fn native_switcher_worker(receiver: mpsc::Receiver<(SteamInstallation, String)>) {
+    let mut pending: HashMap<String, (SteamInstallation, HashSet<String>)> = HashMap::new();
+    loop {
+        let Ok((installation, steam_id)) = receiver.recv() else {
+            return;
+        };
+        pending
+            .entry(installation.install_dir.clone())
+            .or_insert_with(|| (installation, HashSet::new()))
+            .1
+            .insert(steam_id);
+        let mut system = process_system();
+        let mut cleanup_attempts = 0u32;
+        loop {
+            while let Ok((installation, steam_id)) = receiver.try_recv() {
+                pending
+                    .entry(installation.install_dir.clone())
+                    .or_insert_with(|| (installation, HashSet::new()))
+                    .1
+                    .insert(steam_id);
+            }
+            if steam_process_running(&system) {
+                match receiver.recv_timeout(Duration::from_secs(2)) {
+                    Ok((installation, steam_id)) => {
+                        pending
+                            .entry(installation.install_dir.clone())
+                            .or_insert_with(|| (installation, HashSet::new()))
+                            .1
+                            .insert(steam_id);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => refresh_processes(&mut system),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                continue;
+            }
+            // Steam may flush loginusers.vdf immediately after its last process exits,
+            // or briefly have no process while another NEA switch is starting.
+            match receiver.recv_timeout(Duration::from_millis(800)) {
+                Ok((installation, steam_id)) => {
+                    pending
+                        .entry(installation.install_dir.clone())
+                        .or_insert_with(|| (installation, HashSet::new()))
+                        .1
+                        .insert(steam_id);
+                    refresh_processes(&mut system);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            refresh_processes(&mut system);
+            if steam_process_running(&system) {
+                continue;
+            }
+            let batch = std::mem::take(&mut pending);
+            for (install_dir, (installation, steam_ids)) in batch {
+                if SteamAdapter::suppress_accounts_from_native_switcher(&installation, &steam_ids)
+                    .is_err()
+                {
+                    pending.insert(install_dir, (installation, steam_ids));
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            cleanup_attempts += 1;
+            if cleanup_attempts >= 5 {
+                // Keep failed work in `pending`; the next switch request will retry it.
+                break;
+            }
+            let retry_delay = Duration::from_millis(250u64 * (1u64 << (cleanup_attempts - 1)));
+            match receiver.recv_timeout(retry_delay) {
+                Ok((installation, steam_id)) => {
+                    pending
+                        .entry(installation.install_dir.clone())
+                        .or_insert_with(|| (installation, HashSet::new()))
+                        .1
+                        .insert(steam_id);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            refresh_processes(&mut system);
+        }
     }
 }
 
