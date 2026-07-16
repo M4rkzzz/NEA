@@ -215,7 +215,7 @@ type UpdateStatus = {
 };
 
 type WormholeStatus = {
-  state: "preparing" | "waiting" | "connecting" | "transferring" | "importing" | "cancelling" | "cancelled" | "complete" | "error";
+  state: "preparing" | "waiting" | "connecting" | "transferring" | "importing" | "committing" | "cancelling" | "cancelled" | "complete" | "error";
   direction: "send" | "receive";
   message: string;
   code?: string;
@@ -234,7 +234,18 @@ type QuickImportResult = {
   oopzAccounts: SavedAccount[];
   steamWebAccounts: number;
   perfectAccounts: number;
+  steamWebAdded: number;
+  steamWebUpdated: number;
+  perfectAdded: number;
+  perfectUpdated: number;
 };
+
+type QuickShareExportResult = {
+  accounts: number;
+  packageBytes: number;
+};
+
+const MAX_SHARED_PLATFORM_ACCOUNTS = 100;
 
 type AppKey = "oopz" | "steam" | "perfect";
 type FeatureKey = "overview" | "switcher";
@@ -456,9 +467,15 @@ function App() {
     const profile = perfectProfiles[session.steamId];
     return perfectAvailability(profile, data.perfectUnavailableAccountIds?.includes(session.steamId)) === "ready";
   };
-  const selectablePerfectSessions = sharePerfectAvailableOnly
-    ? shareableWebSessions.filter(isPerfectShareUsable)
-    : shareableWebSessions;
+  const isPerfectShareManuallyExcluded = (session: SteamWebSession) => Boolean(
+    session.steamId && data.perfectUnavailableAccountIds?.includes(session.steamId),
+  );
+  const selectablePerfectSessions = shareableWebSessions.filter((session) =>
+    !isPerfectShareManuallyExcluded(session) && (!sharePerfectAvailableOnly || isPerfectShareUsable(session)),
+  );
+  const shareableOopzIds = shareableOopzAccounts.map((account) => account.id);
+  const shareableWebSessionIds = shareableWebSessions.map((session) => session.id);
+  const selectablePerfectSessionIds = selectablePerfectSessions.map((session) => session.id);
   const selectedShareCount = shareSelection.oopzAccountIds.length
     + new Set([...shareSelection.steamWebSessionIds, ...shareSelection.perfectSessionIds]).size;
   const filteredPerfectSessions = useMemo(() => {
@@ -762,25 +779,95 @@ function App() {
   }
 
   function toggleShareItem(key: keyof QuickShareSelection, id: string, checked: boolean) {
-    setShareSelection((current) => ({
-      ...current,
-      [key]: checked
-        ? Array.from(new Set([...current[key], id]))
-        : current[key].filter((value) => value !== id),
-    }));
+    setShareSelection((current) => {
+      if (checked) {
+        if (key === "oopzAccountIds" && !current[key].includes(id) && current[key].length >= MAX_SHARED_PLATFORM_ACCOUNTS) {
+          setMessage(`一次最多选择 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个 OOPZ 账号`);
+          return current;
+        }
+        if (key !== "oopzAccountIds") {
+          const steamIds = new Set([...current.steamWebSessionIds, ...current.perfectSessionIds, id]);
+          if (steamIds.size > MAX_SHARED_PLATFORM_ACCOUNTS) {
+            setMessage(`一次最多选择 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个 Steam 网页或完美账号`);
+            return current;
+          }
+        }
+      }
+      return {
+        ...current,
+        [key]: checked
+          ? Array.from(new Set([...current[key], id]))
+          : current[key].filter((value) => value !== id),
+      };
+    });
   }
 
   function toggleShareBranch(key: keyof QuickShareSelection, ids: string[], checked: boolean) {
-    setShareSelection((current) => ({ ...current, [key]: checked ? ids : [] }));
+    setShareSelection((current) => {
+      const selected = checked ? cappedShareBranchSelection(key, ids, current) : [];
+      if (checked && selected.length < ids.length) {
+        setMessage(key === "oopzAccountIds"
+          ? `OOPZ 一次最多选择 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个账号`
+          : `Steam 网页与完美平台合计最多选择 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个账号`);
+      }
+      return { ...current, [key]: selected };
+    });
+  }
+
+  function cappedShareBranchSelection(
+    key: keyof QuickShareSelection,
+    ids: string[],
+    current: QuickShareSelection,
+  ) {
+    if (key === "oopzAccountIds") return ids.slice(0, MAX_SHARED_PLATFORM_ACCOUNTS);
+    const otherIds = key === "steamWebSessionIds"
+      ? current.perfectSessionIds
+      : current.steamWebSessionIds;
+    const union = new Set(otherIds);
+    const selected: string[] = [];
+    for (const id of ids) {
+      if (selected.length >= MAX_SHARED_PLATFORM_ACCOUNTS) break;
+      if (!union.has(id) && union.size >= MAX_SHARED_PLATFORM_ACCOUNTS) continue;
+      selected.push(id);
+      union.add(id);
+    }
+    return selected;
+  }
+
+  function shareBranchSelectionState(key: keyof QuickShareSelection, ids: string[]) {
+    const selected = new Set(shareSelection[key]);
+    const selectedCount = ids.reduce((count, id) => count + Number(selected.has(id)), 0);
+    return {
+      any: selectedCount > 0,
+      all: ids.length > 0 && selectedCount === ids.length,
+    };
+  }
+
+  function shareBranchCheckboxRef(
+    element: HTMLInputElement | null,
+    key: keyof QuickShareSelection,
+    ids: string[],
+  ) {
+    if (!element) return;
+    const state = shareBranchSelectionState(key, ids);
+    element.indeterminate = state.any && !state.all;
   }
 
   function selectAllShareableAccounts() {
-    const webIds = shareableWebSessions.map((session) => session.id);
+    const webIds = shareableWebSessions
+      .slice(0, MAX_SHARED_PLATFORM_ACCOUNTS)
+      .map((session) => session.id);
+    const webIdSet = new Set(webIds);
     setShareSelection({
-      oopzAccountIds: shareableOopzAccounts.map((account) => account.id),
+      oopzAccountIds: shareableOopzAccounts.slice(0, MAX_SHARED_PLATFORM_ACCOUNTS).map((account) => account.id),
       steamWebSessionIds: webIds,
-      perfectSessionIds: selectablePerfectSessions.map((session) => session.id),
+      perfectSessionIds: shareableWebSessions
+        .filter((session) => webIdSet.has(session.id) && isPerfectShareUsable(session))
+        .map((session) => session.id),
     });
+    if (shareableOopzAccounts.length > MAX_SHARED_PLATFORM_ACCOUNTS || shareableWebSessions.length > MAX_SHARED_PLATFORM_ACCOUNTS) {
+      setMessage(`OOPZ 最多分享 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个；Steam 网页与完美平台合计最多 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个`);
+    }
   }
 
   function setPerfectShareAvailableOnly(checked: boolean) {
@@ -805,25 +892,31 @@ function App() {
       const message = errorMessage(error);
       const cancelled = message.includes("已取消");
       setWormholeStatus({ state: cancelled ? "cancelled" : "error", direction: "send", message });
-      if (cancelled) {
-        setQuickCode("");
-        setQuickPackageBytes(null);
-      }
+      setQuickCode("");
+      setQuickPackageBytes(null);
       setMessage(message);
+    } finally {
+      refreshPerfectArena().catch(() => undefined);
     }
   }
 
   async function cancelQuickShare() {
+    setWormholeStatus((current) => ({
+      state: "cancelling",
+      direction: current?.direction || "send",
+      message: current?.direction === "receive" ? "正在取消导入..." : "正在取消分享...",
+      code: current?.code,
+    }));
     try {
       await invoke("cancel_quick_share");
-      setWormholeStatus((current) => ({
-        state: "cancelling",
-        direction: current?.direction || "send",
-        message: current?.direction === "receive" ? "正在取消导入..." : "正在取消分享...",
-        code: current?.code,
-      }));
     } catch (error) {
-      setMessage(errorMessage(error));
+      const message = errorMessage(error);
+      setWormholeStatus((current) => ({
+        state: "error",
+        direction: current?.direction || "send",
+        message,
+      }));
+      setMessage(message);
     }
   }
 
@@ -834,11 +927,78 @@ function App() {
       return;
     }
     setWormholeStatus({ state: "connecting", direction: "receive", message: "正在连接发送方..." });
-    const imported = await runTask("正在快捷导入...", () =>
-      invoke<QuickImportResult>("quick_import", { code }),
-    );
-    setSelectedId(imported.oopzAccounts[0]?.id ?? null);
-    setMessage(`快捷导入完成：OOPZ ${imported.oopzAccounts.length} 个、Steam 网页 ${imported.steamWebAccounts} 个、完美平台 ${imported.perfectAccounts} 个`);
+    try {
+      const imported = await runTask("正在快捷导入...", () =>
+        invoke<QuickImportResult>("quick_import", { code }),
+      );
+      setSelectedId(imported.oopzAccounts[0]?.id ?? null);
+      setReceiveCode("");
+      setMessage(formatQuickImportResult("快捷导入完成", imported));
+    } finally {
+      refreshPerfectArena().catch(() => undefined);
+    }
+  }
+
+  function formatQuickImportResult(prefix: string, imported: QuickImportResult) {
+    const details = [
+      imported.steamWebAccounts > 0 ? `Steam 网页 ${imported.steamWebAdded} 新增/${imported.steamWebUpdated} 更新` : "",
+      imported.perfectAccounts > 0 ? `完美平台 ${imported.perfectAdded} 新增/${imported.perfectUpdated} 更新（含网页登录态）` : "",
+    ].filter(Boolean).join("，");
+    return `${prefix}：OOPZ ${imported.oopzAccounts.length} 个${details ? `，${details}` : ""}`;
+  }
+
+  async function exportSharePackageFile() {
+    if (selectedShareCount === 0) {
+      setMessage("请至少选择一个可分享账号");
+      return;
+    }
+    const target = await save({
+      title: "导出跨平台账号分享包",
+      defaultPath: `NEA_账号分享_${exportTimestamp()}.nea-share`,
+      filters: [{ name: "NEA 跨平台分享包", extensions: ["nea-share"] }],
+    });
+    if (!target) return;
+    setWormholeStatus({ state: "preparing", direction: "send", message: "正在导出跨平台分享包..." });
+    try {
+      const exported = await runTask("正在导出跨平台分享包...", () =>
+        invoke<QuickShareExportResult>("export_quick_share_package_file", { selection: shareSelection, path: target }),
+        false,
+      );
+      const message = `已导出 ${exported.accounts} 个账号，文件 ${formatFileSize(exported.packageBytes)}；请仅通过可信渠道传递`;
+      setWormholeStatus({ state: "complete", direction: "send", message });
+      setMessage(message);
+    } catch (error) {
+      const message = errorMessage(error);
+      setWormholeStatus({ state: message.includes("已取消") ? "cancelled" : "error", direction: "send", message });
+      throw error;
+    } finally {
+      refreshPerfectArena().catch(() => undefined);
+    }
+  }
+
+  async function importSharePackageFile() {
+    const source = await open({
+      title: "导入跨平台账号分享包",
+      multiple: false,
+      filters: [{ name: "NEA 跨平台分享包", extensions: ["nea-share"] }],
+    });
+    if (!source || Array.isArray(source)) return;
+    setWormholeStatus({ state: "importing", direction: "receive", message: "正在校验并导入跨平台分享包..." });
+    try {
+      const imported = await runTask("正在校验并导入跨平台分享包...", () =>
+        invoke<QuickImportResult>("import_quick_share_package_file", { path: source }),
+      );
+      setSelectedId(imported.oopzAccounts[0]?.id ?? null);
+      const message = formatQuickImportResult("分享包导入完成", imported);
+      setWormholeStatus({ state: "complete", direction: "receive", message });
+      setMessage(message);
+    } catch (error) {
+      const message = errorMessage(error);
+      setWormholeStatus({ state: message.includes("已取消") ? "cancelled" : "error", direction: "receive", message });
+      throw error;
+    } finally {
+      refreshPerfectArena().catch(() => undefined);
+    }
   }
 
   async function copyText(value?: string) {
@@ -1390,9 +1550,12 @@ function App() {
       setWormholeStatus(event.payload);
       if (event.payload.code) setQuickCode(event.payload.code);
       if (typeof event.payload.packageBytes === "number") setQuickPackageBytes(event.payload.packageBytes);
-      if (event.payload.state === "cancelled") {
+      if (["cancelled", "complete", "error"].includes(event.payload.state)) {
         setQuickCode("");
         setQuickPackageBytes(null);
+      }
+      if (event.payload.direction === "receive" && event.payload.state === "complete") {
+        setReceiveCode("");
       }
       setMessage(event.payload.message);
     }));
@@ -1910,23 +2073,23 @@ function App() {
         </section>
       </div>
       {showShareCenter && (
-        <div className="confirm-backdrop share-center-backdrop" onMouseDown={() => !wormholeActive && setShowShareCenter(false)}>
+        <div className="confirm-backdrop share-center-backdrop" onMouseDown={() => !wormholeActive && !busy && setShowShareCenter(false)}>
           <div className="share-center" role="dialog" aria-modal="true" aria-labelledby="share-center-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
             <header className="share-center-header">
-              <div><h2 id="share-center-title">账号分享</h2><p>登录态属于敏感数据；默认不选择，请确认范围后再生成分享码。</p></div>
-              <button className="icon-button" onClick={() => setShowShareCenter(false)} disabled={wormholeActive} aria-label="关闭"><X size={17} /></button>
+              <div><h2 id="share-center-title">账号分享</h2><p>登录态属于敏感数据；默认不选择，可生成一次性码或导出文件自行传递。</p></div>
+              <button className="icon-button" onClick={() => setShowShareCenter(false)} disabled={wormholeActive || busy} aria-label="关闭"><X size={17} /></button>
             </header>
             <div className="share-center-toolbar">
-              <button onClick={selectAllShareableAccounts} disabled={wormholeActive}>全选可分享账号</button>
-              <button onClick={() => setShareSelection({ oopzAccountIds: [], steamWebSessionIds: [], perfectSessionIds: [] })} disabled={wormholeActive}>清空</button>
-              <span>已选择 {selectedShareCount} 个账号</span>
+              <button onClick={selectAllShareableAccounts} disabled={wormholeActive || busy}>全选可分享账号</button>
+              <button onClick={() => setShareSelection({ oopzAccountIds: [], steamWebSessionIds: [], perfectSessionIds: [] })} disabled={wormholeActive || busy}>清空</button>
+              <span title={`OOPZ 最多 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个；Steam 网页与完美平台合计最多 ${MAX_SHARED_PLATFORM_ACCOUNTS} 个`}>已选 {selectedShareCount} · OOPZ ≤ {MAX_SHARED_PLATFORM_ACCOUNTS}，Steam/完美合计 ≤ {MAX_SHARED_PLATFORM_ACCOUNTS}</span>
             </div>
             <div className="share-tree auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
               <section className="share-tree-platform">
-                <label className="share-tree-parent"><input type="checkbox" checked={shareableOopzAccounts.length > 0 && shareSelection.oopzAccountIds.length === shareableOopzAccounts.length} onChange={(event) => toggleShareBranch("oopzAccountIds", shareableOopzAccounts.map((account) => account.id), event.target.checked)} disabled={wormholeActive || shareableOopzAccounts.length === 0} /><img src="/oopz-icon.png" alt="" /><strong>OOPZ</strong><span>{shareableOopzAccounts.length} 个可分享</span></label>
+                <label className="share-tree-parent"><input type="checkbox" ref={(element) => shareBranchCheckboxRef(element, "oopzAccountIds", shareableOopzIds)} checked={shareBranchSelectionState("oopzAccountIds", shareableOopzIds).all} onChange={() => toggleShareBranch("oopzAccountIds", shareableOopzIds, !shareBranchSelectionState("oopzAccountIds", shareableOopzIds).any)} disabled={wormholeActive || busy || shareableOopzAccounts.length === 0} /><img src="/oopz-icon.png" alt="" /><strong>OOPZ</strong><span>{shareableOopzAccounts.length} 个可分享</span></label>
                 <div className="share-tree-children">
                   {shareableOopzAccounts.length === 0 && <div className="share-tree-empty">暂无可分享登录态</div>}
-                  {shareableOopzAccounts.map((account) => <label key={account.id}><input type="checkbox" checked={shareSelection.oopzAccountIds.includes(account.id)} onChange={(event) => toggleShareItem("oopzAccountIds", account.id, event.target.checked)} disabled={wormholeActive} /><span><strong>{account.displayName}</strong><small>{accountLabel(account)}</small></span></label>)}
+                  {shareableOopzAccounts.map((account) => <label key={account.id}><input type="checkbox" checked={shareSelection.oopzAccountIds.includes(account.id)} onChange={(event) => toggleShareItem("oopzAccountIds", account.id, event.target.checked)} disabled={wormholeActive || busy} /><span><strong>{account.displayName}</strong><small>{accountLabel(account)}</small></span></label>)}
                 </div>
               </section>
               <section className="share-tree-platform" data-disabled="true">
@@ -1937,24 +2100,27 @@ function App() {
                 </div>
               </section>
               <section className="share-tree-platform">
-                <label className="share-tree-parent"><input type="checkbox" checked={shareableWebSessions.length > 0 && shareSelection.steamWebSessionIds.length === shareableWebSessions.length} onChange={(event) => toggleShareBranch("steamWebSessionIds", shareableWebSessions.map((session) => session.id), event.target.checked)} disabled={wormholeActive || shareableWebSessions.length === 0} /><img src="/steam-icon.svg" alt="" /><strong>Steam 网页账号</strong><span>支持跨机器</span></label>
+                <label className="share-tree-parent"><input type="checkbox" ref={(element) => shareBranchCheckboxRef(element, "steamWebSessionIds", shareableWebSessionIds)} checked={shareBranchSelectionState("steamWebSessionIds", shareableWebSessionIds).all} onChange={() => toggleShareBranch("steamWebSessionIds", shareableWebSessionIds, !shareBranchSelectionState("steamWebSessionIds", shareableWebSessionIds).any)} disabled={wormholeActive || busy || shareableWebSessions.length === 0} /><img src="/steam-icon.svg" alt="" /><strong>Steam 网页账号</strong><span>支持跨机器</span></label>
                 <div className="share-tree-children">
-                  {shareableWebSessions.map((session) => <label key={session.id}><input type="checkbox" checked={shareSelection.steamWebSessionIds.includes(session.id)} onChange={(event) => toggleShareItem("steamWebSessionIds", session.id, event.target.checked)} disabled={wormholeActive} /><span><strong>{session.note || session.displayName}</strong><small>{session.steamId}</small></span></label>)}
+                  {shareableWebSessions.length === 0 && <div className="share-tree-empty">暂无可分享网页登录态</div>}
+                  {shareableWebSessions.map((session) => <label key={session.id}><input type="checkbox" checked={shareSelection.steamWebSessionIds.includes(session.id)} onChange={(event) => toggleShareItem("steamWebSessionIds", session.id, event.target.checked)} disabled={wormholeActive || busy} /><span><strong>{session.note || session.displayName}</strong><small>{session.steamId}</small></span></label>)}
                 </div>
               </section>
               <section className="share-tree-platform">
                 <div className="share-tree-parent share-tree-perfect-parent">
-                  <label className="share-tree-parent-select"><input type="checkbox" checked={selectablePerfectSessions.length > 0 && selectablePerfectSessions.every((session) => shareSelection.perfectSessionIds.includes(session.id))} onChange={(event) => toggleShareBranch("perfectSessionIds", selectablePerfectSessions.map((session) => session.id), event.target.checked)} disabled={wormholeActive || selectablePerfectSessions.length === 0} /><img src="/perfect-arena-icon.png" alt="" /><strong>完美对战平台</strong></label>
-                  <label className="share-available-filter"><input type="checkbox" checked={sharePerfectAvailableOnly} onChange={(event) => setPerfectShareAvailableOnly(event.target.checked)} disabled={wormholeActive} />仅选择可用账号</label>
+                  <label className="share-tree-parent-select"><input type="checkbox" ref={(element) => shareBranchCheckboxRef(element, "perfectSessionIds", selectablePerfectSessionIds)} checked={shareBranchSelectionState("perfectSessionIds", selectablePerfectSessionIds).all} onChange={() => toggleShareBranch("perfectSessionIds", selectablePerfectSessionIds, !shareBranchSelectionState("perfectSessionIds", selectablePerfectSessionIds).any)} disabled={wormholeActive || busy || selectablePerfectSessions.length === 0} /><img src="/perfect-arena-icon.png" alt="" /><strong>完美对战平台</strong></label>
+                  <label className="share-available-filter"><input type="checkbox" checked={sharePerfectAvailableOnly} onChange={(event) => setPerfectShareAvailableOnly(event.target.checked)} disabled={wormholeActive || busy} />仅选择可用账号</label>
                 </div>
                 <div className="share-tree-children">
+                  {shareableWebSessions.length === 0 && <div className="share-tree-empty">暂无可关联的 Steam 网页账号</div>}
+                  {shareableWebSessions.length > 0 && <div className="share-platform-note">完美分享会同时携带该账号的 Steam 网页登录态；导出本地完美数据时会关闭完美平台，游戏运行中将停止导出。</div>}
                   {shareableWebSessions.map((session) => {
                     const profile = perfectProfiles[session.steamId || ""];
                     const unavailable = Boolean(session.steamId && data.perfectUnavailableAccountIds?.includes(session.steamId));
                     const highRisk = Boolean(profile?.highRisk || profile?.reputationRequiresVerification);
                     const reputation = unavailable ? "不可用" : highRisk ? "高危" : profile?.reputationLevel || "待检测";
                     const disabledByFilter = sharePerfectAvailableOnly && !isPerfectShareUsable(session);
-                    return <label key={session.id} data-unavailable={unavailable || highRisk || undefined}><input type="checkbox" checked={shareSelection.perfectSessionIds.includes(session.id)} onChange={(event) => toggleShareItem("perfectSessionIds", session.id, event.target.checked)} disabled={wormholeActive || disabledByFilter} /><span><strong>{profile?.nickname || session.note || session.displayName}</strong><small>{session.steamId}</small><span className="share-perfect-meta"><b>等级分 {perfectScoreLabel(profile?.score)}</b><b>身份 {profile?.playerIdentity || "待检测"}</b><b data-danger={unavailable || highRisk || undefined}>信誉 {reputation}</b></span></span></label>;
+                    return <label key={session.id} data-unavailable={unavailable || highRisk || undefined}><input type="checkbox" checked={shareSelection.perfectSessionIds.includes(session.id)} onChange={(event) => toggleShareItem("perfectSessionIds", session.id, event.target.checked)} disabled={wormholeActive || busy || unavailable || disabledByFilter} /><span><strong>{profile?.nickname || session.note || session.displayName}</strong><small>{session.steamId}</small><span className="share-perfect-meta"><b>等级分 {perfectScoreLabel(profile?.score)}</b><b>身份 {profile?.playerIdentity || "待检测"}</b><b data-danger={unavailable || highRisk || undefined}>信誉 {reputation}</b></span></span></label>;
                   })}
                 </div>
               </section>
@@ -1965,15 +2131,20 @@ function App() {
                 {quickCode && <code className="quick-code">{quickCode}</code>}
                 {quickCode && quickPackageBytes !== null && <span className="quick-package-size">文件 {formatFileSize(quickPackageBytes)}</span>}
                 {quickCode && <button onClick={() => copyText(quickCode)}>复制代码</button>}
-                {wormholeActive && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus?.state === "cancelling"}>取消</button>}
+                {wormholeActive && wormholeStatus?.state !== "committing" && <button onClick={() => void cancelQuickShare()} disabled={wormholeStatus?.state === "cancelling"}>取消</button>}
               </div>
               <div className="quick-transfer-row">
                 <input value={receiveCode} onChange={(event) => setReceiveCode(event.target.value)} placeholder="输入对方分享码" disabled={busy || wormholeActive} />
                 <button onClick={() => handleAction(quickImport)} disabled={busy || wormholeActive || !receiveCode.trim()}>接收并导入</button>
               </div>
-              {wormholeStatus && <div className="quick-transfer-status" data-state={wormholeStatus.state}>{wormholeStatus.message}</div>}
+              <div className="quick-transfer-row share-file-transfer-row">
+                <button onClick={() => handleAction(exportSharePackageFile)} disabled={busy || wormholeActive || selectedShareCount === 0}>导出分享包</button>
+                <button onClick={() => handleAction(importSharePackageFile)} disabled={busy || wormholeActive}>导入分享包</button>
+                <span>可自行通过任意可信渠道传递 .nea-share 文件</span>
+              </div>
+              {wormholeStatus && <div className="quick-transfer-status" data-state={wormholeStatus.state} role="status" aria-live="polite" aria-atomic="true">{wormholeStatus.message}</div>}
               {wormholeStatus?.total && wormholeStatus.transferred !== undefined && <progress value={wormholeStatus.transferred} max={wormholeStatus.total} />}
-              <p className="share-dedupe-note">同一账号同时勾选 Steam 网页与完美平台时，只发送完美平台项，避免重复。</p>
+              <p className="share-dedupe-note">分享码为一次性敏感凭证，有效等待时间 10 分钟。同一账号同时勾选 Steam 网页与完美平台时，只发送完美平台项；该项仍包含完整 Steam 网页登录能力，不包含 Steam 客户端密码。.nea-share 文件落盘后不再额外加密，持有文件即可恢复其中登录态。</p>
             </div>
           </div>
         </div>

@@ -27,8 +27,8 @@ perfect-world-arena
 
 ## 发布约定
 
-- Tag 使用 `v<major>.<minor>.<patch>`，例如 `v1.2.7`。
-- Release 标题使用 `NEA <tag>`，例如 `NEA v1.2.7`。
+- Tag 使用 `v<major>.<minor>.<patch>`，例如 `v1.3.0`。
+- Release 标题使用 `NEA <tag>`，例如 `NEA v1.3.0`。
 - 安装包使用 `NEA_<version>_x64_en-US.msi`。
 - Release 说明保存在 `.github/releases/<tag>.md`。
 - 正式发布前同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 和 README 版本。
@@ -37,7 +37,7 @@ perfect-world-arena
 
 ```powershell
 pnpm install --frozen-lockfile
-pnpm run verify:full
+pnpm run verify:release
 pnpm run build:msi
 ```
 
@@ -47,25 +47,25 @@ pnpm run build:msi
 src-tauri/target/release/bundle/msi/
 ```
 
-## GitHub Actions
+## 本地构建与发布
 
-推送 `v*` Tag 会触发 `.github/workflows/release.yml`：
+本项目不使用 GitHub Actions 云端编译。MSI 必须在本地完成 `verify:release` 和构建，再把已经生成的安装包上传到 GitHub Release。发布前先创建对应的 `.github/releases/<tag>.md`。
 
-1. 安装 pnpm、Node.js 与 Rust。
-2. 运行完整验证。
-3. 构建 Windows MSI。
-4. 使用同名 Release 说明发布安装包。
-
-发布前必须先创建对应的 `.github/releases/<tag>.md`，否则工作流会主动失败，避免发布错误版本的说明。
-
-## 手动发布
-
-在 GitHub CLI 已登录的环境中：
+先提交并推送代码，再创建和推送 Tag。随后在 GitHub CLI 已登录的环境中上传本地 MSI 与校验文件：
 
 ```powershell
-$tag = "v1.2.7"
+$tag = "v1.3.0"
 $version = $tag.TrimStart("v")
-gh release create $tag "src-tauri/target/release/bundle/msi/NEA_${version}_x64_en-US.msi" --repo M4rkzzz/NEA --title "NEA $tag" --notes-file ".github/releases/$tag.md"
+$msi = Get-Item "src-tauri/target/release/bundle/msi/NEA_${version}_x64_en-US.msi"
+$hash = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+"$hash  $($msi.Name)" | Set-Content -LiteralPath "$($msi.FullName).sha256" -Encoding ascii
+gh release create $tag $msi.FullName "$($msi.FullName).sha256" --repo M4rkzzz/NEA --verify-tag --title "NEA $tag" --notes-file ".github/releases/$tag.md"
+```
+
+替换已有 Release 中的本地 MSI：
+
+```powershell
+gh release upload $tag $msi.FullName "$($msi.FullName).sha256" --repo M4rkzzz/NEA --clobber
 ```
 
 旧版安装包名、数据目录、凭据服务、快捷方式和 `.oopz+` 文件只保留在兼容迁移代码中，不再作为当前发布名称使用。

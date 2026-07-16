@@ -327,6 +327,7 @@ button.primary.danger-confirm:hover:not(:disabled) {
 
 .share-center-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 10px 20px;
@@ -476,6 +477,16 @@ button.primary.danger-confirm:hover:not(:disabled) {
 
 .share-tree-empty {
   padding: 10px 0;
+}
+
+.share-platform-note {
+  margin: 2px 0 7px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: #f5f7f9;
+  color: #66737b;
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .share-center-transfer {
@@ -1748,6 +1759,16 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   white-space: nowrap;
 }
 
+.share-file-transfer-row {
+  padding-top: 2px;
+}
+
+.share-file-transfer-row span {
+  min-width: 0;
+  color: #7a858c;
+  font-size: 11px;
+}
+
 .quick-code {
   min-width: 0;
   flex: 1;
@@ -1843,6 +1864,11 @@ html[data-theme="dark"] .perfect-card-menu {
   color: #e4e8eb;
 }
 
+html[data-theme="dark"] .share-platform-note {
+  background: #292929;
+  color: #a9b1b7;
+}
+
 html[data-theme="dark"] .panel,
 html[data-theme="dark"] .account-row,
 html[data-theme="dark"] .perfect-account-card {
@@ -1911,6 +1937,18 @@ html[data-theme="dark"] .plugin-health,
 html[data-theme="dark"] .quick-transfer-status,
 html[data-theme="dark"] .account-main small,
 html[data-theme="dark"] .perfect-card-name small {
+  color: #a6a6a6;
+}
+
+html[data-theme="dark"] .quick-transfer-status[data-state="error"] {
+  color: #f87171;
+}
+
+html[data-theme="dark"] .quick-transfer-status[data-state="complete"] {
+  color: #4ade80;
+}
+
+html[data-theme="dark"] .quick-transfer-status[data-state="cancelled"] {
   color: #a6a6a6;
 }
 

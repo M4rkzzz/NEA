@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
-use futures::{future::pending, stream, AsyncWriteExt, StreamExt};
+use futures::{future::pending, stream, AsyncWriteExt, StreamExt, TryStreamExt};
 use keyring::Entry;
 use magic_wormhole::{transfer, transit, Code, MailboxConnection, Wormhole};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -91,6 +91,7 @@ const MAX_EXPORT_ACCOUNTS: usize = 100;
 const MAX_EXPORT_FILES: usize = 100_000;
 const WORMHOLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 const WORMHOLE_CODE_WORDS: usize = 4;
+const NEA_FREE_TRANSIT_RELAY: &str = "tcp://relay.mw.leastauthority.com:4001";
 const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 const PERFECT_AVATAR_CACHE_MARKER: &str = "nea-cache://perfect-avatar";
@@ -384,6 +385,7 @@ const MAX_SHARED_WEB_SESSIONS: usize = 100;
 const MAX_SHARED_COOKIES_PER_SESSION: usize = 256;
 const MAX_SHARED_COOKIE_BYTES: usize = 16 * 1024;
 const MAX_SHARE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const STEAM_ID64_INDIVIDUAL_BASE: u64 = 76_561_197_960_265_728;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -425,6 +427,17 @@ struct QuickImportResult {
     oopz_accounts: Vec<SavedAccount>,
     steam_web_accounts: usize,
     perfect_accounts: usize,
+    steam_web_added: usize,
+    steam_web_updated: usize,
+    perfect_added: usize,
+    perfect_updated: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickShareExportResult {
+    accounts: usize,
+    package_bytes: u64,
 }
 
 struct PreparedQuickImport {
@@ -432,6 +445,36 @@ struct PreparedQuickImport {
     manifest: NeaShareManifest,
     oopz_package: Option<PathBuf>,
     perfect_files: Vec<(String, String, PathBuf)>,
+}
+
+struct StagedQuickWebSession {
+    item: SharedWebSession,
+    session: steam::SteamWebSession,
+    stage_dir: PathBuf,
+    target_dir: PathBuf,
+    target_existed: bool,
+    perfect_existed: bool,
+}
+
+struct AppliedSharePath {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickShareRollbackPath {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickShareRollbackJournal {
+    affected_steam_ids: Vec<String>,
+    web_sessions: Vec<steam::SteamWebSession>,
+    perfect_profiles: HashMap<String, perfect_arena::PerfectArenaProfile>,
+    paths: Vec<QuickShareRollbackPath>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,6 +519,33 @@ struct AppState {
     steam_capability_paused: AtomicBool,
     steam_capability_cancelled: AtomicBool,
     main_webview_low_memory: AtomicBool,
+}
+
+fn initial_app_state() -> AppState {
+    AppState {
+        data: Mutex::new(load_data()),
+        account_operation: Mutex::new(()),
+        switch_operation: Mutex::new(()),
+        switch_running: AtomicBool::new(false),
+        discovery_cancelled: AtomicBool::new(false),
+        auto_import_running: AtomicBool::new(false),
+        plugin_operation: Mutex::new(()),
+        plugin_environment_running: AtomicBool::new(false),
+        overlay_rebind_requested: AtomicBool::new(false),
+        overlay_dragging: AtomicBool::new(false),
+        update_running: AtomicBool::new(false),
+        update_status: Mutex::new(initial_update_status()),
+        wormhole_running: AtomicBool::new(false),
+        wormhole_cancelled: AtomicBool::new(false),
+        steam_web_import_running: AtomicBool::new(false),
+        steam_bulk_import_running: AtomicBool::new(false),
+        steam_bulk_import_cancelled: AtomicBool::new(false),
+        steam_import_duplicate_sessions: Mutex::new(HashMap::new()),
+        steam_capability_running: AtomicBool::new(false),
+        steam_capability_paused: AtomicBool::new(false),
+        steam_capability_cancelled: AtomicBool::new(false),
+        main_webview_low_memory: AtomicBool::new(false),
+    }
 }
 
 struct SwitchActivityGuard {
@@ -2887,6 +2957,32 @@ fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn is_safe_account_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
+fn validate_exported_oopz_identity(
+    account: &ExportedAccount,
+    oopz_login: &str,
+) -> Result<String, String> {
+    let uid = account
+        .uid
+        .as_deref()
+        .filter(|uid| is_safe_account_component(uid))
+        .ok_or_else(|| "导入包包含无效 OOPZ UID".to_string())?;
+    let login_uid = uid_from_registry_login(oopz_login)
+        .filter(|login_uid| is_safe_account_component(login_uid))
+        .ok_or_else(|| "导入包中的 OOPZ 登录状态无法识别账号".to_string())?;
+    if login_uid != uid {
+        return Err("导入包中的 OOPZ 登录状态与账号 UID 不匹配".to_string());
+    }
+    Ok(uid.to_string())
+}
+
 fn write_export_files(root: &Path, files: &[ExportedFile]) -> Result<(), String> {
     let parent = root.parent().ok_or_else(|| "账号目录无效".to_string())?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -4381,6 +4477,9 @@ fn optimize_storage_inner(app: &AppHandle) -> Result<StorageOptimizationResult, 
         let Some(session_id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        if session_id.starts_with("share-stage-") {
+            continue;
+        }
         if app
             .get_webview_window(&steam_web_window_label(&session_id))
             .is_some()
@@ -4408,6 +4507,7 @@ fn optimize_storage_inner(app: &AppHandle) -> Result<StorageOptimizationResult, 
 
 #[tauri::command]
 async fn optimize_storage(app: AppHandle) -> Result<StorageOptimizationResult, String> {
+    let _steam_operation = acquire_steam_web_import(&app)?;
     tauri::async_runtime::spawn_blocking(move || optimize_storage_inner(&app))
         .await
         .map_err(|error| error.to_string())?
@@ -4416,6 +4516,9 @@ async fn optimize_storage(app: AppHandle) -> Result<StorageOptimizationResult, S
 fn schedule_storage_maintenance(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_secs(2));
+        let Ok(_steam_operation) = acquire_steam_web_import(&app) else {
+            return;
+        };
         if let Ok(result) = optimize_storage_inner(&app) {
             let _ = app.emit("storage-optimized", result);
         }
@@ -7347,16 +7450,19 @@ fn collect_export_paths(
     current: &Path,
     files: &mut Vec<(PathBuf, String, u64)>,
     total_size: &mut u64,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
+    ensure_share_packaging_not_cancelled(cancelled)?;
     if !current.exists() {
         return Ok(());
     }
     for entry in fs::read_dir(current).map_err(|e| e.to_string())? {
+        ensure_share_packaging_not_cancelled(cancelled)?;
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if file_type.is_dir() {
-            collect_export_paths(root, &path, files, total_size)?;
+            collect_export_paths(root, &path, files, total_size, cancelled)?;
         } else if file_type.is_file() {
             if files.len() >= MAX_EXPORT_FILES {
                 return Err("导出文件数量过多".to_string());
@@ -7380,7 +7486,41 @@ fn collect_export_paths(
     Ok(())
 }
 
-fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(), String> {
+fn ensure_share_packaging_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+        Err(QUICK_SHARE_CANCELLED.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_with_share_cancellation_buffer<R: Read, W: Write>(
+    source: &mut R,
+    target: &mut W,
+    cancelled: Option<&AtomicBool>,
+    buffer: &mut [u8],
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    loop {
+        ensure_share_packaging_not_cancelled(cancelled)?;
+        let read = source.read(buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(total);
+        }
+        target
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| "分享包数据大小溢出".to_string())?;
+    }
+}
+
+fn write_export_package_v3(
+    path: &Path,
+    accounts: &[SavedAccount],
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -7398,11 +7538,24 @@ fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(),
     let mut account_files = Vec::with_capacity(accounts.len());
     let mut total_size = 0u64;
     for (index, account) in accounts.iter().enumerate() {
+        ensure_share_packaging_not_cancelled(cancelled)?;
         let oopz_login = read_oopz_login(&account.id)
             .ok_or_else(|| format!("{} 还不能导出，请先登录一次", account.display_name))?;
+        validate_exported_oopz_identity(
+            &ExportedAccount {
+                display_name: account.display_name.clone(),
+                uid: account.uid.clone(),
+                pid: account.pid.clone(),
+                user_common_id: account.user_common_id.clone(),
+                masked_phone: account.masked_phone.clone(),
+                avatar_url: account.avatar_url.clone(),
+                note: account.note.clone(),
+            },
+            &oopz_login,
+        )?;
         let snapshot = account_snapshot_dir(&account.id)?;
         let mut files = Vec::new();
-        collect_export_paths(&snapshot, &snapshot, &mut files, &mut total_size)?;
+        collect_export_paths(&snapshot, &snapshot, &mut files, &mut total_size, cancelled)?;
         if files.is_empty() {
             return Err(format!("{} 没有可导出的本地数据", account.display_name));
         }
@@ -7427,6 +7580,7 @@ fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(),
         let file = fs::File::create(&temp).map_err(|e| format!("创建导出文件失败: {}", e))?;
         let mut archive = ZipWriter::new(file);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut copy_buffer = vec![0u8; 256 * 1024];
         archive
             .start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
@@ -7439,11 +7593,17 @@ fn write_export_package_v3(path: &Path, accounts: &[SavedAccount]) -> Result<(),
         serde_json::to_writer(&mut archive, &manifest).map_err(|e| e.to_string())?;
         for (directory, files) in account_files {
             for (source, relative, _) in files {
+                ensure_share_packaging_not_cancelled(cancelled)?;
                 archive
                     .start_file(format!("accounts/{}/{}", directory, relative), options)
                     .map_err(|e| e.to_string())?;
                 let mut source = fs::File::open(source).map_err(|e| e.to_string())?;
-                std::io::copy(&mut source, &mut archive).map_err(|e| e.to_string())?;
+                copy_with_share_cancellation_buffer(
+                    &mut source,
+                    &mut archive,
+                    cancelled,
+                    &mut copy_buffer,
+                )?;
             }
         }
         archive.finish().map_err(|e| e.to_string())?;
@@ -7503,7 +7663,7 @@ fn export_account_package_inner(
         return Err(format!("一次最多导出 {} 个账号", MAX_EXPORT_ACCOUNTS));
     }
     let count = accounts.len();
-    write_export_package_v3(path, &accounts)?;
+    write_export_package_v3(path, &accounts, None)?;
     Ok(count)
 }
 
@@ -7578,10 +7738,9 @@ fn read_export_package(path: &Path) -> Result<Vec<ExportedAccountEntry>, String>
         {
             return Err("导入文件缺少账号数据".to_string());
         }
-        if let Some(uid) = entry.account.uid.as_deref() {
-            if !uids.insert(uid) {
-                return Err("导入包包含重复账号".to_string());
-            }
+        let uid = validate_exported_oopz_identity(&entry.account, &entry.oopz_login)?;
+        if !uids.insert(uid) {
+            return Err("导入包包含重复账号".to_string());
         }
         for file in &entry.files {
             safe_relative_path(&file.path)?;
@@ -7898,6 +8057,7 @@ fn prepare_legacy_import(
 ) -> Result<Vec<PreparedImportAccount>, String> {
     let mut prepared = Vec::with_capacity(packages.len());
     for package in packages {
+        validate_exported_oopz_identity(&package.account, &package.oopz_login)?;
         let account = imported_account_from_export(data, package.account);
         let staged_snapshot = root.join("staging").join(&account.id).join("snapshot");
         write_export_files(&staged_snapshot, &package.files)?;
@@ -7948,6 +8108,7 @@ fn prepare_v3_import(
     let mut account_ids = HashSet::new();
     let mut prepared = Vec::with_capacity(manifest.accounts.len());
     for item in manifest.accounts {
+        let uid = validate_exported_oopz_identity(&item.account, &item.oopz_login)?;
         if item.directory.is_empty()
             || !item
                 .directory
@@ -7959,12 +8120,7 @@ fn prepare_v3_import(
         {
             return Err("v3 导入清单包含无效账号".to_string());
         }
-        if item
-            .account
-            .uid
-            .as_ref()
-            .is_some_and(|uid| !imported_uids.insert(uid.clone()))
-        {
+        if !imported_uids.insert(uid) {
             return Err("v3 导入清单包含重复账号".to_string());
         }
         let account = imported_account_from_export(data, item.account);
@@ -8135,16 +8291,302 @@ fn emit_wormhole_status_with_package_size(
 }
 
 fn wormhole_relay_hints() -> Result<Vec<transit::RelayHint>, String> {
-    let relay_url = transit::DEFAULT_RELAY_SERVER
+    let relay_url = NEA_FREE_TRANSIT_RELAY
         .parse()
-        .map_err(|e| format!("公共中继地址无效: {}", e))?;
-    let hint = transit::RelayHint::from_urls(None, [relay_url])
-        .map_err(|e| format!("公共中继配置失败: {}", e))?;
-    Ok(vec![hint])
+        .map_err(|e| format!("免费中继地址无效: {}", e))?;
+    let preferred =
+        transit::RelayHint::from_urls(Some("Winden / Least Authority".to_string()), [relay_url])
+            .map_err(|e| format!("免费中继配置失败: {}", e))?;
+    Ok(vec![preferred])
 }
 
 fn wormhole_temp_package(prefix: &str, extension: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}-{}.{}", prefix, Uuid::new_v4(), extension))
+}
+
+fn is_stale_share_artifact(path: &Path) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= Duration::from_secs(2 * 60 * 60))
+}
+
+fn matches_uuid_artifact(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+}
+
+fn write_quick_share_rollback_journal(
+    root: &Path,
+    journal: &QuickShareRollbackJournal,
+) -> Result<(), String> {
+    let path = root.join("rollback-journal.json");
+    let temp = root.join("rollback-journal.json.tmp");
+    let backup = root.join("rollback-journal.json.bak");
+    let raw = serde_json::to_vec_pretty(journal).map_err(|error| error.to_string())?;
+    fs::write(&temp, raw).map_err(|error| format!("写入分享回滚记录失败: {error}"))?;
+    if path.exists() {
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|error| format!("清理旧分享回滚记录失败: {error}"))?;
+        }
+        fs::rename(&path, &backup).map_err(|error| format!("备份分享回滚记录失败: {error}"))?;
+    }
+    if let Err(error) = fs::rename(&temp, &path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &path);
+        }
+        let _ = fs::remove_file(&temp);
+        return Err(format!("提交分享回滚记录失败: {error}"));
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn record_quick_share_rollback_path(
+    root: &Path,
+    journal: &mut QuickShareRollbackJournal,
+    target: &Path,
+    backup: Option<PathBuf>,
+) -> Result<usize, String> {
+    let index = journal.paths.len();
+    journal.paths.push(QuickShareRollbackPath {
+        target: target.to_path_buf(),
+        backup,
+    });
+    if let Err(error) = write_quick_share_rollback_journal(root, journal) {
+        journal.paths.pop();
+        return Err(error);
+    }
+    Ok(index)
+}
+
+fn apply_quick_share_data_rollback(
+    current: &mut AppData,
+    affected_steam_ids: &HashSet<String>,
+    web_sessions: &[steam::SteamWebSession],
+    perfect_profiles: &HashMap<String, perfect_arena::PerfectArenaProfile>,
+) {
+    current.steam.web_sessions.retain(|session| {
+        !session
+            .steam_id
+            .as_ref()
+            .is_some_and(|steam_id| affected_steam_ids.contains(steam_id))
+    });
+    current
+        .steam
+        .web_sessions
+        .extend(web_sessions.iter().cloned());
+    for steam_id in affected_steam_ids {
+        if let Some(profile) = perfect_profiles.get(steam_id) {
+            current
+                .perfect_profiles
+                .insert(steam_id.clone(), profile.clone());
+        } else {
+            current.perfect_profiles.remove(steam_id);
+        }
+    }
+    reconcile_steam_identities(current);
+}
+
+fn valid_quick_share_recovery_target(target: &Path, affected_steam_ids: &HashSet<String>) -> bool {
+    let web_root = storage_dir()
+        .ok()
+        .map(|root| root.join("workspaces").join("steam").join("web-sessions"));
+    if web_root.as_deref() == target.parent() {
+        return target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(valid_storage_id);
+    }
+    let Some(database_dir) = perfect_arena::account_database_dir() else {
+        return false;
+    };
+    if target.parent() != Some(database_dir.as_path()) {
+        return false;
+    }
+    let Some(file_name) = target.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    affected_steam_ids.iter().any(|steam_id| {
+        perfect_share_file_names(steam_id)
+            .iter()
+            .any(|allowed| allowed == file_name)
+    })
+}
+
+fn recover_quick_share_transaction(root: &Path) -> Result<(), String> {
+    if root.join("committed").is_file() {
+        fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let journal = [
+        root.join("rollback-journal.json"),
+        root.join("rollback-journal.json.bak"),
+        root.join("rollback-journal.json.tmp"),
+    ]
+    .into_iter()
+    .find_map(|path| {
+        fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<QuickShareRollbackJournal>(&raw).ok())
+    })
+    .ok_or_else(|| "分享回滚记录缺失或损坏".to_string())?;
+    let affected_steam_ids = journal
+        .affected_steam_ids
+        .iter()
+        .filter(|steam_id| validate_shared_steam_id(steam_id))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if affected_steam_ids.len() != journal.affected_steam_ids.len() {
+        return Err("分享回滚记录包含无效 SteamID".to_string());
+    }
+    if journal.web_sessions.iter().any(|session| {
+        !valid_storage_id(&session.id)
+            || !session
+                .steam_id
+                .as_ref()
+                .is_some_and(|steam_id| affected_steam_ids.contains(steam_id))
+    }) || journal.perfect_profiles.iter().any(|(steam_id, profile)| {
+        !affected_steam_ids.contains(steam_id) || profile.steam_id != *steam_id
+    }) {
+        return Err("分享回滚记录中的账号数据无效".to_string());
+    }
+    let has_perfect_targets = perfect_arena::account_database_dir().is_some_and(|database_dir| {
+        journal
+            .paths
+            .iter()
+            .any(|path| path.target.parent() == Some(database_dir.as_path()))
+    });
+    if has_perfect_targets {
+        perfect_arena::stop_for_share_transfer()?;
+    }
+    for (index, path) in journal.paths.iter().enumerate().rev() {
+        if !valid_quick_share_recovery_target(&path.target, &affected_steam_ids) {
+            return Err("分享回滚记录包含不安全目标路径".to_string());
+        }
+        if let Some(backup) = &path.backup {
+            let expected = root.join("rollback").join(format!("item-{index}"));
+            if backup != &expected {
+                return Err("分享回滚记录包含不安全备份路径".to_string());
+            }
+            if backup.exists() {
+                if path.target.exists() {
+                    remove_share_path_checked(&path.target)
+                        .map_err(|error| format!("清理半提交分享数据失败: {error}"))?;
+                }
+                if let Some(parent) = path.target.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                rename_share_path(backup, &path.target, "恢复异常退出前分享数据失败")?;
+            }
+        } else if path.target.exists() {
+            remove_share_path_checked(&path.target)
+                .map_err(|error| format!("清理异常退出新增分享数据失败: {error}"))?;
+        }
+    }
+    let mut data = load_data();
+    apply_quick_share_data_rollback(
+        &mut data,
+        &affected_steam_ids,
+        &journal.web_sessions,
+        &journal.perfect_profiles,
+    );
+    save_data(&data)?;
+    fs::remove_dir_all(root).map_err(|error| format!("清理已恢复分享事务失败: {error}"))
+}
+
+fn recover_quick_share_transactions() {
+    let Ok(recovery_root) = storage_dir().map(|root| root.join("recovery")) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(recovery_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || !matches_uuid_artifact(&name, "share-import-", "") {
+            continue;
+        }
+        let has_journal = [
+            "rollback-journal.json",
+            "rollback-journal.json.bak",
+            "rollback-journal.json.tmp",
+        ]
+        .iter()
+        .any(|name| path.join(name).is_file());
+        if has_journal || path.join("committed").is_file() {
+            if let Err(error) = recover_quick_share_transaction(&path) {
+                eprintln!("NEA 分享事务恢复失败（{}）：{}", path.display(), error);
+            }
+        }
+    }
+}
+
+fn cleanup_stale_share_artifacts() {
+    if let Ok(entries) = fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let transfer_file = path.is_file()
+                && (matches_uuid_artifact(&name, "nea-share-", ".nea")
+                    || matches_uuid_artifact(&name, "nea-share-", ".nea-share")
+                    || matches_uuid_artifact(&name, "nea-receive-", ".nea")
+                    || matches_uuid_artifact(&name, "nea-receive-", ".nea-share"));
+            let import_directory = path.is_dir()
+                && matches_uuid_artifact(&name, "nea-share-import-", "")
+                && (!directory_has_entries(&path.join("rollback"))
+                    || path.join("committed").is_file());
+            if (transfer_file || import_directory) && is_stale_share_artifact(&path) {
+                remove_share_path(&path);
+            }
+        }
+    }
+    if let Ok(recovery_root) = storage_dir().map(|root| root.join("recovery")) {
+        if let Ok(entries) = fs::read_dir(recovery_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !path.is_dir() || !matches_uuid_artifact(&name, "share-import-", "") {
+                    continue;
+                }
+                let has_journal = [
+                    "rollback-journal.json",
+                    "rollback-journal.json.bak",
+                    "rollback-journal.json.tmp",
+                ]
+                .iter()
+                .any(|file| path.join(file).is_file());
+                let safe_to_remove = path.join("committed").is_file() || !has_journal;
+                if safe_to_remove && is_stale_share_artifact(&path) {
+                    remove_share_path(&path);
+                }
+            }
+        }
+    }
+    let Ok(root) =
+        storage_dir().map(|root| root.join("workspaces").join("steam").join("web-sessions"))
+    else {
+        return;
+    };
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("share-stage-")
+                .is_some_and(|value| Uuid::parse_str(value).is_ok())
+                && is_stale_share_artifact(&path)
+            {
+                remove_share_path(&path);
+            }
+        }
+    }
 }
 
 async fn wait_for_quick_share_cancel(app: AppHandle) {
@@ -8185,25 +8627,142 @@ fn collect_web_session_cookies(
         .cookies()
         .map_err(|error| format!("读取 {} 的网页登录态失败: {}", session.display_name, error))?
         .into_iter()
-        .filter(is_allowed_steam_cookie)
+        .filter(is_required_steam_share_cookie)
         .map(|cookie| cookie.to_string())
         .collect::<Vec<_>>();
     if temporary {
         let _ = window.destroy();
     }
-    if !result
+    let expected_steam_id = session
+        .steam_id
+        .as_deref()
+        .filter(|steam_id| validate_shared_steam_id(steam_id))
+        .ok_or_else(|| format!("{} 缺少有效 SteamID", session.display_name))?;
+    let login_cookies = result
         .iter()
-        .any(|cookie| cookie.to_ascii_lowercase().starts_with("steamloginsecure="))
+        .filter_map(|raw| Cookie::parse(raw.clone()).ok())
+        .filter(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
+        .collect::<Vec<_>>();
+    if login_cookies.is_empty()
+        || login_cookies.iter().any(|cookie| {
+            steam_id_from_web_cookie(cookie.value()).as_deref() != Some(expected_steam_id)
+        })
     {
         return Err(format!(
-            "{} 的 Steam 网页登录态已失效",
+            "{} 的 Steam 网页登录态已失效或与账号不匹配",
             session.display_name
         ));
     }
     Ok(result)
 }
 
-fn is_allowed_steam_cookie(cookie: &Cookie<'_>) -> bool {
+fn steam_account_id_from_store_html(raw: &str) -> Option<u32> {
+    let value = raw.split_once("var g_AccountID =")?.1.trim_start();
+    let digits = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn steam_store_cookie_header(cookies: &[String]) -> Result<String, String> {
+    let host = "store.steampowered.com";
+    let mut selected = HashMap::<String, (usize, String)>::new();
+    for raw in cookies {
+        let cookie = Cookie::parse(raw.clone())
+            .map_err(|_| "Steam 网页 Cookie 格式无效".to_string())?
+            .into_owned();
+        if !is_required_steam_share_cookie(&cookie) {
+            continue;
+        }
+        let Some(domain) = cookie.domain().map(|domain| domain.trim_start_matches('.')) else {
+            continue;
+        };
+        if host != domain && !host.ends_with(&format!(".{domain}")) {
+            continue;
+        }
+        let key = cookie.name().to_ascii_lowercase();
+        let candidate = (
+            domain.len(),
+            format!("{}={}", cookie.name(), cookie.value()),
+        );
+        if selected
+            .get(&key)
+            .is_none_or(|current| candidate.0 >= current.0)
+        {
+            selected.insert(key, candidate);
+        }
+    }
+    if !selected.contains_key("steamloginsecure") {
+        return Err("分享包缺少 Steam 商店网页登录 Cookie".to_string());
+    }
+    let mut values = selected
+        .into_values()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    Ok(values.join("; "))
+}
+
+async fn verify_shared_steam_session_online(
+    client: &reqwest::Client,
+    cookies: &[String],
+    expected_steam_id: &str,
+) -> Result<(), String> {
+    let expected_account_id = expected_steam_id
+        .parse::<u64>()
+        .ok()
+        .and_then(|steam_id| steam_id.checked_sub(STEAM_ID64_INDIVIDUAL_BASE))
+        .and_then(|account_id| u32::try_from(account_id).ok())
+        .filter(|account_id| *account_id != 0)
+        .ok_or_else(|| format!("SteamID {expected_steam_id} 无效"))?;
+    let cookie_header = steam_store_cookie_header(cookies)?;
+    let response = client
+        .get(STEAM_WEB_ACCOUNT_URL)
+        .header(
+            reqwest::header::USER_AGENT,
+            "NEA/1.2 Steam session verifier",
+        )
+        .header(reqwest::header::COOKIE, cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("联网校验 Steam 网页登录态失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Steam 网页登录态校验请求失败: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > 2 * 1024 * 1024)
+    {
+        return Err("Steam 网页登录态校验响应异常".to_string());
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取 Steam 登录态校验响应失败: {error}"))?;
+    if body.len() > 2 * 1024 * 1024 {
+        return Err("Steam 网页登录态校验响应异常".to_string());
+    }
+    let body = String::from_utf8_lossy(&body);
+    let account_id = steam_account_id_from_store_html(&body)
+        .ok_or_else(|| "Steam 网页登录态已失效或无法确认账号".to_string())?;
+    if account_id != expected_account_id {
+        return Err(format!(
+            "Steam 网页登录态与 SteamID {expected_steam_id} 不匹配"
+        ));
+    }
+    Ok(())
+}
+
+fn shared_steam_verifier_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|error| format!("创建 Steam 登录态校验请求失败: {error}"))
+}
+
+fn is_steam_cookie_domain_allowed(cookie: &Cookie<'_>) -> bool {
     cookie.domain().is_some_and(|domain| {
         let domain = domain.trim_start_matches('.').to_ascii_lowercase();
         domain == "steampowered.com"
@@ -8213,10 +8772,17 @@ fn is_allowed_steam_cookie(cookie: &Cookie<'_>) -> bool {
     })
 }
 
-fn prepare_quick_share_material(
-    app: &AppHandle,
+fn is_required_steam_share_cookie(cookie: &Cookie<'_>) -> bool {
+    is_steam_cookie_domain_allowed(cookie)
+        && matches!(
+            cookie.name().to_ascii_lowercase().as_str(),
+            "steamloginsecure" | "steamrefresh_steam" | "steamrememberlogin" | "sessionid"
+        )
+}
+
+fn normalized_quick_share_selection(
     selection: &QuickShareSelection,
-) -> Result<(Vec<SavedAccount>, Vec<SharedWebSession>), String> {
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let perfect_ids = selection
         .perfect_session_ids
         .iter()
@@ -8233,13 +8799,28 @@ fn prepare_quick_share_material(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    (oopz_ids, web_ids, perfect_ids)
+}
+
+fn prepare_quick_share_material(
+    app: &AppHandle,
+    selection: &QuickShareSelection,
+) -> Result<(Vec<SavedAccount>, Vec<SharedWebSession>), String> {
+    ensure_share_packaging_not_cancelled(Some(&app.state::<AppState>().wormhole_cancelled))?;
+    let (oopz_ids, web_ids, perfect_ids) = normalized_quick_share_selection(selection);
     if oopz_ids.is_empty() && web_ids.is_empty() && perfect_ids.is_empty() {
         return Err("请至少选择一个可分享账号".to_string());
     }
-    if !perfect_ids.is_empty() {
-        perfect_arena::stop_for_share_transfer()?;
+    if oopz_ids.len() > MAX_EXPORT_ACCOUNTS {
+        return Err(format!("一次最多分享 {} 个 OOPZ 账号", MAX_EXPORT_ACCOUNTS));
     }
-    let (oopz_accounts, sessions, profiles, unavailable_ids) = {
+    if web_ids.len() + perfect_ids.len() > MAX_SHARED_WEB_SESSIONS {
+        return Err(format!(
+            "一次最多分享 {} 个 Steam 网页或完美账号",
+            MAX_SHARED_WEB_SESSIONS
+        ));
+    }
+    let (oopz_accounts, sessions, profiles) = {
         let state = app.state::<AppState>();
         let data = state.data.lock().map_err(|error| error.to_string())?;
         let oopz_accounts = data
@@ -8255,12 +8836,7 @@ fn prepare_quick_share_material(
             .filter(|session| web_ids.contains(&session.id) || perfect_ids.contains(&session.id))
             .cloned()
             .collect::<Vec<_>>();
-        (
-            oopz_accounts,
-            sessions,
-            data.perfect_profiles.clone(),
-            data.perfect_unavailable_account_ids.clone(),
-        )
+        (oopz_accounts, sessions, data.perfect_profiles.clone())
     };
     if oopz_accounts.len() != oopz_ids.len() {
         return Err("所选 OOPZ 账号包含不可分享或不存在的登录态".to_string());
@@ -8268,8 +8844,12 @@ fn prepare_quick_share_material(
     if sessions.len() != web_ids.len() + perfect_ids.len() {
         return Err("所选 Steam 网页账号不存在".to_string());
     }
+    if !perfect_ids.is_empty() {
+        perfect_arena::stop_for_share_transfer()?;
+    }
     let mut shared_sessions = Vec::with_capacity(sessions.len());
     for session in sessions {
+        ensure_share_packaging_not_cancelled(Some(&app.state::<AppState>().wormhole_cancelled))?;
         let steam_id = session
             .steam_id
             .clone()
@@ -8283,15 +8863,33 @@ fn prepare_quick_share_material(
                         .and_then(|name| name.to_str())
                         .map(str::to_string)
                 })
+                .filter(|file_name| is_valid_perfect_share_file_name(&steam_id, file_name))
                 .collect()
         } else {
             Vec::new()
         };
+        if perfect {
+            validate_perfect_share_file_set(&steam_id, &perfect_files)?;
+        }
+        let cookies = collect_web_session_cookies(app, &session)?;
+        ensure_share_packaging_not_cancelled(Some(&app.state::<AppState>().wormhole_cancelled))?;
+        if cookies.is_empty()
+            || cookies.len() > MAX_SHARED_COOKIES_PER_SESSION
+            || cookies
+                .iter()
+                .any(|cookie| cookie.is_empty() || cookie.len() > MAX_SHARED_COOKIE_BYTES)
+        {
+            return Err(format!(
+                "{} 的 Steam 网页 Cookie 超过分享限制",
+                session.display_name
+            ));
+        }
         shared_sessions.push(SharedWebSession {
             kind: if perfect { "perfect" } else { "steam-web" }.to_string(),
-            cookies: collect_web_session_cookies(app, &session)?,
+            cookies,
             perfect_profile: perfect.then(|| profiles.get(&steam_id).cloned()).flatten(),
-            perfect_unavailable: perfect && unavailable_ids.contains(&steam_id),
+            // “不可用”是本机人工分类，不应随登录态传播到其他设备。
+            perfect_unavailable: false,
             perfect_files,
             session,
         });
@@ -8303,57 +8901,113 @@ fn write_quick_share_package(
     path: &Path,
     oopz_accounts: &[SavedAccount],
     web_sessions: &[SharedWebSession],
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
+    if oopz_accounts.len() > MAX_EXPORT_ACCOUNTS || web_sessions.len() > MAX_SHARED_WEB_SESSIONS {
+        return Err("分享账号数量超过限制".to_string());
+    }
     let oopz_package = path.with_extension(format!("{}.oopz.tmp", Uuid::new_v4()));
     if !oopz_accounts.is_empty() {
-        write_export_package_v3(&oopz_package, oopz_accounts)?;
+        write_export_package_v3(&oopz_package, oopz_accounts, cancelled)?;
     }
     let result = (|| -> Result<(), String> {
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: !oopz_accounts.is_empty(),
+            web_sessions: web_sessions.to_vec(),
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
+        if manifest_bytes.is_empty() || manifest_bytes.len() as u64 > MAX_SHARE_MANIFEST_BYTES {
+            return Err("NEA 分享清单超过限制".to_string());
+        }
+        let mut source_bytes = (manifest_bytes.len() as u64)
+            .checked_add(1024 * 1024)
+            .ok_or_else(|| "分享包大小溢出".to_string())?;
+        if oopz_package.is_file() {
+            source_bytes = source_bytes
+                .checked_add(
+                    fs::metadata(&oopz_package)
+                        .map_err(|error| error.to_string())?
+                        .len(),
+                )
+                .ok_or_else(|| "分享包大小溢出".to_string())?;
+        }
+        let mut perfect_sources = Vec::<(String, String, PathBuf)>::new();
+        for item in web_sessions.iter().filter(|item| item.kind == "perfect") {
+            ensure_share_packaging_not_cancelled(cancelled)?;
+            let steam_id = item
+                .session
+                .steam_id
+                .as_deref()
+                .filter(|steam_id| validate_shared_steam_id(steam_id))
+                .ok_or_else(|| "完美账号缺少有效 SteamID".to_string())?;
+            validate_perfect_share_file_set(steam_id, &item.perfect_files)?;
+            if item
+                .perfect_files
+                .iter()
+                .any(|file_name| !is_valid_perfect_share_file_name(steam_id, file_name))
+            {
+                return Err("完美平台临时 SHM 文件不会写入分享包".to_string());
+            }
+            let database_dir = perfect_arena::account_database_dir()
+                .ok_or_else(|| "无法定位完美世界竞技平台数据目录".to_string())?;
+            for file_name in &item.perfect_files {
+                let source_path = database_dir.join(file_name);
+                if !source_path.is_file() {
+                    return Err(format!("完美账号数据库文件已不存在: {file_name}"));
+                }
+                validate_perfect_share_file(&source_path, file_name)?;
+                source_bytes = source_bytes
+                    .checked_add(
+                        fs::metadata(&source_path)
+                            .map_err(|error| error.to_string())?
+                            .len(),
+                    )
+                    .ok_or_else(|| "分享包大小溢出".to_string())?;
+                if source_bytes > MAX_NEA_SHARE_ARCHIVE_BYTES {
+                    return Err("NEA 分享包预计超过 2048 MB，已停止导出".to_string());
+                }
+                perfect_sources.push((steam_id.to_string(), file_name.clone(), source_path));
+            }
+        }
+        if source_bytes > MAX_NEA_SHARE_ARCHIVE_BYTES {
+            return Err("NEA 分享包预计超过 2048 MB，已停止导出".to_string());
+        }
         let file = fs::File::create(path).map_err(|error| error.to_string())?;
         let mut archive = ZipWriter::new(file);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut copy_buffer = vec![0u8; 256 * 1024];
         archive
             .start_file("manifest.json", options)
             .map_err(|error| error.to_string())?;
-        serde_json::to_writer(
-            &mut archive,
-            &NeaShareManifest {
-                format: NEA_SHARE_FORMAT_V1.to_string(),
-                exported_at: now(),
-                has_oopz_package: !oopz_accounts.is_empty(),
-                web_sessions: web_sessions.to_vec(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        archive
+            .write_all(&manifest_bytes)
+            .map_err(|error| error.to_string())?;
         if !oopz_accounts.is_empty() {
             archive
                 .start_file("oopz/accounts.nea", options)
                 .map_err(|error| error.to_string())?;
             let mut source = fs::File::open(&oopz_package).map_err(|error| error.to_string())?;
-            std::io::copy(&mut source, &mut archive).map_err(|error| error.to_string())?;
+            copy_with_share_cancellation_buffer(
+                &mut source,
+                &mut archive,
+                cancelled,
+                &mut copy_buffer,
+            )?;
         }
-        for item in web_sessions.iter().filter(|item| item.kind == "perfect") {
-            let Some(steam_id) = item.session.steam_id.as_deref() else {
-                continue;
-            };
-            for file_name in &item.perfect_files {
-                let relative = safe_relative_path(file_name)?;
-                if relative.components().count() != 1 {
-                    return Err("完美账号数据库文件名无效".to_string());
-                }
-                let Some(database_dir) = perfect_arena::account_database_dir() else {
-                    continue;
-                };
-                let source_path = database_dir.join(file_name);
-                if !source_path.is_file() {
-                    continue;
-                }
-                archive
-                    .start_file(format!("perfect/{}/{}", steam_id, file_name), options)
-                    .map_err(|error| error.to_string())?;
-                let mut source = fs::File::open(source_path).map_err(|error| error.to_string())?;
-                std::io::copy(&mut source, &mut archive).map_err(|error| error.to_string())?;
-            }
+        for (steam_id, file_name, source_path) in perfect_sources {
+            ensure_share_packaging_not_cancelled(cancelled)?;
+            archive
+                .start_file(format!("perfect/{steam_id}/{file_name}"), options)
+                .map_err(|error| error.to_string())?;
+            let mut source = fs::File::open(source_path).map_err(|error| error.to_string())?;
+            copy_with_share_cancellation_buffer(
+                &mut source,
+                &mut archive,
+                cancelled,
+                &mut copy_buffer,
+            )?;
         }
         archive.finish().map_err(|error| error.to_string())?;
         Ok(())
@@ -8371,6 +9025,134 @@ fn write_quick_share_package(
     Ok(())
 }
 
+fn write_quick_share_package_atomic(
+    path: &Path,
+    oopz_accounts: &[SavedAccount],
+    web_sessions: &[SharedWebSession],
+    cancelled: Option<&AtomicBool>,
+) -> Result<u64, String> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nea-share"))
+    {
+        return Err("跨平台分享包必须使用 .nea-share 扩展名".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "分享包导出路径无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建导出目录失败: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "分享包文件名无效".to_string())?;
+    let suffix = Uuid::new_v4();
+    let temp = parent.join(format!(".{file_name}.{suffix}.tmp"));
+    let backup = parent.join(format!(".{file_name}.{suffix}.bak"));
+    if let Err(error) = write_quick_share_package(&temp, oopz_accounts, web_sessions, cancelled) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let package_bytes = match fs::metadata(&temp) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("读取分享包大小失败: {error}"));
+        }
+    };
+    if let Err(error) = ensure_share_packaging_not_cancelled(cancelled) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if path.exists() {
+        if let Err(error) = rename_share_path(path, &backup, "备份原分享包失败") {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    if let Err(error) = rename_share_path(&temp, path, "导出分享包失败") {
+        if backup.exists() {
+            if let Err(restore_error) = rename_share_path(&backup, path, "恢复原分享包失败")
+            {
+                let temp_cleanup = fs::remove_file(&temp).err();
+                return Err(format!(
+                    "{error}；{restore_error}。原文件备份保留在 {}{}",
+                    backup.display(),
+                    temp_cleanup.map_or_else(String::new, |cleanup| format!(
+                        "；临时包 {} 清理失败：{cleanup}",
+                        temp.display()
+                    ))
+                ));
+            }
+        }
+        if let Err(cleanup) = fs::remove_file(&temp) {
+            return Err(format!(
+                "{error}；原文件已恢复，但临时包 {} 清理失败：{cleanup}",
+                temp.display()
+            ));
+        }
+        return Err(error);
+    }
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(|error| {
+            format!(
+                "分享包已导出，但旧文件备份清理失败，请手动删除 {}：{error}",
+                backup.display()
+            )
+        })?;
+    }
+    Ok(package_bytes)
+}
+
+#[tauri::command]
+async fn export_quick_share_package_file(
+    app: AppHandle,
+    selection: QuickShareSelection,
+    path: String,
+) -> Result<QuickShareExportResult, String> {
+    let _activity = acquire_switch_activity(&app)?;
+    let _steam_import_guard = acquire_steam_web_import(&app)?;
+    if app
+        .state::<AppState>()
+        .wormhole_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("已有分享或导入正在进行".to_string());
+    }
+    app.state::<AppState>()
+        .wormhole_cancelled
+        .store(false, Ordering::SeqCst);
+    let result = async {
+        let (oopz_accounts, web_sessions) = prepare_quick_share_material(&app, &selection)?;
+        let account_count = oopz_accounts.len() + web_sessions.len();
+        let target = PathBuf::from(path);
+        let build_app = app.clone();
+        let package_bytes = tauri::async_runtime::spawn_blocking(move || {
+            let state = build_app.state::<AppState>();
+            let _account_operation = state
+                .account_operation
+                .lock()
+                .map_err(|error| error.to_string())?;
+            write_quick_share_package_atomic(
+                &target,
+                &oopz_accounts,
+                &web_sessions,
+                Some(&state.wormhole_cancelled),
+            )
+        })
+        .await
+        .map_err(|error| format!("导出分享包任务异常结束: {error}"))??;
+        Ok(QuickShareExportResult {
+            accounts: account_count,
+            package_bytes,
+        })
+    }
+    .await;
+    finish_wormhole_operation(&app);
+    result
+}
+
 #[tauri::command]
 fn cancel_quick_share(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -8386,6 +9168,8 @@ async fn start_quick_export(
     app: AppHandle,
     selection: QuickShareSelection,
 ) -> Result<String, String> {
+    let _activity = acquire_switch_activity(&app)?;
+    let _steam_import_guard = acquire_steam_web_import(&app)?;
     if app
         .state::<AppState>()
         .wormhole_running
@@ -8404,19 +9188,41 @@ async fn start_quick_export(
         None,
         None,
     );
-    let package_path = wormhole_temp_package("nea-share", "nea");
+    let package_path = wormhole_temp_package("nea-share", "nea-share");
     let material = prepare_quick_share_material(&app, &selection);
     let (oopz_accounts, web_sessions) = match material {
         Ok(material) => material,
         Err(error) => {
             finish_wormhole_operation(&app);
-            emit_wormhole_status(&app, "error", "send", &error, None, None);
+            emit_wormhole_status(
+                &app,
+                if error == QUICK_SHARE_CANCELLED {
+                    "cancelled"
+                } else {
+                    "error"
+                },
+                "send",
+                &error,
+                None,
+                None,
+            );
             return Err(error);
         }
     };
     let build_path = package_path.clone();
+    let build_app = app.clone();
     let build_result = match tauri::async_runtime::spawn_blocking(move || {
-        write_quick_share_package(&build_path, &oopz_accounts, &web_sessions)
+        let state = build_app.state::<AppState>();
+        let _account_operation = state
+            .account_operation
+            .lock()
+            .map_err(|error| error.to_string())?;
+        write_quick_share_package(
+            &build_path,
+            &oopz_accounts,
+            &web_sessions,
+            Some(&state.wormhole_cancelled),
+        )
     })
     .await
     {
@@ -8424,8 +9230,20 @@ async fn start_quick_export(
         Err(error) => Err(format!("打包任务异常结束: {}", error)),
     };
     if let Err(error) = build_result {
+        let _ = fs::remove_file(&package_path);
         finish_wormhole_operation(&app);
-        emit_wormhole_status(&app, "error", "send", &error, None, None);
+        emit_wormhole_status(
+            &app,
+            if error == QUICK_SHARE_CANCELLED {
+                "cancelled"
+            } else {
+                "error"
+            },
+            "send",
+            &error,
+            None,
+            None,
+        );
         return Err(error);
     }
     let package_bytes = match fs::metadata(&package_path) {
@@ -8496,17 +9314,23 @@ async fn start_quick_export(
     let transfer_code = code.clone();
     tauri::async_runtime::spawn(async move {
         let final_code = transfer_code.clone();
-        let result = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
+        let result = async {
             let connect_app = transfer_app.clone();
-            let wormhole = tokio::select! {
-                result = Wormhole::connect(mailbox) => {
-                    result.map_err(|e| format!("建立加密连接失败: {}", e))?
-                }
-                _ = wait_for_quick_share_cancel(connect_app) => {
-                    return Err(QUICK_SHARE_CANCELLED.to_string());
-                }
-            };
+            let wormhole =
+                tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
+                    tokio::select! {
+                        result = Wormhole::connect(mailbox) => {
+                            result.map_err(|e| format!("建立加密连接失败: {}", e))
+                        }
+                        _ = wait_for_quick_share_cancel(connect_app) => {
+                            Err(QUICK_SHARE_CANCELLED.to_string())
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "等待对方接收已超时，请重新生成代码".to_string())??;
             let offer = transfer::offer::OfferSend::new_file_or_folder(
+                // 传输名保留 .nea，以兼容尚未升级的接收端；手工落盘包使用 .nea-share 区分 OOPZ 包。
                 "nea-account-share.nea".to_string(),
                 &package_path,
             )
@@ -8564,7 +9388,7 @@ async fn start_quick_export(
                     format!("发送失败: {}", e)
                 }
             })
-        })
+        }
         .await;
         let _ = fs::remove_file(&package_path);
         let was_cancelled = transfer_app
@@ -8584,7 +9408,7 @@ async fn start_quick_export(
             return;
         }
         match result {
-            Ok(Ok(())) => emit_wormhole_status(
+            Ok(()) => emit_wormhole_status(
                 &transfer_app,
                 "complete",
                 "send",
@@ -8592,19 +9416,11 @@ async fn start_quick_export(
                 Some(final_code),
                 None,
             ),
-            Ok(Err(error)) => emit_wormhole_status(
+            Err(error) => emit_wormhole_status(
                 &transfer_app,
                 "error",
                 "send",
                 error,
-                Some(final_code),
-                None,
-            ),
-            Err(_) => emit_wormhole_status(
-                &transfer_app,
-                "error",
-                "send",
-                "快捷分享已超时，请重新生成代码",
                 Some(final_code),
                 None,
             ),
@@ -8615,9 +9431,105 @@ async fn start_quick_export(
 
 fn validate_shared_steam_id(value: &str) -> bool {
     is_valid_steam_id64(value)
+        && value.parse::<u64>().ok().is_some_and(|steam_id| {
+            steam_id > STEAM_ID64_INDIVIDUAL_BASE
+                && steam_id <= STEAM_ID64_INDIVIDUAL_BASE + u64::from(u32::MAX)
+        })
 }
 
-fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, String> {
+fn is_valid_perfect_share_file_name(steam_id: &str, file_name: &str) -> bool {
+    let Some(suffix) = file_name.strip_prefix(&format!("{steam_id}.")) else {
+        return false;
+    };
+    matches!(suffix, "IM3.db" | "IM3.db-wal" | "IPC.db" | "IPC.db-wal")
+}
+
+fn is_compatible_perfect_share_file_name(steam_id: &str, file_name: &str) -> bool {
+    let Some(suffix) = file_name.strip_prefix(&format!("{steam_id}.")) else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "IM3.db" | "IM3.db-shm" | "IM3.db-wal" | "IPC.db" | "IPC.db-shm" | "IPC.db-wal"
+    )
+}
+
+fn perfect_share_file_names(steam_id: &str) -> [String; 6] {
+    [
+        format!("{steam_id}.IM3.db"),
+        format!("{steam_id}.IM3.db-shm"),
+        format!("{steam_id}.IM3.db-wal"),
+        format!("{steam_id}.IPC.db"),
+        format!("{steam_id}.IPC.db-shm"),
+        format!("{steam_id}.IPC.db-wal"),
+    ]
+}
+
+fn validate_perfect_share_file_set(steam_id: &str, file_names: &[String]) -> Result<(), String> {
+    let names = file_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if names.len() != file_names.len()
+        || file_names
+            .iter()
+            .any(|file_name| !is_compatible_perfect_share_file_name(steam_id, file_name))
+    {
+        return Err("完美平台数据库文件清单无效".to_string());
+    }
+    for family in ["IM3", "IPC"] {
+        let main = format!("{steam_id}.{family}.db");
+        let has_sidecar = [
+            format!("{steam_id}.{family}.db-shm"),
+            format!("{steam_id}.{family}.db-wal"),
+        ]
+        .iter()
+        .any(|name| names.contains(name.as_str()));
+        if has_sidecar && !names.contains(main.as_str()) {
+            return Err(format!(
+                "完美平台 {family} 数据缺少主数据库，不能只分享 WAL/SHM"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_perfect_share_file(path: &Path, file_name: &str) -> Result<(), String> {
+    if !file_name.ends_with(".db") {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("完美平台数据库无法只读打开 {file_name}: {error}"))?;
+    let integrity = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("完美平台数据库完整性检查失败 {file_name}: {error}"))?;
+    if integrity != "ok" {
+        return Err(format!(
+            "完美平台数据库完整性检查失败 {file_name}: {integrity}"
+        ));
+    }
+    if file_name.contains(".IPC.db") {
+        let known_schema = connection
+            .prepare("SELECT org, data, update_time FROM IPC_MEMORY_CACHE__prod LIMIT 0")
+            .is_ok()
+            || connection
+                .prepare("SELECT key, data, update_time FROM IPC_CACHE__prod LIMIT 0")
+                .is_ok();
+        if !known_schema {
+            return Err(format!("完美平台 IPC 数据库结构无法识别: {file_name}"));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_quick_import_package(
+    path: &Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedQuickImport, String> {
+    ensure_share_packaging_not_cancelled(cancelled)?;
     let package_size = fs::metadata(path).map_err(|error| error.to_string())?.len();
     if package_size == 0 || package_size > MAX_NEA_SHARE_ARCHIVE_BYTES {
         return Err(format!(
@@ -8648,6 +9560,9 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
     };
     if manifest.format != NEA_SHARE_FORMAT_V1 {
         return Err("不支持此 NEA 分享包版本".to_string());
+    }
+    if !manifest.has_oopz_package && manifest.web_sessions.is_empty() {
+        return Err("NEA 分享包不包含任何账号".to_string());
     }
     if manifest.web_sessions.len() > MAX_SHARED_WEB_SESSIONS {
         return Err("NEA 分享包中的网页账号过多".to_string());
@@ -8685,15 +9600,19 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
             .map_err(|_| format!("Steam 网页账号 {steam_id} 的 Cookie 格式无效"))?;
         if parsed_cookies
             .iter()
-            .any(|cookie| !is_allowed_steam_cookie(cookie))
+            .any(|cookie| !is_steam_cookie_domain_allowed(cookie))
         {
             return Err(format!("Steam 网页账号 {steam_id} 包含非 Steam 域 Cookie"));
         }
-        let cookie_steam_id = parsed_cookies
+        let login_cookies = parsed_cookies
             .iter()
-            .find(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
-            .and_then(|cookie| steam_id_from_web_cookie(cookie.value()));
-        if cookie_steam_id.as_deref() != Some(steam_id) {
+            .filter(|cookie| cookie.name().eq_ignore_ascii_case("steamLoginSecure"))
+            .collect::<Vec<_>>();
+        if login_cookies.is_empty()
+            || login_cookies
+                .iter()
+                .any(|cookie| steam_id_from_web_cookie(cookie.value()).as_deref() != Some(steam_id))
+        {
             return Err(format!("Steam 网页账号 {steam_id} 的登录态与账号不匹配"));
         }
         if item.kind == "steam-web"
@@ -8701,20 +9620,37 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
         {
             return Err("Steam 网页分享项不应包含完美平台数据".to_string());
         }
+        if let Some(profile) = &item.perfect_profile {
+            if item.kind != "perfect" || profile.steam_id != steam_id {
+                return Err("完美平台画像与 SteamID 不匹配".to_string());
+            }
+        }
         for file_name in &item.perfect_files {
             let relative = safe_relative_path(file_name)?;
             if item.kind != "perfect" || relative.components().count() != 1 {
                 return Err("完美平台数据库文件名无效".to_string());
             }
-            if file_name.split('.').next() != Some(steam_id)
+            if !is_compatible_perfect_share_file_name(steam_id, file_name)
                 || !expected_perfect_files.insert((steam_id.to_string(), file_name.clone()))
             {
                 return Err("完美平台数据库文件清单无效".to_string());
             }
         }
+        if item.kind == "perfect" {
+            validate_perfect_share_file_set(steam_id, &item.perfect_files)?;
+        }
+    }
+    let expected_entry_count = 1usize
+        .checked_add(usize::from(manifest.has_oopz_package))
+        .and_then(|count| count.checked_add(expected_perfect_files.len()))
+        .ok_or_else(|| "NEA 分享包文件数量溢出".to_string())?;
+    if archive.len() != expected_entry_count {
+        return Err("NEA 分享包文件数量与清单不一致".to_string());
     }
 
-    let root = std::env::temp_dir().join(format!("nea-share-import-{}", Uuid::new_v4()));
+    let root = storage_dir()?
+        .join("recovery")
+        .join(format!("share-import-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let result = (|| -> Result<PreparedQuickImport, String> {
         let oopz_package = manifest
@@ -8724,7 +9660,10 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
         let mut found_perfect = HashSet::new();
         let mut perfect_files = Vec::new();
         let mut total_uncompressed = 0u64;
+        let mut manifest_entries = 0usize;
+        let mut copy_buffer = vec![0u8; 256 * 1024];
         for index in 0..archive.len() {
+            ensure_share_packaging_not_cancelled(cancelled)?;
             let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
             if entry.is_dir() {
                 return Err("NEA 分享包不应包含目录项".to_string());
@@ -8743,6 +9682,10 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
                 .ok_or_else(|| "NEA 分享包包含非 Unicode 路径".to_string())?
                 .replace('\\', "/");
             if name == "manifest.json" {
+                manifest_entries += 1;
+                if manifest_entries > 1 {
+                    return Err("NEA 分享包包含重复清单".to_string());
+                }
                 continue;
             }
             let target = if name == "oopz/accounts.nea" && manifest.has_oopz_package && !found_oopz
@@ -8759,21 +9702,37 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
                     return Err("NEA 分享包包含未声明或重复的完美平台文件".to_string());
                 }
                 let target = root.join("perfect").join(&key.0).join(&key.1);
-                perfect_files.push((key.0, key.1, target.clone()));
+                perfect_files.push((key.0, key.1.clone(), target.clone()));
                 target
             };
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
             let mut output = fs::File::create(&target).map_err(|error| error.to_string())?;
-            let written =
-                std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+            let written = copy_with_share_cancellation_buffer(
+                &mut entry,
+                &mut output,
+                cancelled,
+                &mut copy_buffer,
+            )?;
             if written != entry.size() {
                 return Err("NEA 分享包文件大小不一致".to_string());
             }
         }
-        if found_oopz != manifest.has_oopz_package || found_perfect != expected_perfect_files {
+        if manifest_entries != 1
+            || found_oopz != manifest.has_oopz_package
+            || found_perfect != expected_perfect_files
+        {
             return Err("NEA 分享包缺少已声明的账号文件".to_string());
+        }
+        for (_, file_name, path) in &perfect_files {
+            if file_name.ends_with(".db-shm") {
+                fs::remove_file(path)
+                    .map_err(|error| format!("忽略完美平台临时 SHM 文件失败: {error}"))?;
+            }
+        }
+        for (_, file_name, path) in &perfect_files {
+            validate_perfect_share_file(path, file_name)?;
         }
         Ok(PreparedQuickImport {
             root: root.clone(),
@@ -8788,66 +9747,284 @@ fn prepare_quick_import_package(path: &Path) -> Result<PreparedQuickImport, Stri
     result
 }
 
-fn commit_perfect_share_files(files: &[(String, String, PathBuf)]) -> Result<(), String> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    perfect_arena::stop_for_share_transfer()?;
-    let database_dir = perfect_arena::account_database_dir()
-        .ok_or_else(|| "无法定位完美世界竞技平台数据目录".to_string())?;
-    fs::create_dir_all(&database_dir)
-        .map_err(|error| format!("创建完美平台数据目录失败: {error}"))?;
-    for (steam_id, file_name, staged) in files {
-        if !validate_shared_steam_id(steam_id) || file_name.split('.').next() != Some(steam_id) {
-            return Err("完美平台账号文件校验失败".to_string());
-        }
-        let target = database_dir.join(file_name);
-        let temp = database_dir.join(format!("{}.{}.nea.tmp", file_name, Uuid::new_v4()));
-        let backup = database_dir.join(format!("{}.{}.nea.bak", file_name, Uuid::new_v4()));
-        fs::copy(staged, &temp).map_err(|error| format!("写入完美平台账号数据失败: {error}"))?;
-        if target.exists() {
-            fs::rename(&target, &backup)
-                .map_err(|error| format!("备份完美平台原账号数据失败: {error}"))?;
-        }
-        if let Err(error) = fs::rename(&temp, &target) {
-            if backup.exists() {
-                let _ = fs::rename(&backup, &target);
-            }
-            let _ = fs::remove_file(&temp);
-            return Err(format!("提交完美平台账号数据失败: {error}"));
-        }
-        let _ = fs::remove_file(&backup);
+fn remove_share_path(path: &Path) {
+    let _ = remove_share_path_checked(path);
+}
+
+fn remove_share_path_checked(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn rename_share_path(source: &Path, target: &Path, action: &str) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match fs::rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 19 {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err(format!(
+        "{action}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "未知文件错误".to_string())
+    ))
+}
+
+fn apply_staged_share_path(
+    staged: &Path,
+    target: &Path,
+    backup_root: &Path,
+    index: usize,
+) -> Result<AppliedSharePath, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| "分享数据目标目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建分享数据目录失败: {error}"))?;
+    fs::create_dir_all(backup_root).map_err(|error| format!("创建分享回滚目录失败: {error}"))?;
+    let backup = target
+        .exists()
+        .then(|| backup_root.join(format!("item-{index}")));
+    if let Some(backup) = &backup {
+        rename_share_path(target, backup, "备份原分享数据失败")?;
+    }
+    if let Err(error) = rename_share_path(staged, target, "提交分享数据失败") {
+        if let Some(backup) = &backup {
+            if let Err(restore_error) = rename_share_path(backup, target, "恢复原分享数据失败")
+            {
+                return Err(format!(
+                    "{error}；{restore_error}。原数据保留在 {}",
+                    backup.display()
+                ));
+            }
+        }
+        return Err(error);
+    }
+    Ok(AppliedSharePath {
+        target: target.to_path_buf(),
+        backup,
+    })
+}
+
+fn backup_share_target_removal(
+    target: &Path,
+    backup_root: &Path,
+    index: usize,
+) -> Result<Option<AppliedSharePath>, String> {
+    if !target.exists() {
+        return Ok(None);
+    }
+    fs::create_dir_all(backup_root).map_err(|error| format!("创建分享回滚目录失败: {error}"))?;
+    let backup = backup_root.join(format!("item-{index}"));
+    rename_share_path(target, &backup, "备份待清理的旧分享数据失败")?;
+    Ok(Some(AppliedSharePath {
+        target: target.to_path_buf(),
+        backup: Some(backup),
+    }))
+}
+
+fn rollback_applied_share_paths(applied: &mut Vec<AppliedSharePath>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    while let Some(change) = applied.pop() {
+        if change.target.exists() {
+            if let Err(error) = remove_share_path_checked(&change.target) {
+                errors.push(format!("清理 {} 失败: {}", change.target.display(), error));
+                continue;
+            }
+        }
+        if let Some(backup) = change.backup {
+            if let Err(error) = rename_share_path(&backup, &change.target, "恢复原分享数据失败")
+            {
+                errors.push(format!("{}: {}", change.target.display(), error));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("恢复原分享数据失败: {}", errors.join("；")))
+    }
+}
+
+fn directory_has_entries(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .is_some_and(|mut entries| entries.next().is_some())
+}
+
+fn rollback_quick_share_data(
+    state: &AppState,
+    before_commit: &AppData,
+    affected_steam_ids: &HashSet<String>,
+) -> Result<(), String> {
+    commit_app_data_update(state, |current| {
+        current.steam.web_sessions.retain(|session| {
+            !session
+                .steam_id
+                .as_ref()
+                .is_some_and(|steam_id| affected_steam_ids.contains(steam_id))
+        });
+        current.steam.web_sessions.extend(
+            before_commit
+                .steam
+                .web_sessions
+                .iter()
+                .filter(|session| {
+                    session
+                        .steam_id
+                        .as_ref()
+                        .is_some_and(|steam_id| affected_steam_ids.contains(steam_id))
+                })
+                .cloned(),
+        );
+        for steam_id in affected_steam_ids {
+            if let Some(profile) = before_commit.perfect_profiles.get(steam_id) {
+                current
+                    .perfect_profiles
+                    .insert(steam_id.clone(), profile.clone());
+            } else {
+                current.perfect_profiles.remove(steam_id);
+            }
+        }
+        Ok(())
+    })
+}
+
+fn ensure_quick_import_not_cancelled(app: &AppHandle, cancellable: bool) -> Result<(), String> {
+    if cancellable
+        && app
+            .state::<AppState>()
+            .wormhole_cancelled
+            .load(Ordering::SeqCst)
+    {
+        Err(QUICK_SHARE_CANCELLED.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 async fn import_quick_share_package(
     app: &AppHandle,
     path: &Path,
+    cancellable: bool,
 ) -> Result<QuickImportResult, String> {
+    ensure_quick_import_not_cancelled(app, cancellable)?;
     let prepare_path = path.to_path_buf();
-    let prepared =
-        tauri::async_runtime::spawn_blocking(move || prepare_quick_import_package(&prepare_path))
-            .await
-            .map_err(|error| format!("解析分享包任务异常结束: {error}"))??;
+    let prepare_app = app.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let state = prepare_app.state::<AppState>();
+        prepare_quick_import_package(
+            &prepare_path,
+            cancellable.then_some(&state.wormhole_cancelled),
+        )
+    })
+    .await
+    .map_err(|error| format!("解析分享包任务异常结束: {error}"))??;
+    if !prepared.manifest.web_sessions.is_empty() {
+        if cancellable {
+            emit_wormhole_status(
+                app,
+                "importing",
+                "receive",
+                "正在联网确认 Steam 网页登录态...",
+                None,
+                None,
+            );
+        }
+        let verification_inputs = prepared
+            .manifest
+            .web_sessions
+            .iter()
+            .map(|item| {
+                (
+                    item.cookies.clone(),
+                    item.session
+                        .steam_id
+                        .clone()
+                        .expect("share manifest steam id was validated"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let verifier = match shared_steam_verifier_client() {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&prepared.root);
+                return Err(error);
+            }
+        };
+        let verification_result = stream::iter(verification_inputs)
+            .map(|(cookies, steam_id)| {
+                let verify_app = app.clone();
+                let client = verifier.clone();
+                async move {
+                    ensure_quick_import_not_cancelled(&verify_app, cancellable)?;
+                    let verification = async {
+                        verify_shared_steam_session_online(&client, &cookies, &steam_id)
+                            .await
+                            .map_err(|error| format!("Steam 网页账号 {steam_id} 校验失败：{error}"))
+                    };
+                    if cancellable {
+                        tokio::select! {
+                            result = verification => result,
+                            _ = wait_for_quick_share_cancel(verify_app) => {
+                                Err(QUICK_SHARE_CANCELLED.to_string())
+                            }
+                        }
+                    } else {
+                        verification.await
+                    }
+                }
+            })
+            .buffer_unordered(6)
+            .try_collect::<Vec<_>>()
+            .await;
+        if let Err(error) = verification_result {
+            let _ = fs::remove_dir_all(&prepared.root);
+            return Err(error);
+        }
+    }
+    let before_data = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let backup_root = prepared.root.join("rollback");
+    let affected_steam_ids = prepared
+        .manifest
+        .web_sessions
+        .iter()
+        .filter_map(|item| item.session.steam_id.clone())
+        .collect::<HashSet<_>>();
+    let mut staged_sessions = Vec::<StagedQuickWebSession>::new();
+    let mut applied_paths = Vec::<AppliedSharePath>::new();
+    let mut data_before_share_commit = None::<AppData>;
+    let mut rollback_journal = None::<QuickShareRollbackJournal>;
     let result = async {
-        let mut imported_sessions = Vec::new();
         for item in &prepared.manifest.web_sessions {
+            ensure_quick_import_not_cancelled(app, cancellable)?;
             let steam_id = item
                 .session
                 .steam_id
                 .as_deref()
                 .ok_or_else(|| "分享包缺少 SteamID".to_string())?;
-            let existing = app
-                .state::<AppState>()
-                .data
-                .lock()
-                .map_err(|error| error.to_string())?
+            let existing = before_data
                 .steam
                 .web_sessions
                 .iter()
                 .find(|session| session.steam_id.as_deref() == Some(steam_id))
                 .cloned();
+            let perfect_existed = item.kind == "perfect"
+                && (before_data.perfect_profiles.contains_key(steam_id)
+                    || !perfect_arena::account_database_files(steam_id).is_empty());
             let new_session = existing.is_none();
             let mut session = existing.unwrap_or_else(|| {
                 let mut session = item.session.clone();
@@ -8859,17 +10036,18 @@ async fn import_quick_share_package(
             if session.display_name.trim().is_empty() {
                 session.display_name = steam_id.to_string();
             }
-            let label = steam_web_window_label(&session.id);
-            if let Some(existing_window) = app.get_webview_window(&label) {
-                let _ = existing_window.destroy();
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let window = build_steam_web_window(app, &session.id, false, false, None)?;
+            let stage_id = format!("share-stage-{}", Uuid::new_v4());
+            let stage_dir = steam_web_session_dir(&stage_id)?;
+            let target_dir = steam_web_session_dir(&session.id)?;
+            let window = build_steam_web_window(app, &stage_id, false, false, None)?;
             let cookie_result = (|| -> Result<(), String> {
                 for raw in &item.cookies {
                     let cookie = Cookie::parse(raw.clone())
                         .map_err(|_| format!("Steam 网页账号 {steam_id} 的 Cookie 格式无效"))?
                         .into_owned();
+                    if !is_required_steam_share_cookie(&cookie) {
+                        continue;
+                    }
                     window
                         .set_cookie(cookie)
                         .map_err(|error| format!("恢复 Steam 网页账号 {steam_id} 失败: {error}"))?;
@@ -8878,65 +10056,270 @@ async fn import_quick_share_package(
             })();
             if let Err(error) = cookie_result {
                 let _ = window.destroy();
-                if new_session {
-                    let _ = fs::remove_dir_all(steam_web_session_dir(&session.id)?);
-                }
+                let _ = fs::remove_dir_all(&stage_dir);
                 return Err(error);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             let restored_steam_id = steam_id_from_web_window(window.clone()).await;
             let _ = window.destroy();
             if restored_steam_id?.as_deref() != Some(steam_id) {
-                if new_session {
-                    let _ = fs::remove_dir_all(steam_web_session_dir(&session.id)?);
-                }
+                let _ = fs::remove_dir_all(&stage_dir);
                 return Err(format!("恢复 Steam 网页账号 {steam_id} 后校验失败"));
             }
-            imported_sessions.push((item, session));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = cleanup_steam_webview_cache_at(&stage_dir.join("webview2"));
+            staged_sessions.push(StagedQuickWebSession {
+                item: item.clone(),
+                session,
+                stage_dir,
+                target_dir,
+                target_existed: !new_session,
+                perfect_existed,
+            });
         }
 
-        commit_perfect_share_files(&prepared.perfect_files)?;
-        let state = app.state::<AppState>();
-        let (steam_web_accounts, perfect_accounts) =
-            commit_app_data_update(&state, move |next_data| {
-                let mut steam_web_accounts = 0usize;
-                let mut perfect_accounts = 0usize;
-                for (item, imported) in imported_sessions {
-                    if let Some(existing) = next_data
-                        .steam
-                        .web_sessions
-                        .iter_mut()
-                        .find(|session| session.steam_id == imported.steam_id)
-                    {
-                        merge_steam_web_session(existing, &imported);
-                        existing.last_verified_at = imported.last_verified_at.clone();
-                    } else {
-                        next_data.steam.web_sessions.push(imported);
-                    }
-                    let steam_id = item
-                        .session
+        ensure_quick_import_not_cancelled(app, cancellable)?;
+        if cancellable {
+            emit_wormhole_status(
+                app,
+                "committing",
+                "receive",
+                "校验完成，正在提交账号数据（此阶段不可取消）...",
+                None,
+                None,
+            );
+        }
+        for staged in &staged_sessions {
+            if let Some(window) =
+                app.get_webview_window(&steam_web_window_label(&staged.session.id))
+            {
+                let _ = window.destroy();
+            }
+        }
+        if !staged_sessions.is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let rollback_snapshot = app
+            .state::<AppState>()
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        let mut journal = QuickShareRollbackJournal {
+            affected_steam_ids: affected_steam_ids.iter().cloned().collect(),
+            web_sessions: rollback_snapshot
+                .steam
+                .web_sessions
+                .iter()
+                .filter(|session| {
+                    session
                         .steam_id
-                        .as_deref()
-                        .expect("validated steam id");
-                    if item.kind == "perfect" {
-                        perfect_accounts += 1;
-                        if let Some(profile) = &item.perfect_profile {
+                        .as_ref()
+                        .is_some_and(|steam_id| affected_steam_ids.contains(steam_id))
+                })
+                .cloned()
+                .collect(),
+            perfect_profiles: rollback_snapshot
+                .perfect_profiles
+                .iter()
+                .filter(|(steam_id, _)| affected_steam_ids.contains(*steam_id))
+                .map(|(steam_id, profile)| (steam_id.clone(), profile.clone()))
+                .collect(),
+            paths: Vec::new(),
+        };
+        journal.affected_steam_ids.sort_unstable();
+        write_quick_share_rollback_journal(&prepared.root, &journal)?;
+        rollback_journal = Some(journal);
+        for staged in &staged_sessions {
+            let backup = staged.target_dir.exists().then(|| {
+                backup_root.join(format!(
+                    "item-{}",
+                    rollback_journal
+                        .as_ref()
+                        .expect("journal exists")
+                        .paths
+                        .len()
+                ))
+            });
+            let index = record_quick_share_rollback_path(
+                &prepared.root,
+                rollback_journal.as_mut().expect("journal exists"),
+                &staged.target_dir,
+                backup,
+            )?;
+            applied_paths.push(apply_staged_share_path(
+                &staged.stage_dir,
+                &staged.target_dir,
+                &backup_root,
+                index,
+            )?);
+        }
+
+        if !prepared.perfect_files.is_empty() {
+            perfect_arena::stop_for_share_transfer()?;
+            let database_dir = perfect_arena::account_database_dir()
+                .ok_or_else(|| "无法定位完美世界竞技平台数据目录".to_string())?;
+            fs::create_dir_all(&database_dir)
+                .map_err(|error| format!("创建完美平台数据目录失败: {error}"))?;
+            let staged_perfect_files = prepared
+                .perfect_files
+                .iter()
+                .filter(|(_, file_name, path)| !file_name.ends_with(".db-shm") && path.is_file())
+                .map(|(steam_id, file_name, path)| {
+                    ((steam_id.clone(), file_name.clone()), path.clone())
+                })
+                .collect::<HashMap<_, _>>();
+            for item in prepared
+                .manifest
+                .web_sessions
+                .iter()
+                .filter(|item| item.kind == "perfect" && !item.perfect_files.is_empty())
+            {
+                let steam_id = item
+                    .session
+                    .steam_id
+                    .as_deref()
+                    .expect("perfect share SteamID was validated");
+                let declared = item
+                    .perfect_files
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>();
+                let all_names = perfect_share_file_names(steam_id);
+                for family in [0..3, 3..6] {
+                    if !declared.contains(all_names[family.start].as_str()) {
+                        continue;
+                    }
+                    for file_name in &all_names[family] {
+                        let target = database_dir.join(file_name);
+                        if let Some(staged) =
+                            staged_perfect_files.get(&(steam_id.to_string(), file_name.clone()))
+                        {
+                            let next_index = rollback_journal
+                                .as_ref()
+                                .expect("journal exists")
+                                .paths
+                                .len();
+                            let backup = target
+                                .exists()
+                                .then(|| backup_root.join(format!("item-{next_index}")));
+                            let index = record_quick_share_rollback_path(
+                                &prepared.root,
+                                rollback_journal.as_mut().expect("journal exists"),
+                                &target,
+                                backup,
+                            )?;
+                            applied_paths.push(apply_staged_share_path(
+                                staged,
+                                &target,
+                                &backup_root,
+                                index,
+                            )?);
+                        } else if target.exists() {
+                            let next_index = rollback_journal
+                                .as_ref()
+                                .expect("journal exists")
+                                .paths
+                                .len();
+                            let backup = backup_root.join(format!("item-{next_index}"));
+                            let index = record_quick_share_rollback_path(
+                                &prepared.root,
+                                rollback_journal.as_mut().expect("journal exists"),
+                                &target,
+                                Some(backup),
+                            )?;
+                            let applied =
+                                backup_share_target_removal(&target, &backup_root, index)?
+                                    .expect("target existence was checked");
+                            applied_paths.push(applied);
+                        }
+                    }
+                }
+            }
+        }
+
+        let session_updates = staged_sessions
+            .iter()
+            .map(|staged| {
+                (
+                    staged.item.clone(),
+                    staged.session.clone(),
+                    staged.target_existed,
+                    staged.perfect_existed,
+                )
+            })
+            .collect::<Vec<_>>();
+        let state = app.state::<AppState>();
+        let (
+            steam_web_accounts,
+            perfect_accounts,
+            steam_web_added,
+            steam_web_updated,
+            perfect_added,
+            perfect_updated,
+            before_share_commit,
+        ) = commit_app_data_update(&state, move |next_data| {
+            let before_share_commit = next_data.clone();
+            let mut steam_web_accounts = 0usize;
+            let mut perfect_accounts = 0usize;
+            let mut steam_web_added = 0usize;
+            let mut steam_web_updated = 0usize;
+            let mut perfect_added = 0usize;
+            let mut perfect_updated = 0usize;
+            for (item, imported, target_existed, perfect_existed) in session_updates {
+                if let Some(existing) = next_data
+                    .steam
+                    .web_sessions
+                    .iter_mut()
+                    .find(|session| session.steam_id == imported.steam_id)
+                {
+                    merge_steam_web_session(existing, &imported);
+                    existing.last_verified_at = imported.last_verified_at.clone();
+                } else {
+                    next_data.steam.web_sessions.push(imported);
+                }
+                let steam_id = item
+                    .session
+                    .steam_id
+                    .as_deref()
+                    .expect("validated steam id");
+                if item.kind == "perfect" {
+                    perfect_accounts += 1;
+                    if perfect_existed {
+                        perfect_updated += 1;
+                    } else {
+                        perfect_added += 1;
+                    }
+                    if let Some(profile) = &item.perfect_profile {
+                        if let Some(saved) = next_data.perfect_profiles.get_mut(steam_id) {
+                            merge_perfect_profile(saved, profile.clone());
+                        } else {
                             next_data
                                 .perfect_profiles
                                 .insert(steam_id.to_string(), profile.clone());
                         }
-                        if item.perfect_unavailable {
-                            next_data
-                                .perfect_unavailable_account_ids
-                                .insert(steam_id.to_string());
-                        }
+                    }
+                } else {
+                    steam_web_accounts += 1;
+                    if target_existed {
+                        steam_web_updated += 1;
                     } else {
-                        steam_web_accounts += 1;
+                        steam_web_added += 1;
                     }
                 }
-                reconcile_steam_identities(next_data);
-                Ok((steam_web_accounts, perfect_accounts))
-            })?;
+            }
+            reconcile_steam_identities(next_data);
+            Ok((
+                steam_web_accounts,
+                perfect_accounts,
+                steam_web_added,
+                steam_web_updated,
+                perfect_added,
+                perfect_updated,
+                before_share_commit,
+            ))
+        })?;
+        data_before_share_commit = Some(before_share_commit);
         let oopz_accounts = if let Some(path) = &prepared.oopz_package {
             let import_app = app.clone();
             let import_path = path.clone();
@@ -8948,17 +10331,69 @@ async fn import_quick_share_package(
         } else {
             Vec::new()
         };
+        let _ = fs::write(prepared.root.join("committed"), now());
         update_tray(app);
         let _ = app.emit("app-data-changed", ());
         Ok(QuickImportResult {
             oopz_accounts,
             steam_web_accounts,
             perfect_accounts,
+            steam_web_added,
+            steam_web_updated,
+            perfect_added,
+            perfect_updated,
         })
     }
     .await;
-    let _ = fs::remove_dir_all(&prepared.root);
-    result
+    let mut rollback_error = if result.is_err() {
+        let paths_error = rollback_applied_share_paths(&mut applied_paths).err();
+        let data_error = data_before_share_commit.as_ref().and_then(|before_commit| {
+            rollback_quick_share_data(&app.state::<AppState>(), before_commit, &affected_steam_ids)
+                .err()
+        });
+        match (paths_error, data_error) {
+            (None, None) => None,
+            (Some(paths), None) => Some(paths),
+            (None, Some(data)) => Some(format!("恢复原配置失败: {data}")),
+            (Some(paths), Some(data)) => Some(format!("{paths}；恢复原配置失败: {data}")),
+        }
+    } else {
+        None
+    };
+    if result.is_err() && data_before_share_commit.is_some() {
+        update_tray(app);
+        let _ = app.emit("app-data-changed", ());
+    }
+    for staged in &staged_sessions {
+        if staged.stage_dir.exists() {
+            let _ = fs::remove_dir_all(&staged.stage_dir);
+        }
+    }
+    if result.is_ok() {
+        let _ = fs::write(prepared.root.join("committed"), now());
+    }
+    let recovery_needed =
+        result.is_err() && (rollback_error.is_some() || directory_has_entries(&backup_root));
+    if recovery_needed {
+        if let Some(path) = &prepared.oopz_package {
+            remove_share_path(path);
+        }
+        remove_share_path(&prepared.root.join("perfect"));
+        let preservation = format!(
+            "原数据未被删除，恢复事务保留在 {}，下次启动会自动重试",
+            prepared.root.display()
+        );
+        rollback_error = Some(match rollback_error {
+            Some(error) => format!("{error}；{preservation}"),
+            None => preservation,
+        });
+    } else {
+        let _ = fs::remove_dir_all(&prepared.root);
+    }
+    match (result, rollback_error) {
+        (Err(error), Some(rollback)) => Err(format!("{error}；{rollback}")),
+        (result, _) => result,
+    }
 }
 
 async fn receive_wormhole_package(
@@ -8966,28 +10401,34 @@ async fn receive_wormhole_package(
     code: Code,
     target: &Path,
 ) -> Result<bool, String> {
-    let mailbox = MailboxConnection::connect(transfer::APP_CONFIG, code, false)
+    let request = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
+        let mailbox = MailboxConnection::connect(transfer::APP_CONFIG, code, false)
+            .await
+            .map_err(|e| format!("连接快捷码失败: {}", e))?;
+        let wormhole = Wormhole::connect(mailbox)
+            .await
+            .map_err(|e| format!("建立加密连接失败: {}", e))?;
+        transfer::request_file(
+            wormhole,
+            wormhole_relay_hints()?,
+            transit::Abilities::ALL,
+            pending(),
+        )
         .await
-        .map_err(|e| format!("连接快捷码失败: {}", e))?;
-    let wormhole = Wormhole::connect(mailbox)
-        .await
-        .map_err(|e| format!("建立加密连接失败: {}", e))?;
-    let request = transfer::request_file(
-        wormhole,
-        wormhole_relay_hints()?,
-        transit::Abilities::ALL,
-        pending(),
-    )
+        .map_err(|e| format!("接收请求失败: {}", e))?
+        .ok_or_else(|| "对方已取消传输".to_string())
+    })
     .await
-    .map_err(|e| format!("接收请求失败: {}", e))?
-    .ok_or_else(|| "对方已取消传输".to_string())?;
+    .map_err(|_| "等待发送方响应已超时，请确认代码后重试".to_string())??;
     let legacy_oopz_package = request.file_name().ends_with(".oopz+");
     let maximum_size = if legacy_oopz_package {
         MAX_V3_ARCHIVE_BYTES
     } else {
         MAX_NEA_SHARE_ARCHIVE_BYTES
     };
-    if !(request.file_name().ends_with(".nea") || legacy_oopz_package)
+    if !(request.file_name().ends_with(".nea-share")
+        || request.file_name().ends_with(".nea")
+        || legacy_oopz_package)
         || request.file_size() == 0
         || request.file_size() > maximum_size
     {
@@ -9045,6 +10486,7 @@ async fn receive_wormhole_package(
 
 #[tauri::command]
 async fn quick_import(app: AppHandle, code: String) -> Result<QuickImportResult, String> {
+    let _activity = acquire_switch_activity(&app)?;
     let _steam_import_guard = acquire_steam_web_import(&app)?;
     let code = code
         .trim()
@@ -9068,17 +10510,14 @@ async fn quick_import(app: AppHandle, code: String) -> Result<QuickImportResult,
         None,
         None,
     );
-    let package_path = wormhole_temp_package("nea-receive", "nea");
+    let package_path = wormhole_temp_package("nea-receive", "nea-share");
     let receive_app = app.clone();
-    let receive_result = tokio::time::timeout(Duration::from_secs(WORMHOLE_TIMEOUT_SECONDS), async {
-        tokio::select! {
-            result = receive_wormhole_package(&app, code, &package_path) => result,
-            _ = wait_for_quick_share_cancel(receive_app) => Err(QUICK_SHARE_CANCELLED.to_string()),
-        }
-    })
-    .await;
+    let receive_result = tokio::select! {
+        result = receive_wormhole_package(&app, code, &package_path) => result,
+        _ = wait_for_quick_share_cancel(receive_app) => Err(QUICK_SHARE_CANCELLED.to_string()),
+    };
     let result = match receive_result {
-        Ok(Ok(legacy_oopz_package)) => {
+        Ok(legacy_oopz_package) => {
             emit_wormhole_status(
                 &app,
                 "importing",
@@ -9088,25 +10527,43 @@ async fn quick_import(app: AppHandle, code: String) -> Result<QuickImportResult,
                 None,
             );
             if legacy_oopz_package {
-                let import_app = app.clone();
-                let import_path = package_path.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    import_account_package_inner(&import_app, &import_path).map(|oopz_accounts| {
-                        QuickImportResult {
-                            oopz_accounts,
-                            steam_web_accounts: 0,
-                            perfect_accounts: 0,
-                        }
+                if let Err(error) = ensure_quick_import_not_cancelled(&app, true) {
+                    Err(error)
+                } else {
+                    emit_wormhole_status(
+                        &app,
+                        "committing",
+                        "receive",
+                        "校验完成，正在提交 OOPZ 账号（此阶段不可取消）...",
+                        None,
+                        None,
+                    );
+                    let import_app = app.clone();
+                    let import_path = package_path.clone();
+                    match tauri::async_runtime::spawn_blocking(move || {
+                        import_account_package_inner(&import_app, &import_path).map(
+                            |oopz_accounts| QuickImportResult {
+                                oopz_accounts,
+                                steam_web_accounts: 0,
+                                perfect_accounts: 0,
+                                steam_web_added: 0,
+                                steam_web_updated: 0,
+                                perfect_added: 0,
+                                perfect_updated: 0,
+                            },
+                        )
                     })
-                })
-                .await
-                .map_err(|error| format!("导入旧版 OOPZ 分享包任务异常结束: {error}"))?
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(format!("导入旧版 OOPZ 分享包任务异常结束: {error}")),
+                    }
+                }
             } else {
-                import_quick_share_package(&app, &package_path).await
+                import_quick_share_package(&app, &package_path, true).await
             }
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err("快捷导入已超时，请确认代码并重试".to_string()),
+        Err(error) => Err(error),
     };
     let _ = fs::remove_file(&package_path);
     finish_wormhole_operation(&app);
@@ -9117,6 +10574,68 @@ async fn quick_import(app: AppHandle, code: String) -> Result<QuickImportResult,
             "receive",
             format!(
                 "快捷导入完成：OOPZ {} 个、Steam 网页 {} 个、完美平台 {} 个",
+                imported.oopz_accounts.len(),
+                imported.steam_web_accounts,
+                imported.perfect_accounts
+            ),
+            None,
+            None,
+        ),
+        Err(error) if error == QUICK_SHARE_CANCELLED => emit_wormhole_status(
+            &app,
+            "cancelled",
+            "receive",
+            QUICK_SHARE_CANCELLED,
+            None,
+            None,
+        ),
+        Err(error) => emit_wormhole_status(&app, "error", "receive", error, None, None),
+    }
+    result
+}
+
+#[tauri::command]
+async fn import_quick_share_package_file(
+    app: AppHandle,
+    path: String,
+) -> Result<QuickImportResult, String> {
+    let source = PathBuf::from(path);
+    if !source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nea-share"))
+    {
+        return Err("请选择 .nea-share 跨平台分享包".to_string());
+    }
+    let _activity = acquire_switch_activity(&app)?;
+    let _steam_import_guard = acquire_steam_web_import(&app)?;
+    if app
+        .state::<AppState>()
+        .wormhole_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Err("已有分享或导入正在进行".to_string());
+    }
+    app.state::<AppState>()
+        .wormhole_cancelled
+        .store(false, Ordering::SeqCst);
+    emit_wormhole_status(
+        &app,
+        "importing",
+        "receive",
+        "正在校验并导入跨平台分享包...",
+        None,
+        None,
+    );
+    let result = import_quick_share_package(&app, &source, true).await;
+    finish_wormhole_operation(&app);
+    match &result {
+        Ok(imported) => emit_wormhole_status(
+            &app,
+            "complete",
+            "receive",
+            format!(
+                "分享包导入完成：OOPZ {} 个、Steam 网页 {} 个、完美平台 {} 个",
                 imported.oopz_accounts.len(),
                 imported.steam_web_accounts,
                 imported.perfect_accounts
@@ -9511,9 +11030,6 @@ pub fn run() {
     } else {
         None
     };
-    if !plugin_runtime {
-        recover_import_transactions();
-    }
     let updater_cleanup = args
         .iter()
         .position(|arg| arg == "--cleanup-updater")
@@ -9530,30 +11046,6 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            data: Mutex::new(load_data()),
-            account_operation: Mutex::new(()),
-            switch_operation: Mutex::new(()),
-            switch_running: AtomicBool::new(false),
-            discovery_cancelled: AtomicBool::new(false),
-            auto_import_running: AtomicBool::new(false),
-            plugin_operation: Mutex::new(()),
-            plugin_environment_running: AtomicBool::new(false),
-            overlay_rebind_requested: AtomicBool::new(false),
-            overlay_dragging: AtomicBool::new(false),
-            update_running: AtomicBool::new(false),
-            update_status: Mutex::new(initial_update_status()),
-            wormhole_running: AtomicBool::new(false),
-            wormhole_cancelled: AtomicBool::new(false),
-            steam_web_import_running: AtomicBool::new(false),
-            steam_bulk_import_running: AtomicBool::new(false),
-            steam_bulk_import_cancelled: AtomicBool::new(false),
-            steam_import_duplicate_sessions: Mutex::new(HashMap::new()),
-            steam_capability_running: AtomicBool::new(false),
-            steam_capability_paused: AtomicBool::new(false),
-            steam_capability_cancelled: AtomicBool::new(false),
-            main_webview_low_memory: AtomicBool::new(false),
-        })
         .invoke_handler(tauri::generate_handler![
             get_app_data,
             get_config_health,
@@ -9594,6 +11086,8 @@ pub fn run() {
             export_account_package,
             export_all_accounts_package,
             import_account_package,
+            export_quick_share_package_file,
+            import_quick_share_package_file,
             start_quick_export,
             cancel_quick_share,
             quick_import,
@@ -9609,6 +11103,12 @@ pub fn run() {
             check_for_updates
         ])
         .setup(move |app| {
+            if !plugin_runtime {
+                recover_import_transactions();
+                recover_quick_share_transactions();
+                cleanup_stale_share_artifacts();
+            }
+            app.manage(initial_app_state());
             watch_config_changes(app.handle().clone());
             if plugin_runtime {
                 if let Some(window) = app.get_webview_window("main") {
@@ -9783,7 +11283,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_steam_session_commits_preserve_every_update() {
+    fn dev_smoke_concurrent_steam_session_commits_preserve_every_update() {
         let data = Arc::new(Mutex::new(AppData::default()));
         let handles = (0..16)
             .map(|index| {
@@ -10026,7 +11526,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_login_state_still_saves_missing_credentials_without_overwrite() {
+    fn dev_smoke_duplicate_login_state_still_saves_missing_credentials_without_overwrite() {
         let steam_id = "76561198000000023";
         let mut data = AppData::default();
         data.steam.accounts.push(steam::SteamAccount {
@@ -10351,6 +11851,23 @@ mod tests {
         archive.finish().unwrap();
     }
 
+    fn write_test_share_package_files(
+        path: &Path,
+        manifest: &NeaShareManifest,
+        files: &[(&str, &[u8])],
+    ) {
+        let file = fs::File::create(path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        archive.start_file("manifest.json", options).unwrap();
+        serde_json::to_writer(&mut archive, manifest).unwrap();
+        for (name, contents) in files {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(contents).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
     #[test]
     fn quick_share_manifest_accepts_matching_steam_cookie() {
         let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
@@ -10361,10 +11878,22 @@ mod tests {
             web_sessions: vec![test_shared_web_session("76561198000000001")],
         };
         write_test_share_package(&path, &manifest, None);
-        let prepared = prepare_quick_import_package(&path).unwrap();
+        let prepared = prepare_quick_import_package(&path, None).unwrap();
         assert_eq!(prepared.manifest.web_sessions.len(), 1);
         let _ = fs::remove_dir_all(prepared.root);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn perfect_share_selection_keeps_web_capability_and_deduplicates_same_session() {
+        let selection = QuickShareSelection {
+            oopz_account_ids: Vec::new(),
+            steam_web_session_ids: vec!["same".to_string(), "web-only".to_string()],
+            perfect_session_ids: vec!["same".to_string()],
+        };
+        let (_, web_ids, perfect_ids) = normalized_quick_share_selection(&selection);
+        assert_eq!(web_ids, HashSet::from(["web-only".to_string()]));
+        assert_eq!(perfect_ids, HashSet::from(["same".to_string()]));
     }
 
     #[test]
@@ -10379,7 +11908,7 @@ mod tests {
             web_sessions: vec![item],
         };
         write_test_share_package(&path, &manifest, None);
-        assert!(prepare_quick_import_package(&path).is_err());
+        assert!(prepare_quick_import_package(&path, None).is_err());
         let _ = fs::remove_file(path);
     }
 
@@ -10393,8 +11922,205 @@ mod tests {
             web_sessions: Vec::new(),
         };
         write_test_share_package(&path, &manifest, Some("unexpected.bin"));
-        assert!(prepare_quick_import_package(&path).is_err());
+        assert!(prepare_quick_import_package(&path, None).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_package_rejects_empty_manifest() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: Vec::new(),
+        };
+        write_test_share_package(&path, &manifest, None);
+        assert!(prepare_quick_import_package(&path, None).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_parser_ignores_legacy_machine_auth_cookie() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let mut item = test_shared_web_session("76561198000000001");
+        item.cookies.push(
+            "steamMachineAuth76561198000000001=secret; Domain=store.steampowered.com; Path=/"
+                .to_string(),
+        );
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![item],
+        };
+        write_test_share_package(&path, &manifest, None);
+        let prepared = prepare_quick_import_package(&path, None).unwrap();
+        let _ = fs::remove_dir_all(prepared.root);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_parser_rejects_malformed_login_cookie() {
+        let path = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let mut item = test_shared_web_session("76561198000000001");
+        item.cookies
+            .push("steamLoginSecure=invalid; Domain=store.steampowered.com; Path=/".to_string());
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![item],
+        };
+        write_test_share_package(&path, &manifest, None);
+        assert!(prepare_quick_import_package(&path, None).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn quick_share_perfect_database_requires_main_and_valid_sqlite() {
+        let steam_id = "76561198000000001";
+        let main_name = format!("{steam_id}.IM3.db");
+        let mut item = test_shared_web_session(steam_id);
+        item.kind = "perfect".to_string();
+        item.perfect_files = vec![main_name.clone()];
+        let manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![item.clone()],
+        };
+        let valid = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let entry_name = format!("perfect/{steam_id}/{main_name}");
+        let valid_database =
+            std::env::temp_dir().join(format!("nea-perfect-test-{}.db", Uuid::new_v4()));
+        {
+            let connection = rusqlite::Connection::open(&valid_database).unwrap();
+            connection
+                .execute_batch("PRAGMA user_version = 1;")
+                .unwrap();
+        }
+        let valid_database_bytes = fs::read(&valid_database).unwrap();
+        let _ = fs::remove_file(valid_database);
+        write_test_share_package_files(
+            &valid,
+            &manifest,
+            &[(entry_name.as_str(), valid_database_bytes.as_slice())],
+        );
+        let prepared = prepare_quick_import_package(&valid, None).unwrap();
+        let _ = fs::remove_dir_all(prepared.root);
+        let _ = fs::remove_file(valid);
+
+        let shm_name = format!("{steam_id}.IM3.db-shm");
+        let mut legacy_item = item.clone();
+        legacy_item.perfect_files = vec![main_name.clone(), shm_name.clone()];
+        let legacy_manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![legacy_item],
+        };
+        let legacy = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let shm_entry = format!("perfect/{steam_id}/{shm_name}");
+        write_test_share_package_files(
+            &legacy,
+            &legacy_manifest,
+            &[
+                (entry_name.as_str(), valid_database_bytes.as_slice()),
+                (shm_entry.as_str(), b"legacy transient shm"),
+            ],
+        );
+        let prepared = prepare_quick_import_package(&legacy, None).unwrap();
+        assert!(prepared
+            .perfect_files
+            .iter()
+            .filter(|(_, name, _)| name.ends_with(".db-shm"))
+            .all(|(_, _, path)| !path.exists()));
+        let _ = fs::remove_dir_all(prepared.root);
+        let _ = fs::remove_file(legacy);
+
+        let invalid = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        write_test_share_package_files(
+            &invalid,
+            &manifest,
+            &[(entry_name.as_str(), b"SQLite format 3\0valid")],
+        );
+        assert!(prepare_quick_import_package(&invalid, None).is_err());
+        let _ = fs::remove_file(invalid);
+
+        let unknown_ipc =
+            std::env::temp_dir().join(format!("nea-perfect-test-{}.db", Uuid::new_v4()));
+        {
+            let connection = rusqlite::Connection::open(&unknown_ipc).unwrap();
+            connection
+                .execute_batch("CREATE TABLE unrelated(value TEXT);")
+                .unwrap();
+        }
+        let unknown_ipc_bytes = fs::read(&unknown_ipc).unwrap();
+        let _ = fs::remove_file(unknown_ipc);
+        let ipc_name = format!("{steam_id}.IPC.db");
+        let mut ipc_item = test_shared_web_session(steam_id);
+        ipc_item.kind = "perfect".to_string();
+        ipc_item.perfect_files = vec![ipc_name.clone()];
+        let ipc_manifest = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![ipc_item],
+        };
+        let ipc = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let ipc_entry = format!("perfect/{steam_id}/{ipc_name}");
+        write_test_share_package_files(
+            &ipc,
+            &ipc_manifest,
+            &[(ipc_entry.as_str(), unknown_ipc_bytes.as_slice())],
+        );
+        assert!(prepare_quick_import_package(&ipc, None).is_err());
+        let _ = fs::remove_file(ipc);
+
+        item.perfect_files = vec![format!("{steam_id}.IM3.db-wal")];
+        let sidecar_only = NeaShareManifest {
+            format: NEA_SHARE_FORMAT_V1.to_string(),
+            exported_at: now(),
+            has_oopz_package: false,
+            web_sessions: vec![item],
+        };
+        let sidecar = std::env::temp_dir().join(format!("nea-share-test-{}.nea", Uuid::new_v4()));
+        let sidecar_entry = format!("perfect/{steam_id}/{steam_id}.IM3.db-wal");
+        write_test_share_package_files(
+            &sidecar,
+            &sidecar_only,
+            &[(sidecar_entry.as_str(), b"wal")],
+        );
+        assert!(prepare_quick_import_package(&sidecar, None).is_err());
+        let _ = fs::remove_file(sidecar);
+    }
+
+    #[test]
+    fn dev_smoke_manual_share_writer_roundtrips_and_replaces_existing_file() {
+        let root = std::env::temp_dir().join(format!("nea-share-writer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("accounts.nea-share");
+        fs::write(&path, b"old").unwrap();
+        let bytes = write_quick_share_package_atomic(
+            &path,
+            &[],
+            &[test_shared_web_session("76561198000000001")],
+            None,
+        )
+        .unwrap();
+        assert!(bytes > 0);
+        let prepared = prepare_quick_import_package(&path, None).unwrap();
+        assert_eq!(prepared.manifest.web_sessions.len(), 1);
+        let _ = fs::remove_dir_all(prepared.root);
+        assert!(write_quick_share_package_atomic(
+            &root.join("accounts.nea"),
+            &[],
+            &[test_shared_web_session("76561198000000001")],
+            None,
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10624,7 +12350,7 @@ mod tests {
     }
 
     #[test]
-    fn local_client_metadata_alone_does_not_discard_a_new_web_login() {
+    fn dev_smoke_local_client_metadata_alone_does_not_discard_a_new_web_login() {
         let steam_id = "76561199000000032";
         let mut data = AppData::default();
         data.steam.accounts.push(steam::SteamAccount {
@@ -10985,7 +12711,8 @@ mod tests {
                 avatar_url: None,
                 note: None,
             },
-            oopz_login: format!("login-{}", uid),
+            oopz_login: general_purpose::STANDARD
+                .encode(serde_json::json!({ "uid": uid }).to_string()),
             files: vec![ExportedFile {
                 path: format!("roaming/{}/state.json", uid),
                 data_base64: general_purpose::STANDARD.encode(b"state"),
@@ -11050,7 +12777,8 @@ mod tests {
                     avatar_url: None,
                     note: None,
                 },
-                oopz_login: "login-state".to_string(),
+                oopz_login: general_purpose::STANDARD
+                    .encode(serde_json::json!({ "uid": "uid-1" }).to_string()),
             }],
         };
         let create_package = |path: &Path, entry_name: &str| {
@@ -11084,6 +12812,202 @@ mod tests {
             prepare_v3_import(&unsafe_transaction, &AppData::default(), &unsafe_package).is_err()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oopz_share_identity_rejects_unsafe_or_mismatched_uid() {
+        let account = |uid: &str| ExportedAccount {
+            display_name: "account".to_string(),
+            uid: Some(uid.to_string()),
+            pid: None,
+            user_common_id: None,
+            masked_phone: None,
+            avatar_url: None,
+            note: None,
+        };
+        let login = |uid: &str| {
+            general_purpose::STANDARD.encode(serde_json::json!({ "uid": uid }).to_string())
+        };
+        assert_eq!(
+            validate_exported_oopz_identity(&account("safe_uid-1"), &login("safe_uid-1")).unwrap(),
+            "safe_uid-1"
+        );
+        assert!(
+            validate_exported_oopz_identity(&account("../outside"), &login("../outside")).is_err()
+        );
+        assert!(validate_exported_oopz_identity(&account("uid-one"), &login("uid-two")).is_err());
+    }
+
+    #[test]
+    fn steam_share_cookie_allowlist_excludes_machine_auth() {
+        let login = Cookie::parse(
+            "steamLoginSecure=76561198000000000%7Ctoken; Domain=store.steampowered.com; Path=/"
+                .to_string(),
+        )
+        .unwrap()
+        .into_owned();
+        let machine = Cookie::parse(
+            "steamMachineAuth76561198000000000=secret; Domain=store.steampowered.com; Path=/"
+                .to_string(),
+        )
+        .unwrap()
+        .into_owned();
+        assert!(is_required_steam_share_cookie(&login));
+        assert!(!is_required_steam_share_cookie(&machine));
+    }
+
+    #[test]
+    fn dev_smoke_share_path_commit_rolls_back_every_applied_item() {
+        let root = std::env::temp_dir().join(format!("nea-share-rollback-{}", Uuid::new_v4()));
+        let backup = root.join("backup");
+        let mut applied = Vec::new();
+        for index in 0..2 {
+            let staged = root.join(format!("staged-{index}.txt"));
+            let target = root.join(format!("target-{index}.txt"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(&staged, format!("new-{index}")).unwrap();
+            fs::write(&target, format!("old-{index}")).unwrap();
+            applied.push(apply_staged_share_path(&staged, &target, &backup, index).unwrap());
+            assert_eq!(fs::read_to_string(&target).unwrap(), format!("new-{index}"));
+        }
+        rollback_applied_share_paths(&mut applied).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("target-{index}.txt"))).unwrap(),
+                format!("old-{index}")
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn share_path_rollback_removes_new_targets_and_restores_failed_replace() {
+        let root = std::env::temp_dir().join(format!("nea-share-rollback-{}", Uuid::new_v4()));
+        let backup = root.join("backup");
+        fs::create_dir_all(&root).unwrap();
+
+        let staged_new = root.join("staged-new.txt");
+        let target_new = root.join("target-new.txt");
+        fs::write(&staged_new, b"new").unwrap();
+        let mut applied =
+            vec![apply_staged_share_path(&staged_new, &target_new, &backup, 0).unwrap()];
+        rollback_applied_share_paths(&mut applied).unwrap();
+        assert!(!target_new.exists());
+
+        let missing_staged = root.join("missing.txt");
+        let existing_target = root.join("existing.txt");
+        fs::write(&existing_target, b"original").unwrap();
+        assert!(apply_staged_share_path(&missing_staged, &existing_target, &backup, 1).is_err());
+        assert_eq!(fs::read(&existing_target).unwrap(), b"original");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quick_share_rollback_journal_replaces_previous_version() {
+        let root = std::env::temp_dir().join(format!("nea-share-journal-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut journal = QuickShareRollbackJournal {
+            affected_steam_ids: vec!["76561198000000001".to_string()],
+            web_sessions: Vec::new(),
+            perfect_profiles: HashMap::new(),
+            paths: Vec::new(),
+        };
+        write_quick_share_rollback_journal(&root, &journal).unwrap();
+        record_quick_share_rollback_path(
+            &root,
+            &mut journal,
+            &PathBuf::from(r"C:\target"),
+            Some(root.join("rollback").join("item-0")),
+        )
+        .unwrap();
+        let saved: QuickShareRollbackJournal =
+            serde_json::from_slice(&fs::read(root.join("rollback-journal.json")).unwrap()).unwrap();
+        assert_eq!(saved.paths.len(), 1);
+        assert!(!root.join("rollback-journal.json.bak").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quick_share_data_rollback_preserves_unaffected_sessions() {
+        let affected_id = "76561198000000001";
+        let unaffected_id = "76561198000000002";
+        let before = test_shared_web_session(affected_id).session;
+        let unaffected = test_shared_web_session(unaffected_id).session;
+        let mut current = AppData::default();
+        let mut imported = before.clone();
+        imported.display_name = "Imported".to_string();
+        current.steam.web_sessions = vec![imported, unaffected.clone()];
+        apply_quick_share_data_rollback(
+            &mut current,
+            &HashSet::from([affected_id.to_string()]),
+            std::slice::from_ref(&before),
+            &HashMap::new(),
+        );
+        assert!(current
+            .steam
+            .web_sessions
+            .iter()
+            .any(|session| session.steam_id.as_deref() == Some(affected_id)
+                && session.display_name == before.display_name));
+        assert!(current
+            .steam
+            .web_sessions
+            .iter()
+            .any(|session| session.id == unaffected.id));
+    }
+
+    #[test]
+    fn steam_store_account_page_parser_requires_matching_account_id() {
+        assert!(!validate_shared_steam_id("76561197960265728"));
+        assert!(validate_shared_steam_id("76561198000000001"));
+        assert_eq!(
+            steam_account_id_from_store_html("<script>var g_AccountID = 39734273;</script>"),
+            Some(39_734_273)
+        );
+        assert_eq!(
+            steam_account_id_from_store_html("<script>var g_AccountID = 0;</script>"),
+            Some(0)
+        );
+        assert_eq!(steam_account_id_from_store_html("Sign In"), None);
+    }
+
+    #[test]
+    fn stale_share_cleanup_pattern_only_accepts_generated_uuid_names() {
+        let id = Uuid::new_v4();
+        assert!(matches_uuid_artifact(
+            &format!("nea-share-{id}.nea"),
+            "nea-share-",
+            ".nea"
+        ));
+        assert!(matches_uuid_artifact(
+            &format!("nea-share-{id}.nea-share"),
+            "nea-share-",
+            ".nea-share"
+        ));
+        assert!(!matches_uuid_artifact(
+            "nea-share-my-export.nea",
+            "nea-share-",
+            ".nea"
+        ));
+    }
+
+    #[test]
+    fn share_packaging_copy_honors_cancellation() {
+        let cancelled = AtomicBool::new(true);
+        let mut source = std::io::Cursor::new(vec![1u8; 1024]);
+        let mut target = Vec::new();
+        let mut buffer = vec![0u8; 256 * 1024];
+        assert_eq!(
+            copy_with_share_cancellation_buffer(
+                &mut source,
+                &mut target,
+                Some(&cancelled),
+                &mut buffer,
+            )
+            .unwrap_err(),
+            QUICK_SHARE_CANCELLED
+        );
+        assert!(target.is_empty());
     }
 
     #[test]

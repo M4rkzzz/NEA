@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.2.7",
+    [string]$Version = "1.3.0",
     [ValidateRange(1, 16)]
     [int]$SampleMiB = 2,
     [ValidateRange(5, 120)]

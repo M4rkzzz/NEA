@@ -746,7 +746,11 @@ fn is_platform_process(
     process
         .exe()
         .is_some_and(|path| path.starts_with(Path::new(&installation.install_dir)))
-        || process.name().eq_ignore_ascii_case(EXECUTABLE_NAME)
+        || is_known_platform_process_name(process)
+}
+
+fn is_known_platform_process_name(process: &sysinfo::Process) -> bool {
+    process.name().eq_ignore_ascii_case(EXECUTABLE_NAME)
         || process.name().eq_ignore_ascii_case("完美世界竞技平台")
 }
 
@@ -846,11 +850,22 @@ pub fn prepare_oauth_login(installation: &PerfectArenaInstallation) -> Result<Sy
 }
 
 pub fn stop_for_share_transfer() -> Result<(), String> {
-    if let Ok(installation) = discover_installation() {
-        ensure_games_stopped()?;
-        stop(&installation)?;
+    ensure_games_stopped()?;
+    match discover_installation() {
+        Ok(installation) => stop(&installation),
+        Err(_)
+            if process_system()
+                .processes()
+                .values()
+                .any(is_known_platform_process_name) =>
+        {
+            Err(
+                "检测到完美世界竞技平台正在运行，但无法确认其安装位置；请手动退出后重试"
+                    .to_string(),
+            )
+        }
+        Err(_) => Ok(()),
     }
-    Ok(())
 }
 
 pub fn account_database_files(steam_id: &str) -> Vec<PathBuf> {
