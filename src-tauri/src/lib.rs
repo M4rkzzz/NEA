@@ -709,6 +709,7 @@ impl Drop for SwitchActivityGuard {
             .state::<AppState>()
             .switch_running
             .store(false, Ordering::SeqCst);
+        update_tray(&self.app);
     }
 }
 
@@ -720,6 +721,7 @@ fn acquire_switch_activity(app: &AppHandle) -> Result<SwitchActivityGuard, Strin
     {
         return Err("另一项切号或恢复操作正在进行，请稍候".to_string());
     }
+    update_tray(app);
     Ok(SwitchActivityGuard { app: app.clone() })
 }
 
@@ -3160,6 +3162,20 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn finish_tray_switch(app: &AppHandle, result: Result<SwitchResult, String>) {
+    if tray_switch_failed(&result) {
+        show_main_window(app);
+    }
+    let _ = app.emit("switch-finished", result);
+}
+
+fn tray_switch_failed(result: &Result<SwitchResult, String>) -> bool {
+    match result {
+        Ok(result) => !result.ok,
+        Err(_) => true,
+    }
+}
+
 fn set_webview_low_memory(window: &WebviewWindow, low_memory: bool) {
     let state = window.app_handle().state::<AppState>();
     if state
@@ -3219,15 +3235,440 @@ fn fit_main_window_to_monitor(window: &WebviewWindow, prefer_default_size: bool)
     }
 }
 
+#[derive(Debug, Clone)]
+struct TrayAccountMenuModel {
+    id: String,
+    label: String,
+    sort_label: String,
+    disambiguator: String,
+    enabled: bool,
+    current: bool,
+    last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TrayActionMenuModel {
+    id: String,
+    label: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TrayPerfectAccountMenuModel {
+    label: String,
+    sort_label: String,
+    disambiguator: String,
+    enabled: bool,
+    current: bool,
+    actions: Vec<TrayActionMenuModel>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrayMenuRuntime {
+    current_oopz_uid: Option<String>,
+    current_steam_id: Option<String>,
+    current_perfect_id: Option<String>,
+    busy: bool,
+    steam_ready: bool,
+    perfect_ready: bool,
+}
+
+fn tray_identifier_suffix(value: &str) -> String {
+    let mut suffix = value
+        .chars()
+        .filter(|character| !character.is_control() && !character.is_whitespace())
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>();
+    suffix.reverse();
+    let suffix = suffix.into_iter().collect::<String>();
+    if suffix.is_empty() {
+        "----".to_string()
+    } else {
+        suffix
+    }
+}
+
+fn sanitize_tray_label(value: &str, max_chars: usize) -> String {
+    let mut sanitized = String::new();
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+    if sanitized.chars().count() <= max_chars {
+        return sanitized;
+    }
+    let mut truncated = sanitized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn tray_public_name(value: &str, pending: &str, identifier: &str) -> (String, bool) {
+    let value = sanitize_tray_label(value, 48);
+    if value.is_empty() {
+        (
+            format!("{pending} · {}", tray_identifier_suffix(identifier)),
+            false,
+        )
+    } else {
+        (value, true)
+    }
+}
+
+fn steam_community_tray_name(data: &AppData, identity: &SteamIdentity) -> (String, bool) {
+    let display_name = sanitize_tray_label(&identity.display_name, 48);
+    let steam_id = identity.steam_id.as_deref();
+    let is_account_name = identity
+        .account_name
+        .as_deref()
+        .into_iter()
+        .chain(
+            data.steam
+                .accounts
+                .iter()
+                .filter(|account| Some(account.id.as_str()) == steam_id)
+                .map(|account| account.account_name.as_str()),
+        )
+        .chain(
+            data.steam
+                .web_sessions
+                .iter()
+                .filter(|session| session.steam_id.as_deref() == steam_id)
+                .filter_map(|session| session.account_name.as_deref()),
+        )
+        .chain(
+            data.steam_credentials
+                .iter()
+                .filter(|credential| credential.steam_id.as_deref() == steam_id)
+                .map(|credential| credential.account_name.as_str()),
+        )
+        .any(|account_name| {
+            display_name.eq_ignore_ascii_case(&sanitize_tray_label(account_name, 48))
+        });
+    let is_steam_id = identity
+        .steam_id
+        .as_deref()
+        .is_some_and(|steam_id| display_name == steam_id);
+    let looks_like_steam_id = display_name.len() == 17
+        && display_name
+            .chars()
+            .all(|character| character.is_ascii_digit());
+    if display_name.is_empty()
+        || display_name == "待登录网页账号"
+        || is_account_name
+        || is_steam_id
+        || looks_like_steam_id
+    {
+        let identifier = identity.steam_id.as_deref().unwrap_or(&identity.id);
+        return (
+            format!("社区 ID 待获取 · {}", tray_identifier_suffix(identifier)),
+            false,
+        );
+    }
+    (display_name, true)
+}
+
+fn perfect_rank(score: i64) -> &'static str {
+    if score <= 1000 {
+        "D"
+    } else if score <= 1150 {
+        "C"
+    } else if score <= 1300 {
+        "C+"
+    } else if score <= 1450 {
+        "金C+"
+    } else if score <= 1600 {
+        "B"
+    } else if score <= 1750 {
+        "B+"
+    } else if score <= 1900 {
+        "金B+"
+    } else if score <= 2050 {
+        "A"
+    } else if score <= 2200 {
+        "A+"
+    } else {
+        "金A+"
+    }
+}
+
+fn perfect_tray_summary(data: &AppData, steam_id: &str) -> (String, bool) {
+    let profile = data.perfect_profiles.get(steam_id);
+    let (name, known_name) = tray_public_name(
+        profile
+            .and_then(|profile| profile.nickname.as_deref())
+            .unwrap_or_default(),
+        "完美名称待获取",
+        steam_id,
+    );
+    let mut parts = vec![name];
+    if let Some(score) = profile.and_then(|profile| profile.score) {
+        parts.push(format!("{}{score}", perfect_rank(score)));
+    }
+    let reputation = if profile.is_some_and(|profile| {
+        profile.high_risk == Some(true) || profile.reputation_requires_verification == Some(true)
+    }) {
+        Some("高危")
+    } else {
+        profile
+            .and_then(|profile| profile.reputation_level.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(reputation) = reputation {
+        let reputation = sanitize_tray_label(reputation, 16);
+        if !reputation.is_empty() {
+            parts.push(reputation);
+        }
+    }
+    (parts.join(" "), known_name)
+}
+
+fn tray_current_label(label: String, current: bool) -> String {
+    if current {
+        format!("✓ {label}")
+    } else {
+        label
+    }
+}
+
+fn sort_tray_accounts(accounts: &mut [TrayAccountMenuModel]) {
+    accounts.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| right.last_used_at.cmp(&left.last_used_at))
+            .then_with(|| {
+                left.sort_label
+                    .to_lowercase()
+                    .cmp(&right.sort_label.to_lowercase())
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn disambiguate_tray_accounts(accounts: &mut [TrayAccountMenuModel]) {
+    let counts = accounts.iter().fold(HashMap::new(), |mut counts, account| {
+        *counts
+            .entry(account.sort_label.to_lowercase())
+            .or_insert(0usize) += 1;
+        counts
+    });
+    for account in accounts {
+        if counts
+            .get(&account.sort_label.to_lowercase())
+            .is_some_and(|count| *count > 1)
+        {
+            account.label = tray_current_label(
+                format!("{} · {}", account.sort_label, account.disambiguator),
+                account.current,
+            );
+        }
+    }
+}
+
+fn disambiguate_perfect_tray_accounts(accounts: &mut [TrayPerfectAccountMenuModel]) {
+    let counts = accounts.iter().fold(HashMap::new(), |mut counts, account| {
+        *counts
+            .entry(account.sort_label.to_lowercase())
+            .or_insert(0usize) += 1;
+        counts
+    });
+    for account in accounts {
+        if counts
+            .get(&account.sort_label.to_lowercase())
+            .is_some_and(|count| *count > 1)
+        {
+            account.label = tray_current_label(
+                format!("{} · {}", account.sort_label, account.disambiguator),
+                account.current,
+            );
+        }
+    }
+}
+
+fn oopz_tray_accounts(data: &AppData, runtime: &TrayMenuRuntime) -> Vec<TrayAccountMenuModel> {
+    let mut accounts = data
+        .accounts
+        .iter()
+        .map(|account| {
+            let identifier = account.uid.as_deref().unwrap_or(&account.id);
+            let (name, _known_name) =
+                tray_public_name(&account.display_name, "昵称待获取", identifier);
+            let current = runtime
+                .current_oopz_uid
+                .as_deref()
+                .is_some_and(|uid| account.uid.as_deref() == Some(uid));
+            TrayAccountMenuModel {
+                id: format!("oopz-switch:{}", account.id),
+                label: tray_current_label(name.clone(), current),
+                sort_label: name,
+                disambiguator: tray_identifier_suffix(identifier),
+                enabled: !current && !runtime.busy,
+                current,
+                last_used_at: account.last_used_at.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    disambiguate_tray_accounts(&mut accounts);
+    sort_tray_accounts(&mut accounts);
+    accounts
+}
+
+fn steam_tray_accounts(data: &AppData, runtime: &TrayMenuRuntime) -> Vec<TrayAccountMenuModel> {
+    let mut accounts = data
+        .steam_identities
+        .iter()
+        .filter(|identity| identity.capabilities.credential && identity.steam_id.is_some())
+        .map(|identity| {
+            let steam_id = identity.steam_id.as_deref().expect("filtered SteamID");
+            let (name, _known_name) = steam_community_tray_name(data, identity);
+            let current = runtime.current_steam_id.as_deref() == Some(steam_id);
+            let last_used_at = data
+                .steam
+                .accounts
+                .iter()
+                .find(|account| account.id == steam_id)
+                .and_then(|account| account.last_used_at.clone());
+            TrayAccountMenuModel {
+                id: format!("steam-switch:{steam_id}"),
+                label: tray_current_label(name.clone(), current),
+                sort_label: name,
+                disambiguator: tray_identifier_suffix(steam_id),
+                enabled: runtime.steam_ready && !current && !runtime.busy,
+                current,
+                last_used_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    disambiguate_tray_accounts(&mut accounts);
+    sort_tray_accounts(&mut accounts);
+    accounts
+}
+
+fn perfect_tray_accounts(
+    data: &AppData,
+    runtime: &TrayMenuRuntime,
+) -> Vec<TrayPerfectAccountMenuModel> {
+    let mut accounts = data
+        .steam_identities
+        .iter()
+        .filter(|identity| identity.capabilities.web_login)
+        .filter_map(|identity| {
+            let steam_id = identity
+                .steam_id
+                .as_deref()
+                .filter(|steam_id| is_valid_steam_id64(steam_id))?;
+            let session_id = identity.web_session_id.as_deref()?;
+            let (summary, _known_name) = perfect_tray_summary(data, steam_id);
+            let perfect_current = runtime.current_perfect_id.as_deref() == Some(steam_id);
+            let steam_current = runtime.current_steam_id.as_deref() == Some(steam_id);
+            let has_credential = has_saved_credential_for_steam_id(data, steam_id);
+            let only_enabled = runtime.perfect_ready && !perfect_current && !runtime.busy;
+            let sync_enabled = runtime.perfect_ready
+                && (steam_current || runtime.steam_ready && has_credential)
+                && !(perfect_current && steam_current)
+                && !runtime.busy;
+            let only_label = if !runtime.perfect_ready {
+                "仅切换完美（未找到客户端）".to_string()
+            } else {
+                "仅切换完美".to_string()
+            };
+            let sync_label = if !runtime.perfect_ready {
+                "同步切换 Steam + 完美（未找到完美客户端）".to_string()
+            } else if !steam_current && !runtime.steam_ready {
+                "同步切换 Steam + 完美（Steam 未就绪）".to_string()
+            } else if !steam_current && !has_credential {
+                "同步切换 Steam + 完美（未保存 Steam 账密）".to_string()
+            } else {
+                "同步切换 Steam + 完美".to_string()
+            };
+            Some(TrayPerfectAccountMenuModel {
+                label: tray_current_label(summary.clone(), perfect_current),
+                sort_label: summary,
+                disambiguator: tray_identifier_suffix(steam_id),
+                enabled: !runtime.busy,
+                current: perfect_current,
+                actions: vec![
+                    TrayActionMenuModel {
+                        id: format!("perfect-only:{session_id}"),
+                        label: only_label,
+                        enabled: only_enabled,
+                    },
+                    TrayActionMenuModel {
+                        id: format!("perfect-sync:{session_id}"),
+                        label: sync_label,
+                        enabled: sync_enabled,
+                    },
+                ],
+            })
+        })
+        .collect::<Vec<_>>();
+    disambiguate_perfect_tray_accounts(&mut accounts);
+    accounts.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| {
+                left.sort_label
+                    .to_lowercase()
+                    .cmp(&right.sort_label.to_lowercase())
+            })
+            .then_with(|| left.actions[0].id.cmp(&right.actions[0].id))
+    });
+    accounts
+}
+
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<AppState>();
-    let mut data = state
-        .data
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let (mut data, busy) = {
+        let data = state
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        (data, state.switch_running.load(Ordering::SeqCst))
+    };
     reconcile_steam_identities(&mut data);
-    let current_uid = current_registry_login().and_then(|login| uid_from_registry_login(&login));
+    let steam_client_running = steam::SteamAdapter::client_is_running();
+    let steam_active_account_id = steam_client_running
+        .then(steam::SteamAdapter::active_user_account_id)
+        .flatten();
+    let current_steam_id = steam_active_account_id.and_then(|active_account_id| {
+        data.steam_identities
+            .iter()
+            .filter_map(|identity| identity.steam_id.as_deref())
+            .find(|steam_id| steam::SteamAdapter::account_id32(steam_id) == Some(active_account_id))
+            .map(str::to_string)
+    });
+    let perfect_workspace = perfect_arena::workspace(&data.steam);
+    let runtime = TrayMenuRuntime {
+        current_oopz_uid: current_registry_login()
+            .and_then(|login| uid_from_registry_login(&login)),
+        current_steam_id,
+        current_perfect_id: perfect_workspace.current_account_id,
+        busy,
+        steam_ready: data
+            .steam
+            .installation
+            .as_ref()
+            .is_some_and(|installation| installation.valid),
+        perfect_ready: perfect_workspace
+            .installation
+            .as_ref()
+            .is_some_and(|installation| installation.valid),
+    };
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(
         app,
@@ -3237,115 +3678,97 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None::<&str>,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    if runtime.busy {
+        menu.append(&MenuItem::with_id(
+            app,
+            "switch-busy",
+            "正在处理账号…",
+            false,
+            None::<&str>,
+        )?)?;
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+    }
 
-    let oopz_menu = Submenu::new(app, "OOPZ", true)?;
-    if data.accounts.is_empty() {
+    let oopz_menu = Submenu::new(app, "OOPZ", !runtime.busy)?;
+    let oopz_accounts = oopz_tray_accounts(&data, &runtime);
+    if oopz_accounts.is_empty() {
         oopz_menu.append(&MenuItem::with_id(
             app,
             "oopz-empty",
-            "暂无账号",
+            "暂无可切换账号",
             false,
             None::<&str>,
         )?)?;
     } else {
-        for account in &data.accounts {
-            let is_current = account.uid.as_deref() == current_uid.as_deref();
-            let label = if is_current {
-                format!("{}（登录中）", account.display_name)
-            } else if account.has_login_state {
-                format!("切换到 {}", account.display_name)
-            } else {
-                format!("登录 {}", account.display_name)
-            };
+        for account in oopz_accounts {
             oopz_menu.append(&MenuItem::with_id(
                 app,
-                format!("oopz-switch:{}", account.id),
-                label,
-                !is_current,
+                account.id,
+                account.label,
+                account.enabled,
                 None::<&str>,
             )?)?;
         }
     }
     menu.append(&oopz_menu)?;
 
-    let steam_menu = Submenu::new(app, "Steam", true)?;
-    let steam_client_running = steam::SteamAdapter::client_is_running();
-    let steam_active_account_id = steam::SteamAdapter::active_user_account_id();
-    let credential_identities = data
-        .steam_identities
-        .iter()
-        .filter(|identity| identity.capabilities.credential && identity.steam_id.is_some())
-        .collect::<Vec<_>>();
-    if credential_identities.is_empty() {
+    let steam_menu = Submenu::new(app, "Steam", !runtime.busy)?;
+    let steam_accounts = steam_tray_accounts(&data, &runtime);
+    if steam_accounts.is_empty() {
         steam_menu.append(&MenuItem::with_id(
             app,
             "steam-empty",
-            "暂无可用账密账号",
+            "暂无可切换账号",
             false,
             None::<&str>,
         )?)?;
     } else {
-        for identity in credential_identities {
-            let mut label = match identity
-                .note
-                .as_deref()
-                .filter(|note| !note.trim().is_empty())
-            {
-                Some(note) => format!("{}（{}）", identity.display_name, note),
-                None => identity.display_name.clone(),
-            };
-            let steam_id = identity.steam_id.as_deref().expect("filtered SteamID");
-            let is_current = steam_client_running
-                && steam::SteamAdapter::account_id32(steam_id) == steam_active_account_id;
-            if is_current {
-                label.push_str("（登录中）");
-            }
+        for account in steam_accounts {
             steam_menu.append(&MenuItem::with_id(
                 app,
-                format!("steam-switch:{steam_id}"),
-                label,
-                !is_current,
+                account.id,
+                account.label,
+                account.enabled,
                 None::<&str>,
             )?)?;
         }
     }
     menu.append(&steam_menu)?;
 
-    let perfect_menu = Submenu::new(app, "完美对战平台", true)?;
-    let verified_web_sessions = data
-        .steam
-        .web_sessions
-        .iter()
-        .filter(|session| session.steam_id.is_some())
-        .collect::<Vec<_>>();
-    if verified_web_sessions.is_empty() {
+    let perfect_menu = Submenu::new(app, "完美对战平台", !runtime.busy)?;
+    let perfect_accounts = perfect_tray_accounts(&data, &runtime);
+    if perfect_accounts.is_empty() {
         perfect_menu.append(&MenuItem::with_id(
             app,
-            "perfect-web-empty",
-            "暂无 Steam 网页账号",
+            "perfect-empty",
+            "暂无可切换账号",
             false,
             None::<&str>,
         )?)?;
     } else {
-        for session in verified_web_sessions {
-            let label = session
-                .note
-                .as_deref()
-                .filter(|note| !note.trim().is_empty())
-                .map(|note| format!("{}（{}）", session.display_name, note))
-                .unwrap_or_else(|| session.display_name.clone());
-            perfect_menu.append(&MenuItem::with_id(
-                app,
-                format!("perfect-web:{}", session.id),
-                label,
-                true,
-                None::<&str>,
-            )?)?;
+        for account in perfect_accounts {
+            let account_menu = Submenu::new(app, account.label, account.enabled)?;
+            for action in account.actions {
+                account_menu.append(&MenuItem::with_id(
+                    app,
+                    action.id,
+                    action.label,
+                    action.enabled,
+                    None::<&str>,
+                )?)?;
+            }
+            perfect_menu.append(&account_menu)?;
         }
     }
     menu.append(&perfect_menu)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "退出 NEA",
+        true,
+        None::<&str>,
+    )?)?;
     Ok(menu)
 }
 
@@ -6162,7 +6585,15 @@ async fn switch_perfect_web_account_impl(
             .steam_id
             .clone()
             .ok_or_else(|| "请先登录并识别该 Steam 网页账号".to_string())?;
-        (steam_id, session.display_name.clone())
+        let display_name = data
+            .perfect_profiles
+            .get(&steam_id)
+            .and_then(|profile| profile.nickname.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("完美账号 · {}", tray_identifier_suffix(&steam_id)));
+        (steam_id, display_name)
     };
     let installation = perfect_arena::discover_installation()?;
     let installation_for_prepare = installation.clone();
@@ -6209,7 +6640,6 @@ async fn switch_perfect_web_account_impl(
     .map_err(|_| "等待完美账号登录的后台任务异常终止，请重试".to_string())?;
     if login_result.is_ok() {
         let _ = oauth_window.destroy();
-        update_tray(&app);
     }
     login_result?;
     let all_steam_ids = {
@@ -6260,7 +6690,9 @@ async fn get_perfect_arena_profiles(
             .into_iter()
             .collect::<Vec<_>>()
     };
-    refresh_perfect_profiles_for_ids(&app, steam_ids, false).await
+    let profiles = refresh_perfect_profiles_for_ids(&app, steam_ids, false).await?;
+    update_tray(&app);
+    Ok(profiles)
 }
 
 #[tauri::command]
@@ -6692,7 +7124,6 @@ async fn switch_steam_account_impl(
         if let Some((_, credential)) = previous_login.as_mut() {
             clear_sensitive_string(&mut credential.password);
         }
-        update_tray(&app);
         Ok(SwitchResult {
             ok: true,
             message: format!("已切换到 Steam 账号 {}", account_name),
@@ -11437,7 +11868,6 @@ fn switch_account_inner(
     }
     save_data(&data)?;
     drop(data);
-    update_tray(&app);
     Ok(SwitchResult {
         ok: true,
         message: format!("已切换到 {} 并启动 OOPZ", account.display_name),
@@ -11587,7 +12017,8 @@ pub fn run() {
                     let _ = spawn_watcher();
                 }
             }
-            let mut tray_builder = TrayIconBuilder::with_id("main-tray").tooltip("NEA");
+            let mut tray_builder =
+                TrayIconBuilder::with_id("main-tray").tooltip("NEA · 左键打开，右键切换账号");
             if let Some(icon) = app.default_window_icon() {
                 tray_builder = tray_builder.icon(icon.clone());
             }
@@ -11616,8 +12047,10 @@ pub fn run() {
                                 let state = app_handle.state::<AppState>();
                                 let result =
                                     switch_account_inner(app_handle.clone(), state, account_id);
-                                let _ = app_handle
-                                    .emit("switch-finished", result.map_err(|e| e.to_string()));
+                                finish_tray_switch(
+                                    &app_handle,
+                                    result.map_err(|error| error.to_string()),
+                                );
                             });
                         }
                         _ if id.starts_with("steam-switch:") => {
@@ -11628,21 +12061,37 @@ pub fn run() {
                                     app_handle.clone(),
                                     account_id,
                                 ));
-                                let _ = app_handle.emit(
-                                    "switch-finished",
+                                finish_tray_switch(
+                                    &app_handle,
                                     result.map_err(|error| error.to_string()),
                                 );
                             });
                         }
-                        _ if id.starts_with("perfect-web:") => {
-                            let session_id = id.trim_start_matches("perfect-web:").to_string();
+                        _ if id.starts_with("perfect-only:") => {
+                            let session_id = id.trim_start_matches("perfect-only:").to_string();
                             let app_handle = app.clone();
                             thread::spawn(move || {
                                 let result = tauri::async_runtime::block_on(
                                     switch_perfect_web_account(app_handle.clone(), session_id),
                                 );
-                                let _ = app_handle.emit(
-                                    "switch-finished",
+                                finish_tray_switch(
+                                    &app_handle,
+                                    result.map_err(|error| error.to_string()),
+                                );
+                            });
+                        }
+                        _ if id.starts_with("perfect-sync:") => {
+                            let session_id = id.trim_start_matches("perfect-sync:").to_string();
+                            let app_handle = app.clone();
+                            thread::spawn(move || {
+                                let result = tauri::async_runtime::block_on(
+                                    switch_steam_and_perfect_account(
+                                        app_handle.clone(),
+                                        session_id,
+                                    ),
+                                );
+                                finish_tray_switch(
+                                    &app_handle,
                                     result.map_err(|error| error.to_string()),
                                 );
                             });
@@ -12211,7 +12660,7 @@ mod tests {
             most_recent: false,
             userdata_captured: false,
             last_used_at: None,
-            note: None,
+            note: Some("不要显示此备注".to_string()),
         });
         data.steam.web_sessions.push(steam::SteamWebSession {
             id: "allcaps-web".to_string(),
@@ -12252,6 +12701,152 @@ mod tests {
         assert!(capabilities.web_login);
         assert!(capabilities.credential);
         assert!(capabilities.perfect_profile);
+
+        let runtime = TrayMenuRuntime {
+            current_perfect_id: Some(steam_id.to_string()),
+            steam_ready: true,
+            perfect_ready: true,
+            ..TrayMenuRuntime::default()
+        };
+        let steam_accounts = steam_tray_accounts(&data, &runtime);
+        assert_eq!(steam_accounts.len(), 1);
+        assert_eq!(steam_accounts[0].label, "Client Name");
+        assert!(!steam_accounts[0].label.contains("allcaps"));
+        assert!(!steam_accounts[0].label.contains(steam_id));
+        assert!(!steam_accounts[0].label.contains("不要显示此备注"));
+        let unavailable_runtime = TrayMenuRuntime::default();
+        assert!(!steam_tray_accounts(&data, &unavailable_runtime)[0].enabled);
+
+        assert_eq!(sanitize_tray_label("  Client\n\0Name\t", 48), "Client Name");
+        let long_label = sanitize_tray_label(&"名".repeat(80), 48);
+        assert_eq!(long_label.chars().count(), 48);
+        assert!(long_label.ends_with('…'));
+        assert!(tray_switch_failed(&Err("失败".to_string())));
+        assert!(tray_switch_failed(&Ok(SwitchResult {
+            ok: false,
+            message: "需要用户处理".to_string(),
+        })));
+        assert!(!tray_switch_failed(&Ok(SwitchResult {
+            ok: true,
+            message: "完成".to_string(),
+        })));
+
+        let perfect_accounts = perfect_tray_accounts(&data, &runtime);
+        assert_eq!(perfect_accounts.len(), 1);
+        assert_eq!(perfect_accounts[0].label, "✓ Perfect Name C+1200 优秀");
+        assert_eq!(perfect_accounts[0].actions.len(), 2);
+        assert_eq!(
+            perfect_accounts[0].actions[0].id,
+            "perfect-only:allcaps-web"
+        );
+        assert_eq!(perfect_accounts[0].actions[0].label, "仅切换完美");
+        assert!(!perfect_accounts[0].actions[0].enabled);
+        assert_eq!(
+            perfect_accounts[0].actions[1].id,
+            "perfect-sync:allcaps-web"
+        );
+        assert!(perfect_accounts[0].actions[1].enabled);
+
+        let mut fallback_identity = data.steam_identities[0].clone();
+        fallback_identity.display_name = "allcaps".to_string();
+        let (fallback, known) = steam_community_tray_name(&data, &fallback_identity);
+        assert!(!known);
+        assert!(fallback.starts_with("社区 ID 待获取"));
+        assert!(!fallback.contains("allcaps"));
+        assert!(!fallback.contains(steam_id));
+
+        let mut fallback_data = data.clone();
+        fallback_data.steam_identities[0].display_name = "allcaps".to_string();
+        let fallback_accounts = steam_tray_accounts(&fallback_data, &runtime);
+        assert!(fallback_accounts[0].enabled);
+        assert!(fallback_accounts[0].label.starts_with("社区 ID 待获取"));
+
+        fallback_data.steam_credentials.push(SteamSavedCredential {
+            account_name: "historical-login".to_string(),
+            password: "historical-password".to_string(),
+            steam_id: Some(steam_id.to_string()),
+            updated_at: now(),
+        });
+        fallback_identity.display_name = "historical-login".to_string();
+        assert!(!steam_community_tray_name(&fallback_data, &fallback_identity).1);
+        fallback_identity.display_name = "76561198000000999".to_string();
+        assert!(!steam_community_tray_name(&fallback_data, &fallback_identity).1);
+
+        let second_steam_id = "76561198000000011";
+        let mut duplicate_name_data = data.clone();
+        duplicate_name_data
+            .steam
+            .accounts
+            .push(steam::SteamAccount {
+                id: second_steam_id.to_string(),
+                account_name: "another-login".to_string(),
+                display_name: "Client Name".to_string(),
+                remember_password: true,
+                most_recent: false,
+                userdata_captured: false,
+                last_used_at: None,
+                note: None,
+            });
+        duplicate_name_data
+            .steam_credentials
+            .push(SteamSavedCredential {
+                account_name: "another-login".to_string(),
+                password: "another-password".to_string(),
+                steam_id: Some(second_steam_id.to_string()),
+                updated_at: now(),
+            });
+        duplicate_name_data
+            .steam
+            .web_sessions
+            .push(steam::SteamWebSession {
+                id: "another-web".to_string(),
+                steam_id: Some(second_steam_id.to_string()),
+                account_name: Some("another-login".to_string()),
+                display_name: "Another Web Name".to_string(),
+                note: None,
+                created_at: now(),
+                last_verified_at: Some(now()),
+            });
+        let mut second_profile = duplicate_name_data.perfect_profiles[steam_id].clone();
+        second_profile.steam_id = second_steam_id.to_string();
+        duplicate_name_data
+            .perfect_profiles
+            .insert(second_steam_id.to_string(), second_profile);
+        reconcile_steam_identities(&mut duplicate_name_data);
+        let duplicate_steam_accounts = steam_tray_accounts(&duplicate_name_data, &runtime);
+        assert_eq!(duplicate_steam_accounts.len(), 2);
+        assert!(duplicate_steam_accounts
+            .iter()
+            .any(|account| account.label == "Client Name · 0010"));
+        assert!(duplicate_steam_accounts
+            .iter()
+            .any(|account| account.label == "Client Name · 0011"));
+        let duplicate_perfect_accounts = perfect_tray_accounts(&duplicate_name_data, &runtime);
+        assert_eq!(duplicate_perfect_accounts.len(), 2);
+        assert!(duplicate_perfect_accounts
+            .iter()
+            .any(|account| account.label == "✓ Perfect Name C+1200 优秀 · 0010"));
+        assert!(duplicate_perfect_accounts
+            .iter()
+            .any(|account| account.label == "Perfect Name C+1200 优秀 · 0011"));
+
+        let mut duplicate_data = data.clone();
+        let mut duplicate_session = duplicate_data.steam.web_sessions[0].clone();
+        duplicate_session.id = "duplicate-web".to_string();
+        duplicate_data.steam.web_sessions.push(duplicate_session);
+        reconcile_steam_identities(&mut duplicate_data);
+        assert_eq!(perfect_tray_accounts(&duplicate_data, &runtime).len(), 1);
+
+        let busy_runtime = TrayMenuRuntime {
+            busy: true,
+            steam_ready: true,
+            perfect_ready: true,
+            ..TrayMenuRuntime::default()
+        };
+        assert!(perfect_tray_accounts(&data, &busy_runtime)[0]
+            .actions
+            .iter()
+            .all(|action| !action.enabled));
     }
 
     #[test]
