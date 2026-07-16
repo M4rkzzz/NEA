@@ -336,9 +336,17 @@ button.primary.danger-confirm:hover:not(:disabled) {
 }
 
 .share-center-toolbar span {
-  margin-left: auto;
   color: #68757d;
   font-size: 12px;
+}
+
+.share-center-toolbar .share-selection-count {
+  margin-left: auto;
+}
+
+.share-center-toolbar .share-selection-notice {
+  color: #b42318;
+  font-weight: 600;
 }
 
 .share-tree {
@@ -352,10 +360,6 @@ button.primary.danger-confirm:hover:not(:disabled) {
   border: 1px solid #dce3e7;
   border-radius: 8px;
   background: #fff;
-}
-
-.share-tree-platform[data-disabled="true"] {
-  background: #f6f8f9;
 }
 
 .share-tree-parent,
@@ -404,13 +408,6 @@ button.primary.danger-confirm:hover:not(:disabled) {
   margin-left: auto;
   color: #748087;
   font-size: 11px;
-}
-
-.share-tree-parent .unsupported-badge,
-.share-tree-children em {
-  color: #8a9297;
-  font-size: 11px;
-  font-style: normal;
 }
 
 .share-tree-children {
@@ -471,22 +468,63 @@ button.primary.danger-confirm:hover:not(:disabled) {
   background: rgba(180, 35, 24, 0.025);
 }
 
-.share-tree-children em {
-  margin-left: auto;
-}
-
 .share-tree-empty {
   padding: 10px 0;
 }
 
-.share-platform-note {
-  margin: 2px 0 7px;
-  padding: 7px 9px;
-  border-radius: 6px;
-  background: #f5f7f9;
-  color: #66737b;
+.share-steam-column-head,
+.share-steam-account-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 66px 66px;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-steam-column-head {
+  min-height: 26px;
+  color: #7a878e;
   font-size: 10px;
-  line-height: 1.45;
+}
+
+.share-steam-column-head b {
+  font-weight: 500;
+  text-align: center;
+}
+
+.share-steam-account-row {
+  min-height: 42px;
+  border-top: 1px solid #eef1f3;
+}
+
+.share-steam-account {
+  display: grid;
+  min-width: 0;
+}
+
+.share-steam-account strong,
+.share-steam-account small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-steam-account strong {
+  color: #303a40;
+  font-size: 12px;
+}
+
+.share-steam-account small {
+  color: #839097;
+  font-size: 10px;
+}
+
+.share-steam-capability {
+  min-height: 0 !important;
+  justify-content: center;
+  gap: 5px !important;
+  border: 0 !important;
+  color: #52616a;
+  font-size: 11px;
 }
 
 .share-center-transfer {
@@ -501,12 +539,6 @@ button.primary.danger-confirm:hover:not(:disabled) {
   width: 100%;
   height: 6px;
   accent-color: #2563eb;
-}
-
-.share-dedupe-note {
-  margin: 0;
-  color: #7a858c;
-  font-size: 11px;
 }
 
 .confirm-actions {
@@ -1763,12 +1795,6 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   padding-top: 2px;
 }
 
-.share-file-transfer-row span {
-  min-width: 0;
-  color: #7a858c;
-  font-size: 11px;
-}
-
 .quick-code {
   min-width: 0;
   flex: 1;
@@ -1864,11 +1890,6 @@ html[data-theme="dark"] .perfect-card-menu {
   color: #e4e8eb;
 }
 
-html[data-theme="dark"] .share-platform-note {
-  background: #292929;
-  color: #a9b1b7;
-}
-
 html[data-theme="dark"] .panel,
 html[data-theme="dark"] .account-row,
 html[data-theme="dark"] .perfect-account-card {
@@ -1962,12 +1983,25 @@ html[data-theme="dark"] .perfect-card-metrics strong,
 html[data-theme="dark"] .confirm-dialog p,
 html[data-theme="dark"] .share-center-header h2,
 html[data-theme="dark"] .share-tree-parent strong,
-html[data-theme="dark"] .share-tree-children label strong {
+html[data-theme="dark"] .share-tree-children label strong,
+html[data-theme="dark"] .share-steam-account strong {
   color: #eef1f3;
 }
 
 html[data-theme="dark"] .confirm-description {
   color: #aeb8bd;
+}
+
+html[data-theme="dark"] .share-center-header p,
+html[data-theme="dark"] .share-selection-count,
+html[data-theme="dark"] .share-available-filter,
+html[data-theme="dark"] .share-perfect-meta b {
+  color: #b8c2c7;
+}
+
+html[data-theme="dark"] .share-selection-notice,
+html[data-theme="dark"] .share-perfect-meta b[data-danger="true"] {
+  color: #ff8a80;
 }
 
 html[data-theme="dark"] .account-row[data-selected="true"],
@@ -2033,9 +2067,16 @@ html[data-theme="dark"] .steam-import-inline-error {
 }
 
 html[data-theme="dark"] .share-tree-children label,
+html[data-theme="dark"] .share-steam-account-row,
 html[data-theme="dark"] .account-details,
 html[data-theme="dark"] .plugin-health {
   border-color: #30383d;
+}
+
+html[data-theme="dark"] .share-steam-account small,
+html[data-theme="dark"] .share-steam-column-head,
+html[data-theme="dark"] .share-steam-capability {
+  color: #a9b1b7;
 }
 
 html[data-theme="dark"] .identity-capabilities b {
