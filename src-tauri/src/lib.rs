@@ -21,7 +21,7 @@ use std::{
 };
 use sysinfo::{Pid, ProcessRefreshKind, Signal, System, UpdateKind};
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::{Cookie, PageLoadEvent},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl,
@@ -571,6 +571,7 @@ struct AppState {
     steam_capability_paused: AtomicBool,
     steam_capability_cancelled: AtomicBool,
     main_webview_low_memory: AtomicBool,
+    tray_perfect_available_only: AtomicBool,
 }
 
 fn initial_app_state() -> AppState {
@@ -597,6 +598,7 @@ fn initial_app_state() -> AppState {
         steam_capability_paused: AtomicBool::new(false),
         steam_capability_cancelled: AtomicBool::new(false),
         main_webview_low_memory: AtomicBool::new(false),
+        tray_perfect_available_only: AtomicBool::new(false),
     }
 }
 
@@ -3075,6 +3077,35 @@ fn update_tray(app: &AppHandle) {
     }
 }
 
+fn rebuild_and_reopen_perfect_tray_menu(app: &AppHandle) -> Result<(), String> {
+    let BuiltTrayMenus { root, perfect } =
+        build_tray_menus(app).map_err(|error| error.to_string())?;
+    let tray = app
+        .tray_by_id("main-tray")
+        .ok_or_else(|| "未找到系统托盘".to_string())?;
+    tray.set_menu(Some(root))
+        .map_err(|error| error.to_string())?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "未找到 NEA 主窗口".to_string())?;
+    window
+        .popup_menu(&perfect)
+        .map_err(|error| error.to_string())
+}
+
+fn toggle_perfect_available_filter(app: &AppHandle) {
+    app.state::<AppState>()
+        .tray_perfect_available_only
+        .fetch_xor(true, Ordering::SeqCst);
+    if let Err(error) = rebuild_and_reopen_perfect_tray_menu(app) {
+        app.state::<AppState>()
+            .tray_perfect_available_only
+            .fetch_xor(true, Ordering::SeqCst);
+        update_tray(app);
+        finish_tray_switch(app, Err(format!("无法更新完美账号筛选菜单: {error}")));
+    }
+}
+
 fn refresh_app_data_from_disk(app: &AppHandle) -> AppData {
     let data = load_data();
     let state = app.state::<AppState>();
@@ -3253,11 +3284,76 @@ struct TrayActionMenuModel {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerfectTrayRank {
+    GoldAPlus,
+    APlus,
+    A,
+    GoldBPlus,
+    BPlus,
+    B,
+    GoldCPlus,
+    CPlus,
+    C,
+    D,
+    Pending,
+}
+
+impl PerfectTrayRank {
+    const DISPLAY_ORDER: [Self; 11] = [
+        Self::GoldAPlus,
+        Self::APlus,
+        Self::A,
+        Self::GoldBPlus,
+        Self::BPlus,
+        Self::B,
+        Self::GoldCPlus,
+        Self::CPlus,
+        Self::C,
+        Self::D,
+        Self::Pending,
+    ];
+
+    fn from_score(score: Option<i64>) -> Self {
+        match score {
+            None => Self::Pending,
+            Some(score) if score <= 1000 => Self::D,
+            Some(score) if score <= 1150 => Self::C,
+            Some(score) if score <= 1300 => Self::CPlus,
+            Some(score) if score <= 1450 => Self::GoldCPlus,
+            Some(score) if score <= 1600 => Self::B,
+            Some(score) if score <= 1750 => Self::BPlus,
+            Some(score) if score <= 1900 => Self::GoldBPlus,
+            Some(score) if score <= 2050 => Self::A,
+            Some(score) if score <= 2200 => Self::APlus,
+            Some(_) => Self::GoldAPlus,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::GoldAPlus => "金A+",
+            Self::APlus => "A+",
+            Self::A => "A",
+            Self::GoldBPlus => "金B+",
+            Self::BPlus => "B+",
+            Self::B => "B",
+            Self::GoldCPlus => "金C+",
+            Self::CPlus => "C+",
+            Self::C => "C",
+            Self::D => "D",
+            Self::Pending => "待检测",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TrayPerfectAccountMenuModel {
     label: String,
     sort_label: String,
     disambiguator: String,
+    rank: PerfectTrayRank,
+    blocked: bool,
     enabled: bool,
     current: bool,
     actions: Vec<TrayActionMenuModel>,
@@ -3271,6 +3367,7 @@ struct TrayMenuRuntime {
     busy: bool,
     steam_ready: bool,
     perfect_ready: bool,
+    perfect_available_only: bool,
 }
 
 fn tray_identifier_suffix(value: &str) -> String {
@@ -3380,27 +3477,18 @@ fn steam_community_tray_name(data: &AppData, identity: &SteamIdentity) -> (Strin
 }
 
 fn perfect_rank(score: i64) -> &'static str {
-    if score <= 1000 {
-        "D"
-    } else if score <= 1150 {
-        "C"
-    } else if score <= 1300 {
-        "C+"
-    } else if score <= 1450 {
-        "金C+"
-    } else if score <= 1600 {
-        "B"
-    } else if score <= 1750 {
-        "B+"
-    } else if score <= 1900 {
-        "金B+"
-    } else if score <= 2050 {
-        "A"
-    } else if score <= 2200 {
-        "A+"
-    } else {
-        "金A+"
-    }
+    PerfectTrayRank::from_score(Some(score)).label()
+}
+
+fn perfect_profile_is_high_risk(profile: Option<&perfect_arena::PerfectArenaProfile>) -> bool {
+    profile.is_some_and(|profile| {
+        profile.high_risk == Some(true) || profile.reputation_requires_verification == Some(true)
+    })
+}
+
+fn perfect_account_is_blocked(data: &AppData, steam_id: &str) -> bool {
+    data.perfect_unavailable_account_ids.contains(steam_id)
+        || perfect_profile_is_high_risk(data.perfect_profiles.get(steam_id))
 }
 
 fn perfect_tray_summary(data: &AppData, steam_id: &str) -> (String, bool) {
@@ -3416,9 +3504,9 @@ fn perfect_tray_summary(data: &AppData, steam_id: &str) -> (String, bool) {
     if let Some(score) = profile.and_then(|profile| profile.score) {
         parts.push(format!("{}{score}", perfect_rank(score)));
     }
-    let reputation = if profile.is_some_and(|profile| {
-        profile.high_risk == Some(true) || profile.reputation_requires_verification == Some(true)
-    }) {
+    let reputation = if data.perfect_unavailable_account_ids.contains(steam_id) {
+        Some("不可用")
+    } else if perfect_profile_is_high_risk(profile) {
         Some("高危")
     } else {
         profile
@@ -3571,6 +3659,9 @@ fn perfect_tray_accounts(
                 .as_deref()
                 .filter(|steam_id| is_valid_steam_id64(steam_id))?;
             let session_id = identity.web_session_id.as_deref()?;
+            let profile = data.perfect_profiles.get(steam_id);
+            let rank = PerfectTrayRank::from_score(profile.and_then(|profile| profile.score));
+            let blocked = perfect_account_is_blocked(data, steam_id);
             let (summary, _known_name) = perfect_tray_summary(data, steam_id);
             let perfect_current = runtime.current_perfect_id.as_deref() == Some(steam_id);
             let steam_current = runtime.current_steam_id.as_deref() == Some(steam_id);
@@ -3598,6 +3689,8 @@ fn perfect_tray_accounts(
                 label: tray_current_label(summary.clone(), perfect_current),
                 sort_label: summary,
                 disambiguator: tray_identifier_suffix(steam_id),
+                rank,
+                blocked,
                 enabled: !runtime.busy,
                 current: perfect_current,
                 actions: vec![
@@ -3627,10 +3720,18 @@ fn perfect_tray_accounts(
             })
             .then_with(|| left.actions[0].id.cmp(&right.actions[0].id))
     });
+    if runtime.perfect_available_only {
+        accounts.retain(|account| !account.blocked);
+    }
     accounts
 }
 
-fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+struct BuiltTrayMenus {
+    root: Menu<tauri::Wry>,
+    perfect: Submenu<tauri::Wry>,
+}
+
+fn build_tray_menus(app: &AppHandle) -> tauri::Result<BuiltTrayMenus> {
     let state = app.state::<AppState>();
     let (mut data, busy) = {
         let data = state
@@ -3668,6 +3769,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             .installation
             .as_ref()
             .is_some_and(|installation| installation.valid),
+        perfect_available_only: state.tray_perfect_available_only.load(Ordering::SeqCst),
     };
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(
@@ -3735,29 +3837,58 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     }
     menu.append(&steam_menu)?;
 
-    let perfect_menu = Submenu::new(app, "完美对战平台", !runtime.busy)?;
+    let perfect_menu = Submenu::with_id(app, "perfect-menu", "完美对战平台", !runtime.busy)?;
+    perfect_menu.append(&CheckMenuItem::with_id(
+        app,
+        "perfect-available-only",
+        "仅显示可用号",
+        !runtime.busy,
+        runtime.perfect_available_only,
+        None::<&str>,
+    )?)?;
+    perfect_menu.append(&PredefinedMenuItem::separator(app)?)?;
     let perfect_accounts = perfect_tray_accounts(&data, &runtime);
     if perfect_accounts.is_empty() {
         perfect_menu.append(&MenuItem::with_id(
             app,
             "perfect-empty",
-            "暂无可切换账号",
+            if runtime.perfect_available_only {
+                "暂无可用账号"
+            } else {
+                "暂无可切换账号"
+            },
             false,
             None::<&str>,
         )?)?;
     } else {
-        for account in perfect_accounts {
-            let account_menu = Submenu::new(app, account.label, account.enabled)?;
-            for action in account.actions {
-                account_menu.append(&MenuItem::with_id(
-                    app,
-                    action.id,
-                    action.label,
-                    action.enabled,
-                    None::<&str>,
-                )?)?;
+        for rank in PerfectTrayRank::DISPLAY_ORDER {
+            let rank_accounts = perfect_accounts
+                .iter()
+                .filter(|account| account.rank == rank)
+                .collect::<Vec<_>>();
+            if rank_accounts.is_empty() {
+                continue;
             }
-            perfect_menu.append(&account_menu)?;
+            let rank_current = rank_accounts.iter().any(|account| account.current);
+            let rank_menu = Submenu::new(
+                app,
+                tray_current_label(rank.label().to_string(), rank_current),
+                !runtime.busy,
+            )?;
+            for account in rank_accounts {
+                let account_menu = Submenu::new(app, account.label.clone(), account.enabled)?;
+                for action in &account.actions {
+                    account_menu.append(&MenuItem::with_id(
+                        app,
+                        action.id.clone(),
+                        action.label.clone(),
+                        action.enabled,
+                        None::<&str>,
+                    )?)?;
+                }
+                rank_menu.append(&account_menu)?;
+            }
+            perfect_menu.append(&rank_menu)?;
         }
     }
     menu.append(&perfect_menu)?;
@@ -3769,7 +3900,14 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         true,
         None::<&str>,
     )?)?;
-    Ok(menu)
+    Ok(BuiltTrayMenus {
+        root: menu,
+        perfect: perfect_menu,
+    })
+}
+
+fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    Ok(build_tray_menus(app)?.root)
 }
 
 fn get_app_data_inner(app: &AppHandle) -> Result<AppData, String> {
@@ -6728,6 +6866,7 @@ fn set_perfect_account_unavailable(
         account_ids.sort();
         Ok(account_ids)
     })?;
+    update_tray(&app);
     let _ = app.emit("app-data-changed", ());
     Ok(account_ids)
 }
@@ -12040,6 +12179,7 @@ pub fn run() {
                     match id {
                         "show" => show_main_window(app),
                         "quit" => app.exit(0),
+                        "perfect-available-only" => toggle_perfect_available_filter(app),
                         _ if id.starts_with("oopz-switch:") => {
                             let account_id = id.trim_start_matches("oopz-switch:").to_string();
                             let app_handle = app.clone();
@@ -12734,6 +12874,8 @@ mod tests {
         let perfect_accounts = perfect_tray_accounts(&data, &runtime);
         assert_eq!(perfect_accounts.len(), 1);
         assert_eq!(perfect_accounts[0].label, "✓ Perfect Name C+1200 优秀");
+        assert_eq!(perfect_accounts[0].rank, PerfectTrayRank::CPlus);
+        assert!(!perfect_accounts[0].blocked);
         assert_eq!(perfect_accounts[0].actions.len(), 2);
         assert_eq!(
             perfect_accounts[0].actions[0].id,
@@ -12746,6 +12888,79 @@ mod tests {
             "perfect-sync:allcaps-web"
         );
         assert!(perfect_accounts[0].actions[1].enabled);
+
+        let rank_cases = [
+            (None, PerfectTrayRank::Pending),
+            (Some(1000), PerfectTrayRank::D),
+            (Some(1001), PerfectTrayRank::C),
+            (Some(1150), PerfectTrayRank::C),
+            (Some(1151), PerfectTrayRank::CPlus),
+            (Some(1300), PerfectTrayRank::CPlus),
+            (Some(1301), PerfectTrayRank::GoldCPlus),
+            (Some(1450), PerfectTrayRank::GoldCPlus),
+            (Some(1451), PerfectTrayRank::B),
+            (Some(1600), PerfectTrayRank::B),
+            (Some(1601), PerfectTrayRank::BPlus),
+            (Some(1750), PerfectTrayRank::BPlus),
+            (Some(1751), PerfectTrayRank::GoldBPlus),
+            (Some(1900), PerfectTrayRank::GoldBPlus),
+            (Some(1901), PerfectTrayRank::A),
+            (Some(2050), PerfectTrayRank::A),
+            (Some(2051), PerfectTrayRank::APlus),
+            (Some(2200), PerfectTrayRank::APlus),
+            (Some(2201), PerfectTrayRank::GoldAPlus),
+        ];
+        for (score, expected) in rank_cases {
+            assert_eq!(PerfectTrayRank::from_score(score), expected);
+        }
+
+        let filtered_runtime = TrayMenuRuntime {
+            perfect_available_only: true,
+            ..runtime.clone()
+        };
+        let mut blocked_data = data.clone();
+        blocked_data
+            .perfect_unavailable_account_ids
+            .insert(steam_id.to_string());
+        let visible_blocked_accounts = perfect_tray_accounts(&blocked_data, &runtime);
+        assert_eq!(visible_blocked_accounts.len(), 1);
+        assert!(visible_blocked_accounts[0].blocked);
+        assert!(visible_blocked_accounts[0].label.ends_with("不可用"));
+        assert!(perfect_tray_accounts(&blocked_data, &filtered_runtime).is_empty());
+        assert_eq!(
+            perfect_tray_summary(&blocked_data, steam_id).0,
+            "Perfect Name C+1200 不可用"
+        );
+
+        blocked_data.perfect_unavailable_account_ids.clear();
+        blocked_data
+            .perfect_profiles
+            .get_mut(steam_id)
+            .expect("test profile")
+            .high_risk = Some(true);
+        assert!(perfect_tray_accounts(&blocked_data, &filtered_runtime).is_empty());
+        assert_eq!(
+            perfect_tray_summary(&blocked_data, steam_id).0,
+            "Perfect Name C+1200 高危"
+        );
+
+        {
+            let pending_profile = blocked_data
+                .perfect_profiles
+                .get_mut(steam_id)
+                .expect("test profile");
+            pending_profile.high_risk = Some(false);
+            pending_profile.score = None;
+        }
+        let pending_accounts = perfect_tray_accounts(&blocked_data, &filtered_runtime);
+        assert_eq!(pending_accounts.len(), 1);
+        assert_eq!(pending_accounts[0].rank, PerfectTrayRank::Pending);
+        blocked_data
+            .perfect_profiles
+            .get_mut(steam_id)
+            .expect("test profile")
+            .reputation_requires_verification = Some(true);
+        assert!(perfect_tray_accounts(&blocked_data, &filtered_runtime).is_empty());
 
         let mut fallback_identity = data.steam_identities[0].clone();
         fallback_identity.display_name = "allcaps".to_string();
