@@ -99,7 +99,9 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml --lib perfect_arena::te
 2. 添加 `.github/releases/vX.Y.Z.md`。
 3. 本地运行 `pnpm install --frozen-lockfile` 和 `pnpm run verify:release`。
 4. 本地运行 `pnpm run build:msi`。
-5. 从 `src-tauri/target/release/bundle/msi/` 取出本地 MSI，计算 SHA-256 后上传或替换 GitHub Release 资产。
+5. 从 `src-tauri/target/release/bundle/msi/` 取出本地 MSI，作为 GitHub Release 的唯一安装资产上传或替换。
+
+NEA 只发布完整 MSI，不提供增量或差分更新，也不生成、上传独立的 `.sha256` 文件。客户端继续使用 GitHub Release API 随 MSI 返回的摘要校验下载完整性；该校验不是额外发布资产。
 
 不要因用户说“发布”就自行设计 CI/CD、矩阵构建、签名服务或额外制品流水线。具体命令见 `docs/GITHUB_SETUP.md`。
 

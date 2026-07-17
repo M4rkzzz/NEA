@@ -51,21 +51,21 @@ src-tauri/target/release/bundle/msi/
 
 本项目不使用 GitHub Actions 云端编译。MSI 必须在本地完成 `verify:release` 和构建，再把已经生成的安装包上传到 GitHub Release。发布前先创建对应的 `.github/releases/<tag>.md`。
 
-先提交并推送代码，再创建和推送 Tag。随后在 GitHub CLI 已登录的环境中上传本地 MSI 与校验文件：
+先提交并推送代码，再创建和推送 Tag。随后在 GitHub CLI 已登录的环境中只上传本地 MSI：
 
 ```powershell
 $tag = "v1.3.0"
 $version = $tag.TrimStart("v")
 $msi = Get-Item "src-tauri/target/release/bundle/msi/NEA_${version}_x64_en-US.msi"
-$hash = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-"$hash  $($msi.Name)" | Set-Content -LiteralPath "$($msi.FullName).sha256" -Encoding ascii
-gh release create $tag $msi.FullName "$($msi.FullName).sha256" --repo M4rkzzz/NEA --verify-tag --title "NEA $tag" --notes-file ".github/releases/$tag.md"
+gh release create $tag $msi.FullName --repo M4rkzzz/NEA --verify-tag --title "NEA $tag" --notes-file ".github/releases/$tag.md"
 ```
 
 替换已有 Release 中的本地 MSI：
 
 ```powershell
-gh release upload $tag $msi.FullName "$($msi.FullName).sha256" --repo M4rkzzz/NEA --clobber
+gh release upload $tag $msi.FullName --repo M4rkzzz/NEA --clobber
 ```
+
+NEA 只提供完整 MSI，不发布增量包、差分包或独立 `.sha256` 文件。应用仍会读取 GitHub Release API 为 MSI 提供的摘要，并在安装前校验完整性。
 
 旧版安装包名、数据目录、凭据服务、快捷方式和 `.oopz+` 文件只保留在兼容迁移代码中，不再作为当前发布名称使用。
