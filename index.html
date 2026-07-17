@@ -6,18 +6,180 @@
     <title>NEA</title>
     <script>
       (() => {
+        const prefersDark = () => {
+          try {
+            return matchMedia("(prefers-color-scheme: dark)").matches;
+          } catch {
+            return false;
+          }
+        };
+
         try {
           const saved = localStorage.getItem("nea-theme");
-          const dark = saved === "dark" || (saved !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+          const dark = saved === "dark" || (saved !== "light" && prefersDark());
           document.documentElement.dataset.theme = dark ? "dark" : "light";
         } catch {
-          document.documentElement.dataset.theme = "light";
+          document.documentElement.dataset.theme = prefersDark() ? "dark" : "light";
+        }
+
+        try {
+          if (new URLSearchParams(location.search).has("overlay")) {
+            document.documentElement.classList.add("nea-overlay");
+          }
+        } catch {
+          // The regular app entry remains the safe fallback for an invalid URL.
         }
       })();
     </script>
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #eaf4f8;
+      }
+
+      body {
+        overflow: hidden;
+      }
+
+      html[data-theme="dark"],
+      html[data-theme="dark"] body,
+      html[data-theme="dark"] #root {
+        background: #171717;
+      }
+
+      #nea-boot {
+        position: fixed;
+        z-index: 2147483647;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        background: linear-gradient(145deg, #f7fbfd 0%, #eaf4f8 100%);
+        opacity: 1;
+        visibility: visible;
+        pointer-events: none;
+        transition: opacity 280ms ease, visibility 0s linear 280ms;
+      }
+
+      html[data-theme="dark"] #nea-boot {
+        background: linear-gradient(145deg, #202a2e 0%, #171717 100%);
+      }
+
+      .nea-boot-mark {
+        width: min(196px, 46vw);
+        animation: nea-boot-breathe 1.5s ease-in-out infinite alternate;
+        transform-origin: center;
+      }
+
+      .nea-boot-logo {
+        display: block;
+        width: 100%;
+        height: auto;
+        user-select: none;
+      }
+
+      .nea-boot-logo-light {
+        display: none;
+      }
+
+      html[data-theme="dark"] .nea-boot-logo-dark {
+        display: none;
+      }
+
+      html[data-theme="dark"] .nea-boot-logo-light {
+        display: block;
+      }
+
+      .nea-boot-track {
+        position: relative;
+        display: block;
+        width: 112px;
+        height: 2px;
+        margin: 14px auto 0;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(32, 39, 43, 0.14);
+      }
+
+      .nea-boot-track::after {
+        content: "";
+        position: absolute;
+        inset-block: 0;
+        left: 0;
+        width: 42%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, transparent, #2563eb, transparent);
+        animation: nea-boot-sweep 1.1s ease-in-out infinite;
+      }
+
+      html[data-theme="dark"] .nea-boot-track {
+        background: rgba(255, 255, 255, 0.13);
+      }
+
+      html[data-theme="dark"] .nea-boot-track::after {
+        background: linear-gradient(90deg, transparent, #67b7e8, transparent);
+      }
+
+      html.nea-app-ready #nea-boot {
+        opacity: 0;
+        visibility: hidden;
+      }
+
+      html.nea-overlay,
+      html.nea-overlay body,
+      html.nea-overlay #root {
+        background: transparent !important;
+      }
+
+      html.nea-overlay #nea-boot {
+        display: none;
+      }
+
+      @keyframes nea-boot-breathe {
+        from {
+          opacity: 0.78;
+          transform: translateY(1px) scale(0.99);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(-1px) scale(1);
+        }
+      }
+
+      @keyframes nea-boot-sweep {
+        from {
+          transform: translateX(-145%);
+        }
+        to {
+          transform: translateX(340%);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #nea-boot {
+          transition: none;
+        }
+
+        .nea-boot-mark,
+        .nea-boot-track::after {
+          animation: none;
+        }
+      }
+    </style>
   </head>
 
   <body>
+    <div id="nea-boot" role="status" aria-label="正在启动 NEA">
+      <div class="nea-boot-mark" aria-hidden="true">
+        <img class="nea-boot-logo nea-boot-logo-dark" src="/nea-brand-dark.png" width="784" height="334" alt="" decoding="sync" fetchpriority="high" />
+        <img class="nea-boot-logo nea-boot-logo-light" src="/nea-brand-light.png" width="784" height="334" alt="" decoding="sync" fetchpriority="high" />
+        <span class="nea-boot-track"></span>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -13635,9 +13635,59 @@ mod tests {
             .assets()
             .get(&entrypoint)
             .expect("production context must embed /index.html");
-        assert!(html
-            .windows(b"<div id=\"root\"></div>".len())
-            .any(|window| { window == b"<div id=\"root\"></div>" }));
+        let html = std::str::from_utf8(html.as_ref())
+            .expect("embedded production index must be valid UTF-8");
+        assert!(html.contains("<div id=\"root\"></div>"));
+        assert!(html.contains("id=\"nea-boot\""));
+
+        let source_index = include_str!("../../index.html");
+        let loader_at = source_index
+            .find("id=\"nea-boot\"")
+            .expect("source index must define the boot loader");
+        let module_at = source_index
+            .find("src=\"/src/main.tsx\"")
+            .expect("source index must load the main module");
+        assert!(
+            loader_at < module_at,
+            "boot loader must be parsed before the main module"
+        );
+        assert!(source_index.contains("classList.add(\"nea-overlay\")"));
+        assert!(source_index.contains("html.nea-overlay #nea-boot"));
+        assert!(source_index.contains("prefers-reduced-motion: reduce"));
+        assert!(source_index.contains("src=\"/nea-brand-dark.png\" width=\"784\" height=\"334\""));
+        assert!(source_index.contains("src=\"/nea-brand-light.png\" width=\"784\" height=\"334\""));
+
+        let script_at = html
+            .find("<script type=\"module\"")
+            .expect("production index must load a module");
+        let src_relative = html[script_at..]
+            .find("src=\"")
+            .expect("production module must have a source");
+        let src_at = script_at + src_relative + "src=\"".len();
+        let src_end = src_at
+            + html[src_at..]
+                .find('"')
+                .expect("production module source must be closed");
+        let module_path = &html[src_at..src_end];
+        let module = context
+            .assets()
+            .get(&tauri::utils::assets::AssetKey::from(module_path))
+            .expect("production context must embed the main module");
+        assert!(module
+            .windows(b"nea-app-ready".len())
+            .any(|window| window == b"nea-app-ready"));
+
+        let main_window = context
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|window| window.label == "main")
+            .expect("tauri config must define the main window");
+        assert_eq!(
+            main_window.background_color,
+            Some(tauri::utils::config::Color(234, 244, 248, 255))
+        );
     }
 
     #[test]
