@@ -714,11 +714,14 @@ html[data-theme="dark"] .steam-import-parallel-hint {
 
 
 .workspace {
+  position: relative;
+  z-index: 1;
   min-width: 0;
   height: 100%;
   padding: 16px 18px 20px;
   border-radius: 14px 0 0 0;
   background: #fff;
+  box-shadow: -5px 0 14px rgba(34, 53, 63, 0.07), -1px 0 2px rgba(34, 53, 63, 0.08);
   overflow-y: auto;
 }
 
@@ -2007,6 +2010,7 @@ html[data-theme="dark"] .window-brand img {
 
 html[data-theme="dark"] .workspace {
   background: #171717;
+  box-shadow: -6px 0 16px rgba(0, 0, 0, 0.28), -1px 0 1px rgba(255, 255, 255, 0.035);
 }
 
 html[data-theme="dark"] .panel,
