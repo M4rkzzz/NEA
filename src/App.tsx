@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { Eye, EyeOff, KeyRound, LayoutDashboard, Minus, Moon, MoreHorizontal, RefreshCw, Share2, Square, Sun, Trash2, UsersRound, X } from "lucide-react";
+import { CalendarCheck, Eye, EyeOff, KeyRound, LayoutDashboard, Minus, Moon, MoreHorizontal, RefreshCw, Share2, Square, Sun, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -13,6 +13,7 @@ type AppConfig = {
   localSandboxDir?: string;
   pluginModeEnabled?: boolean;
   pluginAutostartEnabled?: boolean;
+  oopzAutoSignEnabled?: boolean;
   overlayVertical?: boolean;
 };
 
@@ -94,6 +95,7 @@ type SteamWorkspace = {
   installation?: { installDir: string; executable: string; valid: boolean };
   accounts: SteamAccount[];
   currentAccountId?: string;
+  clientOnline: boolean;
   webSessions: SteamWebSession[];
 };
 
@@ -254,11 +256,26 @@ type QuickShareExportResult = {
   packageBytes: number;
 };
 
+type OopzAutoSignStatus = {
+  enabled: boolean;
+  state: "disabled" | "waiting" | "checking" | "signed" | "error";
+  message: string;
+  accountUid?: string;
+  signedToday: boolean;
+  accumulatedDays?: number;
+  freeCoinBalance?: number;
+  rewardName?: string;
+  rewardQuantity?: number;
+  lastCheckedAt?: string;
+  lastSignedAt?: string;
+};
+
 const MAX_SHARED_PLATFORM_ACCOUNTS = 100;
 
 type AppKey = "oopz" | "steam" | "perfect";
-type FeatureKey = "overview" | "switcher";
+type FeatureKey = "overview" | "switcher" | "autoSign";
 type PerfectAvailability = "ready" | "pending" | "blocked";
+type StartupViewPhase = "loading" | "ready" | "error";
 
 function fmtDate(value?: string) {
   if (!value) return "-";
@@ -387,10 +404,12 @@ function App() {
     if (saved === "light") return false;
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
   });
-  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], webSessions: [] } });
+  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], clientOnline: false, webSessions: [] } });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState("正在初始化...");
+  const [startupPhase, setStartupPhase] = useState<StartupViewPhase>("loading");
+  const [startupError, setStartupError] = useState("");
   const [busy, setBusy] = useState(false);
   const [searchingOopz, setSearchingOopz] = useState(false);
   const [searchPath, setSearchPath] = useState("");
@@ -398,10 +417,12 @@ function App() {
     const saved = readPreference("nea-active-app");
     return saved === "steam" || saved === "perfect" ? saved : "oopz";
   });
-  const [activeFeature, setActiveFeature] = useState<FeatureKey>(() =>
-    readPreference("nea-active-feature") === "switcher" ? "switcher" : "overview",
-  );
+  const [activeFeature, setActiveFeature] = useState<FeatureKey>(() => {
+    const saved = readPreference("nea-active-feature");
+    return saved === "switcher" || saved === "autoSign" ? saved : "overview";
+  });
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
+  const [oopzAutoSignStatus, setOopzAutoSignStatus] = useState<OopzAutoSignStatus | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [wormholeStatus, setWormholeStatus] = useState<WormholeStatus | null>(null);
   const [quickCode, setQuickCode] = useState("");
@@ -639,6 +660,7 @@ function App() {
       if (refreshAfter) await refresh();
       return result;
     } catch (error) {
+      if (refreshAfter) await refresh().catch(() => undefined);
       setMessage(errorMessage(error));
       throw error;
     } finally {
@@ -1199,6 +1221,28 @@ function App() {
     setMessage(status.pluginModeEnabled ? "插件环境已修复" : "插件环境已清理");
   }
 
+  async function refreshOopzAutoSignStatus() {
+    const status = await invoke<OopzAutoSignStatus>("get_oopz_auto_sign_status");
+    setOopzAutoSignStatus(status);
+    return status;
+  }
+
+  async function toggleOopzAutoSign(enabled: boolean) {
+    const status = await runTask(enabled ? "正在开启自动签到..." : "正在关闭自动签到...", () =>
+      invoke<OopzAutoSignStatus>("set_oopz_auto_sign_enabled", { enabled }),
+    );
+    setOopzAutoSignStatus(status);
+    setMessage(enabled ? "自动签到已开启" : "自动签到已关闭");
+  }
+
+  async function checkOopzAutoSignNow() {
+    const status = await runTask("正在静默检查 OOPZ 签到状态...", () =>
+      invoke<OopzAutoSignStatus>("check_oopz_auto_sign"),
+    );
+    setOopzAutoSignStatus(status);
+    setMessage(status.message);
+  }
+
   async function resetOverlayPosition() {
     await runTask("正在重置浮层位置...", () => invoke("reset_overlay_position"));
     setMessage("浮层位置已恢复默认");
@@ -1570,30 +1614,39 @@ function App() {
   }, [activeApp, activeFeature]);
 
   useEffect(() => {
+    let disposed = false;
+    const announceBootReady = () => window.dispatchEvent(new Event("nea:boot-ready"));
     refresh()
       .then(async () => {
-        try {
-          await invoke("get_config_health");
-        } catch (error) {
-          setMessage(errorMessage(error));
-          return;
-        }
+        await invoke("get_config_health");
+        if (disposed) return;
+        setStartupPhase("ready");
+        announceBootReady();
         if (activeApp === "oopz") {
-          await validate();
+          await validate().catch(() => setMessage("未找到 OOPZ，请在概览里手动选择目录"));
         } else {
           setMessage("NEA 已就绪");
         }
+        await Promise.allSettled([
+          invoke<UpdateStatus>("get_update_status").then((status) => {
+            setUpdateStatus(status);
+            if (status.state === "updated" || status.state === "error") setMessage(status.message);
+          }),
+          invoke<SteamCapabilityStatus>("get_steam_capability_status").then(setSteamCapabilityStatus),
+          refreshOopzAutoSignStatus(),
+          refreshPluginStatus(),
+          refreshPerfectArena(),
+        ]);
       })
-      .catch(() => setMessage(activeApp === "oopz" ? "未找到 OOPZ，请在概览里手动选择目录" : "NEA 已就绪"));
-    invoke<UpdateStatus>("get_update_status").then((status) => {
-      setUpdateStatus(status);
-      if (status.state === "updated" || status.state === "error") setMessage(status.message);
-    }).catch(() => undefined);
-    invoke<SteamCapabilityStatus>("get_steam_capability_status").then(setSteamCapabilityStatus).catch(() => undefined);
-    refreshPluginStatus().catch(() => undefined);
-    refreshPerfectArena().catch(() => undefined);
+      .catch((error) => {
+        if (disposed) return;
+        const startupMessage = errorMessage(error);
+        setStartupError(startupMessage);
+        setStartupPhase("error");
+        setMessage(startupMessage);
+        announceBootReady();
+      });
 
-    let disposed = false;
     const unsubs: Array<() => void> = [];
     const keepListener = (promise: Promise<() => void>) => {
       void promise
@@ -1654,6 +1707,12 @@ function App() {
       refreshPluginStatus().catch(() => undefined);
       if (event.payload) setMessage(event.payload);
     }));
+    keepListener(listen<OopzAutoSignStatus>("oopz-auto-sign-status", (event) => {
+      setOopzAutoSignStatus(event.payload);
+      if (event.payload.state === "signed" || event.payload.state === "error") {
+        setMessage(event.payload.message);
+      }
+    }));
     keepListener(listen<UpdateStatus>("update-status", (event) => {
       setUpdateStatus(event.payload);
       setMessage(event.payload.message);
@@ -1678,17 +1737,21 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (startupPhase !== "ready") return;
     if (activeApp === "oopz" && activeFeature === "switcher" && !scannedOnceRef.current) {
       refreshAccounts(false).catch(() => undefined);
     }
     if (activeApp === "oopz" && activeFeature === "switcher") {
       refreshPluginStatus().catch(() => undefined);
     }
+    if (activeApp === "oopz" && activeFeature === "autoSign") {
+      refreshOopzAutoSignStatus().catch(() => undefined);
+    }
     if (activeApp === "perfect") {
       refreshPerfectArena().catch(() => undefined);
     }
     setVisibleSteamCredentials([]);
-  }, [activeApp, activeFeature]);
+  }, [activeApp, activeFeature, startupPhase]);
 
   useEffect(() => {
     if (!pendingOopzOperation && !pendingDeleteAccount && !pendingDeleteSteamWebSession && !pendingDeleteSteamCredential && !showSteamTextImport && !showShareCenter && !perfectMenuSessionId) return;
@@ -1914,6 +1977,57 @@ function App() {
     </section>
   );
 
+  const autoSignAccount = oopzAutoSignStatus?.accountUid
+    ? data.accounts.find((account) => account.uid === oopzAutoSignStatus.accountUid)
+    : undefined;
+  const autoSignStateLabel = oopzAutoSignStatus?.state === "signed" ? "今日已完成"
+    : oopzAutoSignStatus?.state === "checking" ? "检查中"
+      : oopzAutoSignStatus?.state === "waiting" ? "等待登录"
+        : oopzAutoSignStatus?.state === "error" ? "稍后重试"
+          : "未开启";
+  const autoSign = (
+    <section className="content-stack auto-sign-page">
+      <div className="panel auto-sign-hero" data-state={oopzAutoSignStatus?.state || "disabled"}>
+        <div className="auto-sign-icon" aria-hidden="true"><CalendarCheck size={28} /></div>
+        <div className="auto-sign-heading">
+          <h2>自动签到</h2>
+          <p>OOPZ 登录并运行时，NEA 会在后台静默检测；可签到时自动完成，不打开额外窗口。</p>
+        </div>
+        <button
+          className={oopzAutoSignStatus?.enabled ? "" : "primary"}
+          onClick={() => handleAction(() => toggleOopzAutoSign(!oopzAutoSignStatus?.enabled))}
+          disabled={busy || oopzAutoSignStatus?.state === "checking"}
+        >{oopzAutoSignStatus?.enabled ? "关闭" : "开启"}</button>
+      </div>
+
+      <div className="summary-grid auto-sign-summary">
+        <div className="metric"><strong>{autoSignStateLabel}</strong><span>今日状态</span></div>
+        <div className="metric"><strong>{oopzAutoSignStatus?.accumulatedDays ?? "-"}</strong><span>累计签到天数</span></div>
+        <div className="metric"><strong>{oopzAutoSignStatus?.freeCoinBalance ?? "-"}</strong><span>抽奖币余额</span></div>
+      </div>
+
+      <div className="panel auto-sign-detail">
+        <div className="panel-title">
+          <h2>运行状态</h2>
+          <button onClick={() => handleAction(checkOopzAutoSignNow)} disabled={busy || !oopzAutoSignStatus?.enabled || oopzAutoSignStatus?.state === "checking"}>
+            {oopzAutoSignStatus?.state === "checking" ? "检查中" : "立即检查"}
+          </button>
+        </div>
+        <div className="auto-sign-status-line" data-state={oopzAutoSignStatus?.state || "disabled"}>
+          <span className="auto-sign-status-dot" />
+          <strong>{oopzAutoSignStatus?.message || "正在读取自动签到状态"}</strong>
+        </div>
+        <dl className="meta auto-sign-meta">
+          <dt>当前账号</dt><dd>{autoSignAccount?.displayName || (oopzAutoSignStatus?.accountUid ? "当前 OOPZ 账号" : "等待 OOPZ 登录")}</dd>
+          <dt>最近检查</dt><dd>{fmtDate(oopzAutoSignStatus?.lastCheckedAt)}</dd>
+          <dt>最近签到</dt><dd>{fmtDate(oopzAutoSignStatus?.lastSignedAt)}</dd>
+          <dt>签到奖励</dt><dd>{oopzAutoSignStatus?.rewardName ? `${oopzAutoSignStatus.rewardName}${oopzAutoSignStatus.rewardQuantity ? ` ×${oopzAutoSignStatus.rewardQuantity}` : ""}` : "-"}</dd>
+        </dl>
+        <div className="notice auto-sign-notice">只会执行每日签到；不会自动领取里程碑奖励，也不会关闭、重启或切换 OOPZ。</div>
+      </div>
+    </section>
+  );
+
   const steamOverview = (
     <section className="content-stack">
       <div className="panel">
@@ -1993,6 +2107,7 @@ function App() {
               : data.steam.webSessions.find((item) => Boolean(identity.steamId && item.steamId === identity.steamId));
             const credential = findSteamCredential(identity.steamId, identity.accountName, identity.webSessionId, identity.clientAccountId);
             const current = Boolean(identity.steamId && data.steam.currentAccountId === identity.steamId);
+            const clientOnline = current && data.steam.clientOnline;
             const profile = identity.steamId ? perfectProfiles[identity.steamId] : undefined;
             const numericFallback = Boolean(identity.steamId && identity.displayName.trim() === identity.steamId);
             const accountNameFallback = Boolean(
@@ -2010,7 +2125,7 @@ function App() {
                   {credential && <button className="icon-button danger" onClick={(event) => promptDeleteSteamCredential(event, identity)} disabled={busy} aria-label={`清除 ${label} 保存的账号密码`} title="清除已保存账密（保留网页登录）"><KeyRound size={16} /></button>}
                   {session && <button className="icon-button danger" onClick={(event) => promptDeleteSteamWebSession(event, session)} disabled={busy} aria-label={`删除 ${label} 的网页登录`} title="删除网页登录"><Trash2 size={16} /></button>}
                   <button onClick={() => session && handleAction(() => openSteamWebSession(session))} disabled={busy || !session}>{session ? "打开网页" : "网页未登录"}</button>
-                  <button className={credential && identity.steamId && !current ? "primary" : ""} onClick={() => identity.steamId && credential && handleAction(() => switchSteamAccount(identity))} disabled={busy || !identity.steamId || !credential || current}>{current ? "客户端已登录" : credential && identity.steamId ? "账密打开客户端" : credential ? "待识别 SteamID" : "缺少账密"}</button>
+                  <button className={credential && identity.steamId && !clientOnline ? "primary" : ""} onClick={() => identity.steamId && credential && handleAction(() => switchSteamAccount(identity))} disabled={busy || !identity.steamId || !credential || clientOnline}>{clientOnline ? "客户端已上线" : current && credential ? "等待客户端上线" : credential && identity.steamId ? "账密打开客户端" : credential ? "待识别 SteamID" : "缺少账密"}</button>
                 </div>
               </div>
               {credential && credentialDetails(credential)}
@@ -2069,7 +2184,8 @@ function App() {
           const identity = findSteamIdentity(session.steamId, session.accountName, session.id);
           const credential = findSteamCredential(session.steamId, session.accountName, session.id);
           const steamAlreadyCurrent = Boolean(session.steamId && data.steam.currentAccountId === session.steamId);
-          const canSyncSteam = Boolean(credential || steamAlreadyCurrent);
+          const steamAlreadyOnline = steamAlreadyCurrent && data.steam.clientOnline;
+          const canSyncSteam = Boolean(credential || steamAlreadyOnline);
           const selected = selectedSteamWebSessionId === session.id;
           const requiresVerification = Boolean(profile?.highRisk || profile?.reputationRequiresVerification);
           const unavailable = Boolean(session.steamId && data.perfectUnavailableAccountIds?.includes(session.steamId));
@@ -2100,7 +2216,7 @@ function App() {
               <div className="perfect-card-actions" data-has-credential={Boolean(credential) || undefined}>
                 {credential && credentialEye(credential, profile?.nickname || session.displayName)}
                 <button className="icon-button danger" onClick={(event) => promptDeleteSteamWebSession(event, session)} disabled={busy} aria-label={`删除 ${session.displayName} 的网页登录`} title="删除网页登录（保留已保存账密）"><Trash2 size={16} /></button>
-                <button className={canSyncSteam && !(current && steamAlreadyCurrent) ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || (current && steamAlreadyCurrent) || !perfectWorkspace.installation || !data.steam.installation} title={steamAlreadyCurrent ? "Steam 客户端已是该账号，仅同步切换完美账号" : credential ? "使用已保存账密登录 Steam 客户端，并切换完美账号" : "该账号没有已保存账号密码"}>同步切换</button>
+                <button className={canSyncSteam && !(current && steamAlreadyOnline) ? "primary" : ""} onClick={() => handleAction(() => switchSteamAndPerfectAccount(session))} disabled={busy || !canSyncSteam || (current && steamAlreadyOnline) || !perfectWorkspace.installation || !data.steam.installation} title={steamAlreadyOnline ? "Steam 客户端已在线，仅同步切换完美账号" : credential ? "使用已保存账密登录 Steam 客户端，并切换完美账号" : "该账号没有已保存账号密码"}>同步切换</button>
                 {session.steamId
                   ? <button onClick={() => handleAction(() => switchPerfectWebAccount(session))} disabled={busy || current || !perfectWorkspace.installation}>{current ? "完美已登录" : "仅切完美"}</button>
                   : <button onClick={() => handleAction(() => openSteamWebSession(session))} disabled={busy}>登录</button>}
@@ -2115,7 +2231,7 @@ function App() {
   function selectApp(app: AppKey) {
     const changingApp = app !== activeApp;
     setActiveApp(app);
-    if (changingApp) setActiveFeature("switcher");
+    if (changingApp || (app !== "oopz" && activeFeature === "autoSign")) setActiveFeature("switcher");
     setVisibleSteamCredentials([]);
     setPerfectMenuSessionId(null);
     if (busyRef.current) return;
@@ -2134,11 +2250,37 @@ function App() {
   }
 
   const activeContent = activeApp === "oopz"
-    ? activeFeature === "overview" ? overview : switcher
+    ? activeFeature === "overview" ? overview : activeFeature === "autoSign" ? autoSign : switcher
     : activeApp === "steam"
       ? activeFeature === "overview" ? steamOverview : steamSwitcher
       : activeFeature === "overview" ? perfectOverview : perfectSwitcher;
   const activeAppName = activeApp === "oopz" ? "OOPZ" : activeApp === "steam" ? "Steam" : "完美对战平台";
+  const activeFeatureName = activeFeature === "overview" ? "概览" : activeFeature === "autoSign" ? "自动签到" : "账号切换";
+
+  if (startupPhase !== "ready") {
+    return (
+      <main className="shell startup-shell" aria-busy={startupPhase === "loading"}>
+        <header className="window-titlebar" data-tauri-drag-region onMouseDown={startWindowDrag} onDoubleClick={toggleMaximizeWindow}>
+          <div className="window-brand" data-tauri-drag-region>
+            <img src="/nea-brand-dark.png" alt="NEA - Not Enough Accounts" draggable={false} data-tauri-drag-region />
+          </div>
+          <div className="window-controls" onDoubleClick={(event) => event.stopPropagation()}>
+            <button onClick={minimizeWindow} aria-label="最小化" title="最小化"><Minus size={15} /></button>
+            <button onClick={toggleMaximizeWindow} aria-label="最大化或还原" title="最大化或还原"><Square size={13} /></button>
+            <button className="window-close" onClick={closeWindow} aria-label="隐藏到托盘" title="隐藏到托盘"><X size={16} /></button>
+          </div>
+        </header>
+        <section className="startup-state" role={startupPhase === "error" ? "alert" : "status"}>
+          <div className="startup-state-card">
+            {startupPhase === "loading" && <div className="spinner" aria-hidden="true" />}
+            <strong>{startupPhase === "loading" ? "正在加载账号" : "启动未完成"}</strong>
+            <span>{startupPhase === "loading" ? "正在恢复数据并准备账号菜单…" : startupError}</span>
+            {startupPhase === "error" && <small>请从托盘退出 NEA 后重新打开；原账号数据不会被空配置覆盖。</small>}
+          </div>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="shell">
@@ -2169,17 +2311,19 @@ function App() {
           <nav className="feature-list">
             <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
             <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
+            {activeApp === "oopz" && <button data-active={activeFeature === "autoSign"} aria-current={activeFeature === "autoSign" ? "page" : undefined} onClick={() => setActiveFeature("autoSign")}><CalendarCheck size={17} strokeWidth={2} aria-hidden="true" /><strong>自动签到</strong></button>}
           </nav>
         </aside>
 
         <section className="workspace auto-hide-scrollbar" data-contained-scroll={activeApp === "perfect" && activeFeature === "switcher" || undefined} onScroll={showScrollbarWhileScrolling}>
           <header className="topbar">
-            <h2>{activeAppName} · {activeFeature === "overview" ? "概览" : "账号切换"}</h2>
+            <h2>{activeAppName} · {activeFeatureName}</h2>
             <div className="status" data-busy={busy} role="status" aria-live="polite" aria-atomic="true" title={message}>{busy && <span className="spinner" />}<span>{message}</span></div>
           </header>
           <nav className="mobile-feature-tabs" aria-label={`${activeAppName} 功能`}>
             <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={15} aria-hidden="true" />概览</button>
             <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={15} aria-hidden="true" />账号切换</button>
+            {activeApp === "oopz" && <button data-active={activeFeature === "autoSign"} aria-current={activeFeature === "autoSign" ? "page" : undefined} onClick={() => setActiveFeature("autoSign")}><CalendarCheck size={15} aria-hidden="true" />自动签到</button>}
           </nav>
           {activeContent}
         </section>

@@ -111,6 +111,45 @@ button.primary.danger-confirm:hover:not(:disabled) {
   overflow: hidden;
 }
 
+.startup-shell {
+  background: #eaf4f8;
+}
+
+.startup-state {
+  display: grid;
+  min-height: 0;
+  place-items: center;
+  padding: 32px;
+  background: #f7fbfc;
+}
+
+.startup-state-card {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  width: min(420px, 100%);
+  color: #34434b;
+  text-align: center;
+}
+
+.startup-state-card .spinner {
+  width: 28px;
+  height: 28px;
+  margin-bottom: 4px;
+  border-width: 3px;
+}
+
+.startup-state-card strong {
+  color: #20272b;
+  font-size: 18px;
+}
+
+.startup-state-card span,
+.startup-state-card small {
+  color: #6c777d;
+  line-height: 1.6;
+}
+
 .app-layout {
   display: grid;
   grid-template-columns: 64px 156px minmax(520px, 1fr);
@@ -1021,6 +1060,97 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   color: #6b7280;
 }
 
+.auto-sign-page {
+  max-width: 920px;
+}
+
+.auto-sign-hero {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.auto-sign-icon {
+  display: grid;
+  place-items: center;
+  width: 50px;
+  height: 50px;
+  border-radius: 14px;
+  background: #eaf2ff;
+  color: #245ac7;
+}
+
+.auto-sign-hero[data-state="signed"] .auto-sign-icon {
+  background: #e8f7ed;
+  color: #16803b;
+}
+
+.auto-sign-heading h2 {
+  margin: 0;
+}
+
+.auto-sign-heading p {
+  margin: 5px 0 0;
+  color: #6b7280;
+  line-height: 1.55;
+}
+
+.auto-sign-summary .metric strong {
+  font-size: 19px;
+}
+
+.auto-sign-status-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 14px;
+  border-radius: 8px;
+  background: #f5f7fa;
+  padding: 11px 12px;
+}
+
+.auto-sign-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #89929e;
+}
+
+.auto-sign-status-line[data-state="checking"] .auto-sign-status-dot {
+  background: #3979dd;
+  box-shadow: 0 0 0 4px #dce9ff;
+}
+
+.auto-sign-status-line[data-state="signed"] .auto-sign-status-dot {
+  background: #21a052;
+  box-shadow: 0 0 0 4px #dff4e6;
+}
+
+.auto-sign-status-line[data-state="error"] .auto-sign-status-dot {
+  background: #d14a3b;
+  box-shadow: 0 0 0 4px #fae3e0;
+}
+
+.auto-sign-meta {
+  margin-bottom: 14px;
+}
+
+.auto-sign-notice {
+  margin: 0;
+}
+
+@media (max-width: 680px) {
+  .auto-sign-hero {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .auto-sign-hero > button {
+    grid-column: 1 / -1;
+  }
+}
+
 .actionable-empty {
   display: grid;
   justify-items: start;
@@ -1867,6 +1997,20 @@ html[data-theme="dark"] .sidebar {
   background: #1b2428;
 }
 
+html[data-theme="dark"] .startup-state {
+  background: #171717;
+}
+
+html[data-theme="dark"] .startup-state-card,
+html[data-theme="dark"] .startup-state-card strong {
+  color: #e4e8eb;
+}
+
+html[data-theme="dark"] .startup-state-card span,
+html[data-theme="dark"] .startup-state-card small {
+  color: #9ba7ad;
+}
+
 html[data-theme="dark"] .window-brand img {
   filter: invert(1) grayscale(1) brightness(1.65);
 }
@@ -1955,10 +2099,25 @@ html[data-theme="dark"] .status,
 html[data-theme="dark"] .paths dt,
 html[data-theme="dark"] .metric span,
 html[data-theme="dark"] .plugin-health,
+html[data-theme="dark"] .auto-sign-heading p,
 html[data-theme="dark"] .quick-transfer-status,
 html[data-theme="dark"] .account-main small,
 html[data-theme="dark"] .perfect-card-name small {
   color: #a6a6a6;
+}
+
+html[data-theme="dark"] .auto-sign-icon {
+  background: #263a58;
+  color: #8bb7ff;
+}
+
+html[data-theme="dark"] .auto-sign-hero[data-state="signed"] .auto-sign-icon {
+  background: #203e2c;
+  color: #70d591;
+}
+
+html[data-theme="dark"] .auto-sign-status-line {
+  background: #222a2e;
 }
 
 html[data-theme="dark"] .quick-transfer-status[data-state="error"] {

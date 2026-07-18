@@ -1,8 +1,10 @@
 use crate::adapters::{AccountIdentity, AppAdapter, AppInstallation};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Mutex, OnceLock},
@@ -13,6 +15,7 @@ use sysinfo::{ProcessRefreshKind, Signal, System, UpdateKind};
 use winreg::{enums::*, RegKey};
 
 static LOGINUSERS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static STEAM_LOGIN_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
 static NATIVE_SWITCHER_WORKER: OnceLock<mpsc::Sender<(SteamInstallation, String)>> =
     OnceLock::new();
 
@@ -59,7 +62,98 @@ pub struct SteamWorkspace {
     pub accounts: Vec<SteamAccount>,
     pub current_account_id: Option<String>,
     #[serde(default)]
+    pub client_online: bool,
+    #[serde(default)]
     pub web_sessions: Vec<SteamWebSession>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteamConnectionState {
+    Unknown,
+    Connecting,
+    Online,
+    Offline,
+}
+
+#[derive(Debug)]
+pub struct SteamConnectionLogMonitor {
+    path: PathBuf,
+    offset: u64,
+    pending: String,
+    target_account_id: u32,
+    state: SteamConnectionState,
+}
+
+impl SteamConnectionLogMonitor {
+    fn new(
+        path: PathBuf,
+        offset: u64,
+        target_account_id: u32,
+        state: SteamConnectionState,
+    ) -> Self {
+        Self {
+            path,
+            offset,
+            pending: String::new(),
+            target_account_id,
+            state,
+        }
+    }
+
+    pub fn state(&self) -> SteamConnectionState {
+        self.state
+    }
+
+    fn consume(&mut self, appended: &[u8]) {
+        self.pending.push_str(&String::from_utf8_lossy(appended));
+        while let Some(newline) = self.pending.find('\n') {
+            let line = self.pending[..newline].trim_end_matches('\r');
+            self.state = connection_state_after_line(self.state, line, self.target_account_id);
+            self.pending.drain(..=newline);
+        }
+    }
+
+    pub fn poll(&mut self) -> SteamConnectionState {
+        let Ok(mut file) = fs::File::open(&self.path) else {
+            return self.state;
+        };
+        let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+            return self.state;
+        };
+        if length < self.offset {
+            let previous_path = self.path.with_file_name("connection_log.previous.txt");
+            let recovered_rotation_tail =
+                fs::File::open(previous_path).ok().and_then(|mut previous| {
+                    let previous_length = previous.metadata().ok()?.len();
+                    if previous_length < self.offset
+                        || previous.seek(SeekFrom::Start(self.offset)).is_err()
+                    {
+                        return None;
+                    }
+                    let mut tail = Vec::new();
+                    previous.read_to_end(&mut tail).ok()?;
+                    Some(tail)
+                });
+            if let Some(mut tail) = recovered_rotation_tail {
+                tail.push(b'\n');
+                self.consume(&tail);
+            } else {
+                self.pending.clear();
+                self.state = SteamConnectionState::Unknown;
+            }
+            self.offset = 0;
+        }
+        if length == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return self.state;
+        }
+        let mut appended = Vec::with_capacity((length - self.offset).min(64 * 1024) as usize);
+        if file.read_to_end(&mut appended).is_err() {
+            return self.state;
+        }
+        self.offset = self.offset.saturating_add(appended.len() as u64);
+        self.consume(&appended);
+        self.state
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -252,9 +346,86 @@ fn users(root: &BTreeMap<String, VdfValue>) -> Result<&BTreeMap<String, VdfValue
 pub struct SteamAdapter;
 
 impl SteamAdapter {
+    pub fn with_login_transition<T>(operation: impl FnOnce() -> T) -> T {
+        let _guard = STEAM_LOGIN_TRANSITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation()
+    }
+
     pub fn account_id32(steam_id64: &str) -> Option<u32> {
         let steam_id = steam_id64.parse::<u64>().ok()?;
         (steam_id64.len() == 17).then_some((steam_id & u32::MAX as u64) as u32)
+    }
+
+    fn connection_log_path(installation: &AppInstallation) -> PathBuf {
+        installation
+            .data_dir
+            .join("logs")
+            .join("connection_log.txt")
+    }
+
+    pub fn monitor_next_connection(
+        installation: &AppInstallation,
+        steam_id64: &str,
+    ) -> Result<SteamConnectionLogMonitor, String> {
+        let target_account_id = Self::account_id32(steam_id64)
+            .ok_or_else(|| "目标 SteamID64 无效，无法确认客户端在线状态".to_string())?;
+        let path = Self::connection_log_path(installation);
+        let offset = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(SteamConnectionLogMonitor::new(
+            path,
+            offset,
+            target_account_id,
+            SteamConnectionState::Unknown,
+        ))
+    }
+
+    pub fn monitor_current_connection(
+        installation: &AppInstallation,
+        steam_id64: &str,
+    ) -> Result<SteamConnectionLogMonitor, String> {
+        let target_account_id = Self::account_id32(steam_id64)
+            .ok_or_else(|| "目标 SteamID64 无效，无法确认客户端在线状态".to_string())?;
+        let path = Self::connection_log_path(installation);
+        let current = fs::read(&path).unwrap_or_default();
+        let offset = current.len() as u64;
+        let complete_length = current
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let pending = String::from_utf8_lossy(&current[complete_length..]).into_owned();
+        let session_started_at = steam_client_started_at(&process_system());
+        let mut state = SteamConnectionState::Unknown;
+        if let Some(session_started_at) = session_started_at {
+            let previous = installation
+                .data_dir
+                .join("logs")
+                .join("connection_log.previous.txt");
+            for contents in [
+                fs::read(previous).unwrap_or_default(),
+                current[..complete_length].to_vec(),
+            ] {
+                state = connection_state_from_session_log(
+                    state,
+                    &contents,
+                    target_account_id,
+                    session_started_at,
+                );
+            }
+        }
+        let mut monitor = SteamConnectionLogMonitor::new(path, offset, target_account_id, state);
+        monitor.pending = pending;
+        Ok(monitor)
+    }
+
+    pub fn is_account_online(installation: &AppInstallation, steam_id64: &str) -> bool {
+        Self::is_account_active(steam_id64)
+            && Self::monitor_current_connection(installation, steam_id64)
+                .is_ok_and(|monitor| monitor.state() == SteamConnectionState::Online)
     }
 
     pub fn active_user_account_id() -> Option<u32> {
@@ -277,10 +448,6 @@ impl SteamAdapter {
 
     pub fn processes_are_running() -> bool {
         steam_process_running(&process_system())
-    }
-
-    pub fn is_account_logged_in(steam_id64: &str) -> bool {
-        Self::client_is_running() && Self::is_account_active(steam_id64)
     }
 
     pub fn suppress_accounts_from_native_switcher(
@@ -319,16 +486,53 @@ impl SteamAdapter {
         Ok(changed_accounts)
     }
 
+    pub fn suppress_accounts_from_native_switcher_if_stopped(
+        installation: &SteamInstallation,
+        steam_ids: &HashSet<String>,
+    ) -> Result<Option<usize>, String> {
+        Self::with_login_transition(|| {
+            if Self::processes_are_running() {
+                return Ok(None);
+            }
+            Self::suppress_accounts_from_native_switcher(installation, steam_ids).map(Some)
+        })
+    }
+
+    pub fn prepare_account_for_online_login(
+        installation: &SteamInstallation,
+        steam_id: &str,
+    ) -> Result<bool, String> {
+        let _write_guard = LOGINUSERS_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = PathBuf::from(&installation.install_dir)
+            .join("config")
+            .join("loginusers.vdf");
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("读取 Steam 在线登录配置失败: {error}")),
+        };
+        let mut root = parse_vdf(&raw)?;
+        let Some(VdfValue::Object(account)) = users_mut(&mut root)?.get_mut(steam_id) else {
+            return Ok(false);
+        };
+        let changed = set_text(account, "WantsOfflineMode", "0")
+            | set_text(account, "SkipOfflineModeWarning", "1");
+        if changed {
+            replace_text_atomically(&path, &serialize_vdf(&root))?;
+        }
+        Ok(changed)
+    }
+
     pub fn keep_account_out_of_native_switcher(
         installation: SteamInstallation,
         steam_id: String,
     ) -> Result<(), String> {
         let steam_ids = HashSet::from([steam_id.clone()]);
-        let immediate_result = if Self::processes_are_running() {
-            Ok(())
-        } else {
-            Self::suppress_accounts_from_native_switcher(&installation, &steam_ids).map(|_| ())
-        };
+        let immediate_result =
+            Self::suppress_accounts_from_native_switcher_if_stopped(&installation, &steam_ids)
+                .map(|_| ());
         let sender = NATIVE_SWITCHER_WORKER.get_or_init(|| {
             let (sender, receiver) = mpsc::channel();
             thread::spawn(move || native_switcher_worker(receiver));
@@ -439,6 +643,74 @@ impl SteamAdapter {
     }
 }
 
+fn connection_log_timestamp(line: &str) -> Option<NaiveDateTime> {
+    let timestamp = line.get(1..20)?;
+    NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S").ok()
+}
+
+fn connection_state_after_line(
+    current: SteamConnectionState,
+    line: &str,
+    target_account_id: u32,
+) -> SteamConnectionState {
+    let target = format!("[U:1:{target_account_id}]");
+    if !line.contains(&target) {
+        return current;
+    }
+    if line.contains("LogOff()")
+        || line.contains("AsyncDisconnect")
+        || line.contains("RecvMsgClientLoggedOff")
+        || line.contains("Log session ended")
+        || line.contains("[Logging Off,")
+    {
+        return SteamConnectionState::Offline;
+    }
+    if line.contains("StartAutoReconnect")
+        || line.contains("[Connecting,")
+        || line.contains("[Connected,")
+        || line.contains("[Logging On,")
+        || line.contains("LogOn() called")
+    {
+        return SteamConnectionState::Connecting;
+    }
+    if line.contains("[Logged On,") {
+        return SteamConnectionState::Online;
+    }
+    if line.contains("[Logged Off,") {
+        return SteamConnectionState::Offline;
+    }
+    current
+}
+
+fn connection_state_from_session_log(
+    mut state: SteamConnectionState,
+    contents: &[u8],
+    target_account_id: u32,
+    session_started_at: NaiveDateTime,
+) -> SteamConnectionState {
+    for line in String::from_utf8_lossy(contents).lines() {
+        let Some(timestamp) = connection_log_timestamp(line) else {
+            continue;
+        };
+        if timestamp < session_started_at {
+            continue;
+        }
+        state = connection_state_after_line(state, line, target_account_id);
+    }
+    state
+}
+
+fn steam_client_started_at(system: &System) -> Option<NaiveDateTime> {
+    let started_at = system
+        .processes()
+        .values()
+        .filter(|process| process.name().eq_ignore_ascii_case("steam.exe"))
+        .map(|process| process.start_time())
+        .max()?;
+    DateTime::<Utc>::from_timestamp(started_at as i64, 0)
+        .map(|value| value.with_timezone(&Local).naive_local() - chrono::Duration::seconds(2))
+}
+
 fn native_switcher_worker(receiver: mpsc::Receiver<(SteamInstallation, String)>) {
     let mut pending: HashMap<String, (SteamInstallation, HashSet<String>)> = HashMap::new();
     loop {
@@ -495,9 +767,13 @@ fn native_switcher_worker(receiver: mpsc::Receiver<(SteamInstallation, String)>)
             }
             let batch = std::mem::take(&mut pending);
             for (install_dir, (installation, steam_ids)) in batch {
-                if SteamAdapter::suppress_accounts_from_native_switcher(&installation, &steam_ids)
-                    .is_err()
-                {
+                if !matches!(
+                    SteamAdapter::suppress_accounts_from_native_switcher_if_stopped(
+                        &installation,
+                        &steam_ids,
+                    ),
+                    Ok(Some(_))
+                ) {
                     pending.insert(install_dir, (installation, steam_ids));
                 }
             }
@@ -548,6 +824,20 @@ fn steam_client_running(system: &System) -> bool {
 
 fn refresh_processes(system: &mut System) {
     system.refresh_processes_specifics(ProcessRefreshKind::new());
+}
+
+fn steam_processes_stably_stopped(system: &mut System) -> bool {
+    if steam_process_running(system) {
+        return false;
+    }
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(200));
+        refresh_processes(system);
+        if steam_process_running(system) {
+            return false;
+        }
+    }
+    true
 }
 
 impl SteamAdapter {
@@ -624,7 +914,7 @@ impl AppAdapter for SteamAdapter {
     }
     fn stop(&self, installation: &AppInstallation) -> Result<(), String> {
         let mut system = process_system();
-        if !steam_process_running(&system) {
+        if steam_processes_stably_stopped(&mut system) {
             return Ok(());
         }
 
@@ -635,7 +925,7 @@ impl AppAdapter for SteamAdapter {
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(500));
             refresh_processes(&mut system);
-            if !steam_process_running(&system) {
+            if !steam_process_running(&system) && steam_processes_stably_stopped(&mut system) {
                 return Ok(());
             }
         }
@@ -652,7 +942,7 @@ impl AppAdapter for SteamAdapter {
         for _ in 0..10 {
             thread::sleep(Duration::from_millis(500));
             refresh_processes(&mut system);
-            if !steam_process_running(&system) {
+            if !steam_process_running(&system) && steam_processes_stably_stopped(&mut system) {
                 return Ok(());
             }
         }
@@ -665,10 +955,10 @@ impl AppAdapter for SteamAdapter {
         }
         thread::sleep(Duration::from_millis(500));
         refresh_processes(&mut system);
-        if steam_process_running(&system) {
-            Err("Steam 进程无法完全退出，已中止切号以防登录状态被覆盖".to_string())
-        } else {
+        if !steam_process_running(&system) && steam_processes_stably_stopped(&mut system) {
             Ok(())
+        } else {
+            Err("Steam 进程无法完全退出，已中止切号以防登录状态被覆盖".to_string())
         }
     }
     fn start(&self, installation: &AppInstallation) -> Result<(), String> {
@@ -686,6 +976,7 @@ impl AppAdapter for SteamAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn parses_loginusers_vdf_as_read_only_metadata() {
@@ -717,6 +1008,177 @@ mod tests {
     #[test]
     fn rejects_unclosed_vdf() {
         assert!(parse_vdf("\"users\" { \"1\" {").is_err());
+    }
+
+    #[test]
+    fn steam_connection_parser_requires_the_target_to_reach_logged_on() {
+        let target = 1_217_010_099;
+        let other = 918_826_622;
+        let mut state = SteamConnectionState::Unknown;
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:05:17] [Logged On, 4, 27] [U:1:{other}] processing complete"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Unknown);
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:05:19] [Connecting, 4, 0] [U:1:{target}] Connect() starting connection"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Connecting);
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:08:42] [Logged On, 4, 23] [U:1:{target}] RecvMsgClientLogOnResponse() : processing complete"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Online);
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:08:59] [Logged On, 4, 23] [U:1:{target}] RecvMsgClientLoggedOff('Service Unavailable')"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Offline);
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:09:00] [Logged On, 4, 23] [U:1:{target}] LogOff()"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Offline);
+        state = connection_state_after_line(
+            state,
+            &format!("[2026-07-17 23:09:01] [Logged Off, 4, 0] [U:1:{target}] StartAutoReconnect() will start in 30 seconds"),
+            target,
+        );
+        assert_eq!(state, SteamConnectionState::Connecting);
+    }
+
+    #[test]
+    fn next_connection_monitor_ignores_history_and_buffers_partial_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "nea-steam-connection-monitor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("connection_log.txt");
+        let target = 1_217_010_099;
+        let steam_id = (76_561_197_960_265_728u64 + target as u64).to_string();
+        fs::write(
+            &path,
+            format!(
+                "[2026-07-17 22:00:00] [Logged On, 4, 23] [U:1:{target}] processing complete\n"
+            ),
+        )
+        .unwrap();
+        let installation = AppInstallation {
+            executable: root.join("steam.exe"),
+            data_dir: root.clone(),
+        };
+        let mut monitor = SteamAdapter::monitor_next_connection(&installation, &steam_id).unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Unknown);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(
+            file,
+            "[2026-07-17 23:08:41] [Logging On, 4, 23] [U:1:{target}] credentials sent\n[2026-07-17 23:08:42] [Logged On, 4, 23] [U:1:{target}] process"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Connecting);
+        writeln!(file, "ing complete").unwrap();
+        file.flush().unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Online);
+
+        fs::write(
+            &path,
+            format!(
+                "[2026-07-17 23:09:01] [Logged Off, 4, 0] [U:1:{target}] StartAutoReconnect()\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Connecting);
+        drop(file);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connection_monitor_keeps_a_partial_line_across_log_rotation() {
+        let root = std::env::temp_dir().join(format!(
+            "nea-steam-connection-rotation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("connection_log.txt");
+        fs::write(&path, b"history\n").unwrap();
+        let target = 1_217_010_099;
+        let steam_id = (76_561_197_960_265_728u64 + target as u64).to_string();
+        let installation = AppInstallation {
+            executable: root.join("steam.exe"),
+            data_dir: root.clone(),
+        };
+        let mut monitor = SteamAdapter::monitor_next_connection(&installation, &steam_id).unwrap();
+        let partial = format!("[2026-07-17 23:08:42] [Logged On, 4, 23] [U:1:{target}] process");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(partial.as_bytes())
+            .unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Unknown);
+        let previous = logs.join("connection_log.previous.txt");
+        fs::rename(&path, &previous).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&previous)
+            .unwrap()
+            .write_all(b"ing complete\n")
+            .unwrap();
+        fs::write(&path, b"").unwrap();
+        assert_eq!(monitor.poll(), SteamConnectionState::Online);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepares_only_the_target_account_for_online_login() {
+        let root =
+            std::env::temp_dir().join(format!("nea-steam-online-login-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("loginusers.vdf"),
+            "\"users\"\n{\n\"76561198000000001\" { \"AccountName\" \"target\" \"WantsOfflineMode\" \"1\" \"SkipOfflineModeWarning\" \"0\" }\n\"76561198000000002\" { \"AccountName\" \"other\" \"WantsOfflineMode\" \"1\" \"SkipOfflineModeWarning\" \"0\" }\n}",
+        )
+        .unwrap();
+        let installation = SteamInstallation {
+            install_dir: root.to_string_lossy().to_string(),
+            executable: root.join("steam.exe").to_string_lossy().to_string(),
+            valid: true,
+        };
+        assert!(
+            SteamAdapter::prepare_account_for_online_login(&installation, "76561198000000001")
+                .unwrap()
+        );
+        assert!(!SteamAdapter::prepare_account_for_online_login(
+            &installation,
+            "76561198000000001"
+        )
+        .unwrap());
+        let parsed =
+            parse_vdf(&fs::read_to_string(config.join("loginusers.vdf")).unwrap()).unwrap();
+        let accounts = users(&parsed).unwrap();
+        let VdfValue::Object(target) = accounts.get("76561198000000001").unwrap() else {
+            panic!()
+        };
+        let VdfValue::Object(other) = accounts.get("76561198000000002").unwrap() else {
+            panic!()
+        };
+        assert_eq!(text(target, "WantsOfflineMode"), Some("0"));
+        assert_eq!(text(target, "SkipOfflineModeWarning"), Some("1"));
+        assert_eq!(text(other, "WantsOfflineMode"), Some("1"));
+        assert_eq!(text(other, "SkipOfflineModeWarning"), Some("0"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

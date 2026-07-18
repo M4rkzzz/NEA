@@ -7,7 +7,7 @@ const isOverlay = new URLSearchParams(window.location.search).has("overlay");
 const rootElement = document.getElementById("root") as HTMLElement;
 const bootElement = document.getElementById("nea-boot");
 let bootFinished = false;
-let bootObserver: MutationObserver | null = null;
+let bootFallbackTimer: number | undefined;
 
 function prefersReducedMotion() {
   try {
@@ -20,8 +20,8 @@ function prefersReducedMotion() {
 function finishBoot() {
   if (bootFinished) return;
   bootFinished = true;
-  bootObserver?.disconnect();
-  bootObserver = null;
+  window.removeEventListener("nea:boot-ready", finishBoot);
+  if (bootFallbackTimer !== undefined) window.clearTimeout(bootFallbackTimer);
 
   if (isOverlay) {
     bootElement?.remove();
@@ -61,10 +61,8 @@ function finishBoot() {
 if (isOverlay) {
   finishBoot();
 } else {
-  bootObserver = new MutationObserver(() => {
-    if (rootElement.firstElementChild) finishBoot();
-  });
-  bootObserver.observe(rootElement, { childList: true });
+  window.addEventListener("nea:boot-ready", finishBoot, { once: true });
+  bootFallbackTimer = window.setTimeout(finishBoot, 30_000);
 }
 
 ReactDOM.createRoot(rootElement).render(
