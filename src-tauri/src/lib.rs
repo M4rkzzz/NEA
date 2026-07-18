@@ -12478,6 +12478,7 @@ fn switch_account_inner(
     }
     save_data(&data)?;
     drop(data);
+    schedule_oopz_auto_sign_check(app, true, true);
     Ok(SwitchResult {
         ok: true,
         message: format!("已切换到 {} 并启动 OOPZ", account.display_name),
