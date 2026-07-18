@@ -1090,12 +1090,6 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   margin: 0;
 }
 
-.auto-sign-heading p {
-  margin: 5px 0 0;
-  color: #6b7280;
-  line-height: 1.55;
-}
-
 .auto-sign-summary .metric strong {
   font-size: 19px;
 }
@@ -1135,10 +1129,6 @@ html[data-theme="dark"] .steam-import-parallel-hint {
 
 .auto-sign-meta {
   margin-bottom: 14px;
-}
-
-.auto-sign-notice {
-  margin: 0;
 }
 
 @media (max-width: 680px) {
@@ -2099,7 +2089,6 @@ html[data-theme="dark"] .status,
 html[data-theme="dark"] .paths dt,
 html[data-theme="dark"] .metric span,
 html[data-theme="dark"] .plugin-health,
-html[data-theme="dark"] .auto-sign-heading p,
 html[data-theme="dark"] .quick-transfer-status,
 html[data-theme="dark"] .account-main small,
 html[data-theme="dark"] .perfect-card-name small {

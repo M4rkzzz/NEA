@@ -1991,7 +1991,6 @@ function App() {
         <div className="auto-sign-icon" aria-hidden="true"><CalendarCheck size={28} /></div>
         <div className="auto-sign-heading">
           <h2>自动签到</h2>
-          <p>OOPZ 登录并运行时，NEA 会在后台静默检测；可签到时自动完成，不打开额外窗口。</p>
         </div>
         <button
           className={oopzAutoSignStatus?.enabled ? "" : "primary"}
@@ -2023,7 +2022,6 @@ function App() {
           <dt>最近签到</dt><dd>{fmtDate(oopzAutoSignStatus?.lastSignedAt)}</dd>
           <dt>签到奖励</dt><dd>{oopzAutoSignStatus?.rewardName ? `${oopzAutoSignStatus.rewardName}${oopzAutoSignStatus.rewardQuantity ? ` ×${oopzAutoSignStatus.rewardQuantity}` : ""}` : "-"}</dd>
         </dl>
-        <div className="notice auto-sign-notice">只会执行每日签到；不会自动领取里程碑奖励，也不会关闭、重启或切换 OOPZ。</div>
       </div>
     </section>
   );

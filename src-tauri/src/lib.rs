@@ -97,6 +97,8 @@ const QUICK_SHARE_CANCELLED: &str = "快捷分享已取消";
 const MAX_AVATAR_BYTES: u64 = 2 * 1024 * 1024;
 const PERFECT_AVATAR_CACHE_MARKER: &str = "nea-cache://perfect-avatar";
 const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/M4rkzzz/NEA/releases/latest";
+const GITHUB_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/M4rkzzz/NEA/main/.github/update.json";
 const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
@@ -588,6 +590,21 @@ struct GitHubAsset {
     browser_download_url: String,
     size: u64,
     digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateManifest {
+    version: String,
+    asset_name: String,
+    download_url: String,
+    size: u64,
+    sha256: String,
+}
+
+struct AvailableUpdate {
+    version: String,
+    asset: GitHubAsset,
 }
 
 #[derive(Debug)]
@@ -1145,12 +1162,13 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
     if asset.size == 0 || asset.size > MAX_UPDATE_BYTES {
         return Err("更新安装包大小异常".to_string());
     }
-    if ![
-        "https://github.com/M4rkzzz/NEA/releases/download/",
-        "https://github.com/M4rkzzz/oopz-plus/releases/download/",
-    ]
-    .iter()
-    .any(|prefix| asset.browser_download_url.starts_with(prefix))
+    let trusted_release_prefixes = [
+        format!("https://github.com/M4rkzzz/NEA/releases/download/v{version}/"),
+        format!("https://github.com/M4rkzzz/oopz-plus/releases/download/v{version}/"),
+    ];
+    if !trusted_release_prefixes
+        .iter()
+        .any(|prefix| asset.browser_download_url.starts_with(prefix))
     {
         return Err("更新下载地址不可信".to_string());
     }
@@ -1162,6 +1180,82 @@ fn validate_update_asset<'a>(asset: &'a GitHubAsset, version: &str) -> Result<&'
             value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
         })
         .ok_or_else(|| "Release 安装包缺少 SHA-256 摘要，已拒绝自动安装".to_string())
+}
+
+fn update_from_manifest(manifest: UpdateManifest) -> Result<AvailableUpdate, String> {
+    let (_, version) = parse_release_version(&manifest.version)
+        .ok_or_else(|| "更新清单版本号格式不正确".to_string())?;
+    let asset = GitHubAsset {
+        name: manifest.asset_name,
+        browser_download_url: manifest.download_url,
+        size: manifest.size,
+        digest: Some(format!("sha256:{}", manifest.sha256)),
+    };
+    validate_update_asset(&asset, &version)?;
+    Ok(AvailableUpdate { version, asset })
+}
+
+fn fetch_update_manifest(client: &reqwest::blocking::Client) -> Result<AvailableUpdate, String> {
+    let response = client
+        .get(GITHUB_UPDATE_MANIFEST_URL)
+        .header(reqwest::header::USER_AGENT, "NEA-Updater")
+        .send()
+        .map_err(|error| format!("读取更新清单失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("读取更新清单失败: {error}"))?;
+    let mut raw = String::new();
+    response
+        .take(64 * 1024)
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("读取更新清单失败: {error}"))?;
+    let manifest = serde_json::from_str::<UpdateManifest>(&raw)
+        .map_err(|error| format!("更新清单格式错误: {error}"))?;
+    update_from_manifest(manifest)
+}
+
+fn fetch_update_from_github_api(
+    client: &reqwest::blocking::Client,
+) -> Result<Option<AvailableUpdate>, String> {
+    let response = client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .header(reqwest::header::USER_AGENT, "NEA-Updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|error| format!("检查 GitHub 更新失败: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("GitHub 匿名 API 配额已用完".to_string());
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| format!("检查 GitHub 更新失败: {error}"))?;
+    let mut raw = String::new();
+    response
+        .take(2 * 1024 * 1024)
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("读取更新信息失败: {error}"))?;
+    let release: GitHubRelease =
+        serde_json::from_str(&raw).map_err(|error| format!("更新信息格式错误: {error}"))?;
+    if release.draft || release.prerelease {
+        return Err("GitHub 最新版本不是正式 Release".to_string());
+    }
+    let (_, version) = parse_release_version(&release.tag_name)
+        .ok_or_else(|| "GitHub Release 版本号格式不正确".to_string())?;
+    let nea_name = format!("NEA_{}_x64_en-US.msi", version);
+    let legacy_name = format!("OOPZ+_{}_x64_en-US.msi", version);
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| {
+            asset.name.eq_ignore_ascii_case(&nea_name)
+                || asset.name.eq_ignore_ascii_case(&legacy_name)
+        })
+        .ok_or_else(|| format!("Release 缺少安装包 {} 或 {}", nea_name, legacy_name))?;
+    validate_update_asset(&asset, &version)?;
+    Ok(Some(AvailableUpdate { version, asset }))
 }
 
 fn github_proxy_url(asset: &GitHubAsset) -> String {
@@ -1420,36 +1514,18 @@ fn perform_update_check(app: &AppHandle, force: bool) -> Result<(), String> {
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client
-        .get(GITHUB_LATEST_RELEASE_URL)
-        .header(reqwest::header::USER_AGENT, "NEA-Updater")
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .map_err(|e| format!("检查更新失败: {}", e))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let update = match fetch_update_manifest(&client) {
+        Ok(update) => Some(update),
+        Err(manifest_error) => fetch_update_from_github_api(&client)
+            .map_err(|api_error| format!("更新清单不可用: {manifest_error}; {api_error}"))?,
+    };
+    let Some(update) = update else {
         record_update_check(app)?;
         set_update_status(app, "current", None, "GitHub 暂无可用 Release");
         return Ok(());
-    }
-    if response.status() == reqwest::StatusCode::FORBIDDEN {
-        return Err("GitHub 更新检查暂时受限，请稍后重试".to_string());
-    }
-    let response = response
-        .error_for_status()
-        .map_err(|e| format!("检查更新失败: {}", e))?;
-    let mut raw = String::new();
-    response
-        .take(2 * 1024 * 1024)
-        .read_to_string(&mut raw)
-        .map_err(|e| format!("读取更新信息失败: {}", e))?;
-    let release: GitHubRelease =
-        serde_json::from_str(&raw).map_err(|e| format!("更新信息格式错误: {}", e))?;
-    if release.draft || release.prerelease {
-        return Err("GitHub 最新版本不是正式 Release".to_string());
-    }
-    let (available, version) = parse_release_version(&release.tag_name)
-        .ok_or_else(|| "GitHub Release 版本号格式不正确".to_string())?;
+    };
+    let (available, version) =
+        parse_release_version(&update.version).ok_or_else(|| "更新版本号格式不正确".to_string())?;
     let (current, _) = parse_release_version(env!("CARGO_PKG_VERSION"))
         .ok_or_else(|| "当前版本号格式不正确".to_string())?;
     record_update_check(app)?;
@@ -1457,26 +1533,13 @@ fn perform_update_check(app: &AppHandle, force: bool) -> Result<(), String> {
         set_update_status(app, "current", None, "当前已是最新版本");
         return Ok(());
     }
-    let nea_name = format!("NEA_{}_x64_en-US.msi", version);
-    let legacy_name = format!("OOPZ+_{}_x64_en-US.msi", version);
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(&nea_name))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name.eq_ignore_ascii_case(&legacy_name))
-        })
-        .ok_or_else(|| format!("Release 缺少安装包 {} 或 {}", nea_name, legacy_name))?;
     set_update_status(
         app,
         "downloading",
         Some(version.clone()),
         format!("发现新版本 {}，正在通过加速线路下载...", version),
     );
-    let msi_path = download_update_asset(app, asset, &version)?;
+    let msi_path = download_update_asset(app, &update.asset, &version)?;
     set_update_status(
         app,
         "installing",
@@ -15154,6 +15217,38 @@ mod tests {
             ..asset
         };
         assert!(validate_update_asset(&untrusted, "1.2.3").is_err());
+    }
+
+    #[test]
+    fn update_manifest_preserves_version_asset_and_digest_validation() {
+        let digest = "b".repeat(64);
+        let update = update_from_manifest(UpdateManifest {
+            version: "v1.3.3".to_string(),
+            asset_name: "NEA_1.3.3_x64_en-US.msi".to_string(),
+            download_url:
+                "https://github.com/M4rkzzz/NEA/releases/download/v1.3.3/NEA_1.3.3_x64_en-US.msi"
+                    .to_string(),
+            size: 1024,
+            sha256: digest.clone(),
+        })
+        .unwrap();
+        assert_eq!(update.version, "1.3.3");
+        assert_eq!(update.asset.size, 1024);
+        assert_eq!(
+            validate_update_asset(&update.asset, &update.version),
+            Ok(digest.as_str())
+        );
+
+        let mismatched = UpdateManifest {
+            version: "1.3.3".to_string(),
+            asset_name: "NEA_1.3.3_x64_en-US.msi".to_string(),
+            download_url:
+                "https://github.com/M4rkzzz/NEA/releases/download/v1.3.2/NEA_1.3.3_x64_en-US.msi"
+                    .to_string(),
+            size: 1024,
+            sha256: digest,
+        };
+        assert!(update_from_manifest(mismatched).is_err());
     }
 
     #[test]

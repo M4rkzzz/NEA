@@ -101,7 +101,7 @@ pnpm install
 pnpm run dev:app       # 开发运行
 pnpm run check:fast    # 紧密开发循环：仅 TypeScript + Rust 增量检查
 pnpm run verify:dev    # 功能完成：TypeScript + 5 项关键回归测试
-pnpm run verify:release # 正式发布：构建 + 82 项稳定测试 + Clippy
+pnpm run verify:release # 正式发布：构建 + 83 项稳定测试 + Clippy
 pnpm run build:msi     # 构建 Windows MSI
 pnpm run bundle:msi    # 仅在现有 Release EXE 未变化时快速重新封装 MSI
 ```

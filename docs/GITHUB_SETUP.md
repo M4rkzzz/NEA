@@ -31,7 +31,7 @@ perfect-world-arena
 - Release 标题使用 `NEA <tag>`，例如 `NEA v1.3.0`。
 - 安装包使用 `NEA_<version>_x64_en-US.msi`。
 - Release 说明保存在 `.github/releases/<tag>.md`。
-- 正式发布前同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 中的 `nea` 根包、`src-tauri/tauri.conf.json` 和 README 版本。
+- 正式发布前同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 中的 `nea` 根包、`src-tauri/tauri.conf.json`、README 和 `.github/update.json`；清单中的安装包大小与 SHA-256 使用本轮最终 MSI 的实际值。
 
 ## 本地发布检查
 
