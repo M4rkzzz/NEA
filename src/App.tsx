@@ -14,6 +14,7 @@ type AppConfig = {
   pluginModeEnabled?: boolean;
   pluginAutostartEnabled?: boolean;
   oopzAutoSignEnabled?: boolean;
+  oopzAutoSignAccountId?: string;
   overlayVertical?: boolean;
 };
 
@@ -1235,6 +1236,16 @@ function App() {
     setMessage(enabled ? "自动签到已开启" : "自动签到已关闭");
   }
 
+  async function selectOopzAutoSignAccount(accountId: string) {
+    const status = await runTask("正在保存自动签到账号...", () =>
+      invoke<OopzAutoSignStatus>("set_oopz_auto_sign_account", {
+        accountId: accountId || null,
+      }),
+    );
+    setOopzAutoSignStatus(status);
+    setMessage(status.message);
+  }
+
   async function checkOopzAutoSignNow() {
     const status = await runTask("正在静默检查 OOPZ 签到状态...", () =>
       invoke<OopzAutoSignStatus>("check_oopz_auto_sign"),
@@ -1977,9 +1988,11 @@ function App() {
     </section>
   );
 
-  const autoSignAccount = oopzAutoSignStatus?.accountUid
-    ? data.accounts.find((account) => account.uid === oopzAutoSignStatus.accountUid)
-    : undefined;
+  const autoSignEligibleAccounts = data.accounts.filter((account) => account.hasLoginState && Boolean(account.uid));
+  const autoSignAccount = data.accounts.find((account) => account.id === data.config.oopzAutoSignAccountId)
+    || (oopzAutoSignStatus?.accountUid
+      ? data.accounts.find((account) => account.uid === oopzAutoSignStatus.accountUid)
+      : undefined);
   const autoSignStateLabel = oopzAutoSignStatus?.state === "signed" ? "今日已完成"
     : oopzAutoSignStatus?.state === "checking" ? "检查中"
       : oopzAutoSignStatus?.state === "waiting" ? "等待登录"
@@ -1997,6 +2010,21 @@ function App() {
           onClick={() => handleAction(() => toggleOopzAutoSign(!oopzAutoSignStatus?.enabled))}
           disabled={busy || oopzAutoSignStatus?.state === "checking"}
         >{oopzAutoSignStatus?.enabled ? "关闭" : "开启"}</button>
+      </div>
+
+      <div className="panel auto-sign-account-panel">
+        <label htmlFor="oopz-auto-sign-account"><strong>自动签到账号</strong></label>
+        <select
+          id="oopz-auto-sign-account"
+          value={data.config.oopzAutoSignAccountId || ""}
+          onChange={(event) => handleAction(() => selectOopzAutoSignAccount(event.target.value))}
+          disabled={busy || oopzAutoSignStatus?.state === "checking"}
+        >
+          <option value="">{autoSignEligibleAccounts.length > 0 ? "请选择账号" : "没有可自动登录的账号"}</option>
+          {autoSignEligibleAccounts.map((account) => (
+            <option key={account.id} value={account.id}>{account.displayName}</option>
+          ))}
+        </select>
       </div>
 
       <div className="summary-grid auto-sign-summary">
@@ -2017,7 +2045,7 @@ function App() {
           <strong>{oopzAutoSignStatus?.message || "正在读取自动签到状态"}</strong>
         </div>
         <dl className="meta auto-sign-meta">
-          <dt>当前账号</dt><dd>{autoSignAccount?.displayName || (oopzAutoSignStatus?.accountUid ? "当前 OOPZ 账号" : "等待 OOPZ 登录")}</dd>
+          <dt>签到账号</dt><dd>{autoSignAccount?.displayName || "未选择"}</dd>
           <dt>最近检查</dt><dd>{fmtDate(oopzAutoSignStatus?.lastCheckedAt)}</dd>
           <dt>最近签到</dt><dd>{fmtDate(oopzAutoSignStatus?.lastSignedAt)}</dd>
           <dt>签到奖励</dt><dd>{oopzAutoSignStatus?.rewardName ? `${oopzAutoSignStatus.rewardName}${oopzAutoSignStatus.rewardQuantity ? ` ×${oopzAutoSignStatus.rewardQuantity}` : ""}` : "-"}</dd>

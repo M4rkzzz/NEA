@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{ErrorKind, Read, Write},
+    os::windows::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
@@ -32,14 +33,18 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
     COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
 };
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, HWND, LPARAM, RECT};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, CreateProcessW, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+    STARTUPINFOW,
+};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, GA_ROOTOWNER, GWLP_HWNDPARENT,
+    IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW, ShowWindow, GA_ROOTOWNER,
+    GWLP_HWNDPARENT, SW_HIDE,
 };
 use windows_core::Interface;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -102,6 +107,10 @@ const GITHUB_UPDATE_MANIFEST_URL: &str =
 const GITHUB_DOWNLOAD_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 const MAX_UPDATE_BYTES: u64 = 150 * 1024 * 1024;
 const UPDATE_CHECK_INTERVAL_MINUTES: i64 = 30;
+const OOPZ_AUTO_SIGN_NETWORK_INTERVAL_SECONDS: u64 = 30 * 60;
+const OOPZ_AUTO_SIGN_OBSERVE_INTERVAL_SECONDS: u64 = 60;
+const OOPZ_AUTO_SIGN_STARTUP_DELAY_SECONDS: u64 = 8;
+const OOPZ_AUTO_SIGN_RESTART_COOLDOWN_SECONDS: u64 = 2 * 60;
 static CONFIG_WRITES_BLOCKED: AtomicBool = AtomicBool::new(false);
 static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_INTERNAL_CONFIG_BYTES: Mutex<Option<Vec<u8>>> = Mutex::new(None);
@@ -119,6 +128,8 @@ struct AppConfig {
     plugin_autostart_enabled: bool,
     #[serde(default)]
     oopz_auto_sign_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oopz_auto_sign_account_id: Option<String>,
     #[serde(default)]
     overlay_offset_x: i32,
     #[serde(default)]
@@ -643,6 +654,7 @@ struct AppState {
     oopz_auto_sign_running: AtomicBool,
     oopz_auto_sign_status: Mutex<OopzAutoSignStatus>,
     oopz_auto_sign_last_attempt: Mutex<Option<Instant>>,
+    oopz_auto_sign_last_start: Mutex<Option<Instant>>,
     oopz_auto_sign_completed_key: Mutex<Option<String>>,
 }
 
@@ -676,6 +688,7 @@ fn initial_app_state(data: AppData, startup_phase: StartupPhase) -> AppState {
         oopz_auto_sign_running: AtomicBool::new(false),
         oopz_auto_sign_status: Mutex::new(initial_oopz_auto_sign_status()),
         oopz_auto_sign_last_attempt: Mutex::new(None),
+        oopz_auto_sign_last_start: Mutex::new(None),
         oopz_auto_sign_completed_key: Mutex::new(None),
     }
 }
@@ -1616,12 +1629,24 @@ fn perform_oopz_auto_sign_check(
     force: bool,
 ) -> Result<OopzAutoSignStatus, String> {
     let state = app.state::<AppState>();
-    let enabled = state
-        .data
-        .lock()
-        .map_err(|error| error.to_string())?
-        .config
-        .oopz_auto_sign_enabled;
+    let (enabled, selected_account_id, selected_account, config) = {
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        let selected_account_id = data.config.oopz_auto_sign_account_id.clone();
+        let selected_account = selected_account_id
+            .as_deref()
+            .and_then(|account_id| {
+                data.accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+            })
+            .cloned();
+        (
+            data.config.oopz_auto_sign_enabled,
+            selected_account_id,
+            selected_account,
+            data.config.clone(),
+        )
+    };
     if !enabled {
         let mut status = oopz_auto_sign_status(app);
         status.enabled = false;
@@ -1632,28 +1657,43 @@ fn perform_oopz_auto_sign_check(
         return Ok(status);
     }
 
-    let Some(executable) = running_oopz_exe() else {
+    let Some(selected_account_id) = selected_account_id else {
         let mut status = oopz_auto_sign_status(app);
         status.enabled = true;
         status.state = "waiting".to_string();
-        status.message = "等待 OOPZ 登录并运行".to_string();
+        status.message = "请选择自动签到账号".to_string();
         status.account_uid = None;
         status.signed_today = false;
         emit_oopz_auto_sign_status(app, status.clone());
         return Ok(status);
     };
-    let Some(login) = current_registry_login() else {
+
+    let Some(selected_account) = selected_account else {
         let mut status = oopz_auto_sign_status(app);
         status.enabled = true;
-        status.state = "waiting".to_string();
-        status.message = "等待 OOPZ 登录".to_string();
+        status.state = "error".to_string();
+        status.message = "自动签到账号已不存在，请重新选择".to_string();
         status.account_uid = None;
         status.signed_today = false;
         emit_oopz_auto_sign_status(app, status.clone());
         return Ok(status);
     };
-    let uid =
-        uid_from_registry_login(&login).ok_or_else(|| "当前 OOPZ 登录状态无法识别".to_string())?;
+
+    let uid = selected_account
+        .uid
+        .clone()
+        .ok_or_else(|| "自动签到账号缺少 UID，请重新登录后刷新账号".to_string())?;
+    if !selected_account.has_login_state || read_oopz_login(&selected_account_id).is_none() {
+        let mut status = oopz_auto_sign_status(app);
+        status.enabled = true;
+        status.state = "error".to_string();
+        status.message = "自动签到账号缺少可用登录状态，请重新登录后刷新账号".to_string();
+        status.account_uid = Some(uid);
+        status.signed_today = false;
+        emit_oopz_auto_sign_status(app, status.clone());
+        return Ok(status);
+    }
+
     let completed_key = format!("{}:{}", uid, chrono::Local::now().format("%Y-%m-%d"));
     if state
         .oopz_auto_sign_completed_key
@@ -1672,12 +1712,102 @@ fn perform_oopz_auto_sign_check(
         return Ok(status);
     }
 
+    let running_executable = running_oopz_exe();
+    let current_login = current_registry_login();
+    let current_uid = current_login.as_deref().and_then(uid_from_registry_login);
+
+    if running_executable.is_none() {
+        let start_result = if current_uid.as_deref() == Some(uid.as_str()) {
+            let paths = paths_from_config(&config)?;
+            spawn_oopz_hidden(Path::new(&paths.oopz_exe_path))?;
+            ensure_plugin_runtime_after_oopz_start(config);
+            schedule_oopz_auto_sign_check(app.clone(), true, true);
+            Ok(())
+        } else {
+            switch_account_inner_with_options(app.clone(), state.clone(), selected_account_id, true)
+                .map(|_| ())
+        };
+        start_result?;
+        *state
+            .oopz_auto_sign_last_start
+            .lock()
+            .map_err(|error| error.to_string())? = Some(Instant::now());
+
+        let mut status = oopz_auto_sign_status(app);
+        status.enabled = true;
+        status.state = "waiting".to_string();
+        status.message = format!(
+            "已自动启动 {}，等待 OOPZ 登录",
+            selected_account.display_name
+        );
+        status.account_uid = Some(uid);
+        status.signed_today = false;
+        emit_oopz_auto_sign_status(app, status.clone());
+        return Ok(status);
+    }
+
+    let Some(current_login) = current_login else {
+        let recently_started = state
+            .oopz_auto_sign_last_start
+            .lock()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|last| {
+                last.elapsed() < Duration::from_secs(OOPZ_AUTO_SIGN_RESTART_COOLDOWN_SECONDS)
+            });
+        if !recently_started {
+            switch_account_inner_with_options(
+                app.clone(),
+                state.clone(),
+                selected_account_id,
+                true,
+            )?;
+            *state
+                .oopz_auto_sign_last_start
+                .lock()
+                .map_err(|error| error.to_string())? = Some(Instant::now());
+        }
+        let mut status = oopz_auto_sign_status(app);
+        status.enabled = true;
+        status.state = "waiting".to_string();
+        status.message = if recently_started {
+            "等待 OOPZ 登录完成"
+        } else {
+            "已自动恢复登录，等待 OOPZ 就绪"
+        }
+        .to_string();
+        status.account_uid = Some(uid);
+        status.signed_today = false;
+        emit_oopz_auto_sign_status(app, status.clone());
+        return Ok(status);
+    };
+
+    *state
+        .oopz_auto_sign_last_start
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+
+    if current_uid.as_deref() != Some(uid.as_str()) {
+        let mut status = oopz_auto_sign_status(app);
+        status.enabled = true;
+        status.state = "waiting".to_string();
+        status.message = "OOPZ 正在使用其他账号，暂不打断".to_string();
+        status.account_uid = Some(uid);
+        status.signed_today = false;
+        emit_oopz_auto_sign_status(app, status.clone());
+        return Ok(status);
+    }
+
+    let executable = running_executable.expect("OOPZ executable checked above");
+    let login = current_login;
+
     if !force {
         let last_attempt = state
             .oopz_auto_sign_last_attempt
             .lock()
             .map_err(|error| error.to_string())?;
-        if last_attempt.is_some_and(|last| last.elapsed() < Duration::from_secs(10 * 60)) {
+        if last_attempt.is_some_and(|last| {
+            last.elapsed() < Duration::from_secs(OOPZ_AUTO_SIGN_NETWORK_INTERVAL_SECONDS)
+        }) {
             return Ok(oopz_auto_sign_status(app));
         }
     }
@@ -1764,7 +1894,7 @@ fn run_oopz_auto_sign_check(app: &AppHandle, force: bool) -> Result<OopzAutoSign
 fn schedule_oopz_auto_sign_check(app: AppHandle, force: bool, delay: bool) {
     thread::spawn(move || {
         if delay {
-            thread::sleep(Duration::from_secs(8));
+            thread::sleep(Duration::from_secs(OOPZ_AUTO_SIGN_STARTUP_DELAY_SECONDS));
         }
         let _ = run_oopz_auto_sign_check(&app, force);
     });
@@ -1773,7 +1903,7 @@ fn schedule_oopz_auto_sign_check(app: AppHandle, force: bool, delay: bool) {
 fn start_oopz_auto_sign_checks(app: AppHandle) {
     schedule_oopz_auto_sign_check(app.clone(), false, true);
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(60));
+        thread::sleep(Duration::from_secs(OOPZ_AUTO_SIGN_OBSERVE_INTERVAL_SECONDS));
         schedule_oopz_auto_sign_check(app.clone(), false, false);
     });
 }
@@ -1786,6 +1916,13 @@ fn get_oopz_auto_sign_status(app: AppHandle) -> OopzAutoSignStatus {
 #[tauri::command]
 fn set_oopz_auto_sign_enabled(app: AppHandle, enabled: bool) -> Result<OopzAutoSignStatus, String> {
     let state = app.state::<AppState>();
+    let selected_account_id = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .config
+        .oopz_auto_sign_account_id
+        .clone();
     commit_app_data_update(&state, |data| {
         data.config.oopz_auto_sign_enabled = enabled;
         Ok(())
@@ -1794,7 +1931,11 @@ fn set_oopz_auto_sign_enabled(app: AppHandle, enabled: bool) -> Result<OopzAutoS
     status.enabled = enabled;
     status.state = if enabled { "waiting" } else { "disabled" }.to_string();
     status.message = if enabled {
-        "已开启，等待 OOPZ 登录并运行"
+        if selected_account_id.is_some() {
+            "已开启，正在准备自动签到"
+        } else {
+            "已开启，请选择自动签到账号"
+        }
     } else {
         "自动签到未开启"
     }
@@ -1803,9 +1944,93 @@ fn set_oopz_auto_sign_enabled(app: AppHandle, enabled: bool) -> Result<OopzAutoS
         status.signed_today = false;
         status.account_uid = None;
     }
+    *state
+        .oopz_auto_sign_last_attempt
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    *state
+        .oopz_auto_sign_last_start
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    *state
+        .oopz_auto_sign_completed_key
+        .lock()
+        .map_err(|error| error.to_string())? = None;
     emit_oopz_auto_sign_status(&app, status.clone());
     let _ = app.emit("app-data-changed", ());
     if enabled {
+        schedule_oopz_auto_sign_check(app, true, false);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+fn set_oopz_auto_sign_account(
+    app: AppHandle,
+    account_id: Option<String>,
+) -> Result<OopzAutoSignStatus, String> {
+    let normalized = account_id.filter(|account_id| !account_id.trim().is_empty());
+    let state = app.state::<AppState>();
+    let selected_account = if let Some(account_id) = normalized.as_deref() {
+        let account = state
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if !account.has_login_state
+            || account.uid.is_none()
+            || read_oopz_login(account_id).is_none()
+        {
+            return Err("该账号缺少可用登录状态，请先完成一次快速登录".to_string());
+        }
+        Some(account)
+    } else {
+        None
+    };
+
+    commit_app_data_update(&state, |data| {
+        data.config.oopz_auto_sign_account_id = normalized.clone();
+        Ok(())
+    })?;
+    *state
+        .oopz_auto_sign_last_attempt
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    *state
+        .oopz_auto_sign_last_start
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    *state
+        .oopz_auto_sign_completed_key
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+
+    let enabled = state
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .config
+        .oopz_auto_sign_enabled;
+    let mut status = oopz_auto_sign_status(&app);
+    status.enabled = enabled;
+    status.account_uid = selected_account
+        .as_ref()
+        .and_then(|account| account.uid.clone());
+    status.signed_today = false;
+    status.state = if enabled { "waiting" } else { "disabled" }.to_string();
+    status.message = match (&selected_account, enabled) {
+        (Some(account), true) => format!("已选择 {}，正在准备自动签到", account.display_name),
+        (Some(account), false) => format!("已选择 {}", account.display_name),
+        (None, true) => "请选择自动签到账号".to_string(),
+        (None, false) => "自动签到未开启".to_string(),
+    };
+    emit_oopz_auto_sign_status(&app, status.clone());
+    let _ = app.emit("app-data-changed", ());
+    if enabled && selected_account.is_some() {
         schedule_oopz_auto_sign_check(app, true, false);
     }
     Ok(status)
@@ -2343,6 +2568,70 @@ fn spawn_plugin_runtime() -> Result<(), String> {
     Ok(())
 }
 
+fn spawn_oopz_hidden(executable: &Path) -> Result<(), String> {
+    let mut command_line = std::ffi::OsString::from("\"");
+    command_line.push(executable.as_os_str());
+    command_line.push("\"");
+    let mut command_line: Vec<u16> = command_line.encode_wide().chain(Some(0)).collect();
+    let current_directory = executable.parent().map(|directory| {
+        directory
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<u16>>()
+    });
+    let current_directory_ptr = current_directory
+        .as_ref()
+        .map_or_else(PCWSTR::null, |directory| PCWSTR(directory.as_ptr()));
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: SW_HIDE.0 as u16,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW,
+            None,
+            current_directory_ptr,
+            &startup,
+            &mut process,
+        )
+        .map_err(|error| format!("静默启动 OOPZ 失败: {error}"))?;
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    keep_oopz_windows_hidden_during_startup();
+    Ok(())
+}
+
+fn launch_oopz(executable: &str, silent: bool) -> Result<(), String> {
+    if silent {
+        spawn_oopz_hidden(Path::new(executable))
+    } else {
+        Command::new(executable)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn keep_oopz_windows_hidden_during_startup() {
+    thread::spawn(|| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            hide_oopz_windows();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
 fn ensure_plugin_runtime_for_oopz(config: &AppConfig) {
     if config.plugin_mode_enabled && running_oopz_exe().is_some() && !is_plugin_runtime_running() {
         let _ = spawn_plugin_runtime();
@@ -2391,6 +2680,20 @@ struct WindowSearch {
     pids: Vec<u32>,
     hwnd: Option<HWND>,
     rect: Option<RECT>,
+}
+
+struct WindowHide {
+    pids: Vec<u32>,
+}
+
+unsafe extern "system" fn hide_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let hide = &*(lparam.0 as *const WindowHide);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if hide.pids.contains(&pid) && GetAncestor(hwnd, GA_ROOTOWNER) == hwnd {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    BOOL(1)
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -2446,6 +2749,17 @@ fn oopz_window_info_for_pids(pids: Vec<u32>) -> Option<(HWND, RECT)> {
 
 fn oopz_window_info() -> Option<(HWND, RECT)> {
     oopz_window_info_for_pids(oopz_process_ids())
+}
+
+fn hide_oopz_windows() {
+    let pids = oopz_process_ids();
+    if pids.is_empty() {
+        return;
+    }
+    let hide = WindowHide { pids };
+    unsafe {
+        let _ = EnumWindows(Some(hide_windows_proc), LPARAM(&hide as *const _ as isize));
+    }
 }
 
 fn overlay_dimensions(account_count: usize, vertical: bool) -> (u32, u32) {
@@ -12186,6 +12500,12 @@ fn delete_account_inner(
     next_data
         .accounts
         .retain(|account| account.id != account_id);
+    let cleared_auto_sign_account =
+        next_data.config.oopz_auto_sign_account_id.as_deref() == Some(account_id.as_str());
+    if cleared_auto_sign_account {
+        next_data.config.oopz_auto_sign_account_id = None;
+        next_data.config.oopz_auto_sign_enabled = false;
+    }
     if let Err(error) = save_data(&next_data) {
         if let Some(staged) = &staged {
             rollback_staged_deletion(staged);
@@ -12198,7 +12518,22 @@ fn delete_account_inner(
     *state.data.lock().map_err(|e| e.to_string())? = next_data;
     delete_credential(&account_id);
     finish_staged_deletion(staged);
+    if cleared_auto_sign_account {
+        if let Ok(mut completed) = state.oopz_auto_sign_completed_key.lock() {
+            *completed = None;
+        }
+        if let Ok(mut last_attempt) = state.oopz_auto_sign_last_attempt.lock() {
+            *last_attempt = None;
+        }
+        if let Ok(mut last_start) = state.oopz_auto_sign_last_start.lock() {
+            *last_start = None;
+        }
+        let mut status = initial_oopz_auto_sign_status();
+        status.message = "自动签到账号已删除，功能已关闭".to_string();
+        emit_oopz_auto_sign_status(&app, status);
+    }
     update_tray(&app);
+    let _ = app.emit("app-data-changed", ());
     Ok(())
 }
 
@@ -12363,6 +12698,15 @@ fn switch_account_inner(
     state: State<AppState>,
     account_id: String,
 ) -> Result<SwitchResult, String> {
+    switch_account_inner_with_options(app, state, account_id, false)
+}
+
+fn switch_account_inner_with_options(
+    app: AppHandle,
+    state: State<AppState>,
+    account_id: String,
+    silent_start: bool,
+) -> Result<SwitchResult, String> {
     let _activity = acquire_switch_activity(&app)?;
     let _operation = state
         .switch_operation
@@ -12386,9 +12730,7 @@ fn switch_account_inner(
         close_oopz_if_running()?;
         backup_current(&paths)?;
         clear_registry_login()?;
-        Command::new(paths.oopz_exe_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        launch_oopz(&paths.oopz_exe_path, silent_start)?;
         if let Some(uid) = account.uid.clone() {
             schedule_avatar_refresh(app.clone(), uid);
         }
@@ -12416,9 +12758,7 @@ fn switch_account_inner(
         close_oopz_if_running()?;
         backup_current(&paths)?;
         clear_registry_login()?;
-        Command::new(paths.oopz_exe_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        launch_oopz(&paths.oopz_exe_path, silent_start)?;
         if let Some(uid) = account.uid.clone() {
             schedule_avatar_refresh(app.clone(), uid);
         }
@@ -12455,9 +12795,7 @@ fn switch_account_inner(
         )?;
         write_registry_login(&oopz_login)?;
         verify_registry_login_uid(&uid)?;
-        Command::new(&paths.oopz_exe_path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        launch_oopz(&paths.oopz_exe_path, silent_start)?;
         Ok(())
     })();
     if let Err(error) = apply_result {
@@ -12523,6 +12861,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
     };
     let plugin_enabled = data.config.plugin_mode_enabled;
     let oopz_auto_sign_enabled = data.config.oopz_auto_sign_enabled;
+    let oopz_auto_sign_account_selected = data.config.oopz_auto_sign_account_id.is_some();
     {
         let state = app.state::<AppState>();
         let mut current = state
@@ -12540,7 +12879,11 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
             }
             .to_string();
             status.message = if oopz_auto_sign_enabled {
-                "已开启，等待 OOPZ 登录并运行"
+                if oopz_auto_sign_account_selected {
+                    "已开启，正在准备自动签到"
+                } else {
+                    "已开启，请选择自动签到账号"
+                }
             } else {
                 "自动签到未开启"
             }
@@ -12669,6 +13012,7 @@ pub fn run() {
             check_for_updates,
             get_oopz_auto_sign_status,
             set_oopz_auto_sign_enabled,
+            set_oopz_auto_sign_account,
             check_oopz_auto_sign
         ])
         .setup(move |app| {

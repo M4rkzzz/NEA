@@ -1093,6 +1093,23 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   margin: 0;
 }
 
+.auto-sign-account-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 340px);
+  align-items: center;
+  gap: 16px;
+}
+
+.auto-sign-account-panel select {
+  width: 100%;
+  height: 34px;
+  border: 1px solid #d8dde2;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #fff;
+  color: #202124;
+}
+
 .auto-sign-summary .metric strong {
   font-size: 19px;
 }
@@ -1141,6 +1158,10 @@ html[data-theme="dark"] .steam-import-parallel-hint {
 
   .auto-sign-hero > button {
     grid-column: 1 / -1;
+  }
+
+  .auto-sign-account-panel {
+    grid-template-columns: 1fr;
   }
 }
 
