@@ -128,6 +128,8 @@ struct AppConfig {
     plugin_mode_enabled: bool,
     #[serde(default)]
     plugin_autostart_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    silent_start_enabled: Option<bool>,
     #[serde(default)]
     oopz_auto_sign_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2565,6 +2567,34 @@ fn autostart_command(executable: &Path) -> String {
     format!("\"{}\" {}", executable.display(), AUTOSTART_ARGUMENT)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupSettings {
+    autostart_enabled: bool,
+    silent_start_enabled: bool,
+}
+
+fn silent_start_preference_from_disk() -> Option<bool> {
+    let raw = fs::read_to_string(config_path().ok()?).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("config")?
+        .get("silentStartEnabled")?
+        .as_bool()
+}
+
+fn effective_silent_start_enabled(config: &AppConfig) -> bool {
+    config.silent_start_enabled.unwrap_or(false)
+}
+
+fn silent_start_for_launch(preference: Option<bool>) -> bool {
+    preference.unwrap_or(false)
+}
+
+fn should_start_silently() -> bool {
+    silent_start_for_launch(silent_start_preference_from_disk())
+}
+
 fn autostart_enabled() -> Result<bool, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let expected = autostart_command(&executable);
@@ -2596,13 +2626,33 @@ fn set_autostart_registration(enabled: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn get_autostart_enabled() -> Result<bool, String> {
-    autostart_enabled()
+fn get_startup_settings(state: State<AppState>) -> Result<StartupSettings, String> {
+    let silent_start_enabled = {
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        effective_silent_start_enabled(&data.config)
+    };
+    Ok(StartupSettings {
+        autostart_enabled: autostart_enabled()?,
+        silent_start_enabled,
+    })
 }
 
 #[tauri::command]
-fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
-    set_autostart_registration(enabled)
+fn set_autostart_enabled(state: State<AppState>, enabled: bool) -> Result<StartupSettings, String> {
+    set_autostart_registration(enabled)?;
+    get_startup_settings(state)
+}
+
+#[tauri::command]
+fn set_silent_start_enabled(
+    state: State<AppState>,
+    enabled: bool,
+) -> Result<StartupSettings, String> {
+    commit_app_data_update(&state, |data| {
+        data.config.silent_start_enabled = Some(enabled);
+        Ok(())
+    })?;
+    get_startup_settings(state)
 }
 
 fn spawn_plugin_runtime() -> Result<(), String> {
@@ -12964,7 +13014,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let silent_start = args.iter().any(|arg| arg == AUTOSTART_ARGUMENT);
+    let silent_start = should_start_silently();
     if args.iter().any(|arg| arg == "--apply-update") {
         apply_update_helper(&args);
         return;
@@ -12994,8 +13044,8 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
     if !plugin_runtime {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if !args.iter().any(|arg| arg == AUTOSTART_ARGUMENT) {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if !should_start_silently() {
                 show_main_window(app);
             }
         }));
@@ -13059,8 +13109,9 @@ pub fn run() {
             set_overlay_layout,
             get_update_status,
             check_for_updates,
-            get_autostart_enabled,
+            get_startup_settings,
             set_autostart_enabled,
+            set_silent_start_enabled,
             get_oopz_auto_sign_status,
             set_oopz_auto_sign_enabled,
             set_oopz_auto_sign_account,
@@ -13248,11 +13299,18 @@ mod tests {
     }
 
     #[test]
-    fn autostart_command_quotes_the_executable_and_requests_silent_start() {
+    fn autostart_command_quotes_the_executable_and_marks_the_launch() {
         assert_eq!(
             autostart_command(Path::new("C:\\Program Files\\NEA\\nea.exe")),
             "\"C:\\Program Files\\NEA\\nea.exe\" --autostart"
         );
+    }
+
+    #[test]
+    fn silent_start_defaults_off_and_applies_to_every_launch() {
+        assert!(!silent_start_for_launch(None));
+        assert!(!silent_start_for_launch(Some(false)));
+        assert!(silent_start_for_launch(Some(true)));
     }
 
     #[test]

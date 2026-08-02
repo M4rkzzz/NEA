@@ -167,18 +167,24 @@ button.primary.danger-confirm:hover:not(:disabled) {
   background: #eaf4f8;
 }
 
-.global-share-button {
+.global-actions {
+  display: grid;
+  gap: 4px;
+  margin-top: auto;
+}
+
+.global-action-button {
   display: grid;
   width: 48px;
   height: 42px;
-  margin-top: auto;
   place-items: center;
   border-color: transparent;
   background: transparent;
   color: #52616a;
 }
 
-.global-share-button:hover:not(:disabled) {
+.global-action-button:hover:not(:disabled),
+.global-action-button[data-active="true"] {
   border-color: #c6d9df;
   background: #fff;
   color: #20272b;
@@ -320,6 +326,109 @@ button.primary.danger-confirm:hover:not(:disabled) {
   color: #66737a;
   font-size: 12px;
   line-height: 18px;
+}
+
+.settings-dialog {
+  width: min(460px, 100%);
+}
+
+.settings-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.settings-dialog-header h2 {
+  margin: 0;
+  font-size: 19px;
+}
+
+.settings-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border: 1px solid #e0e6e9;
+  border-radius: 8px;
+  padding: 16px;
+  background: #f7fafb;
+}
+
+.settings-item + .settings-item {
+  margin-top: 10px;
+}
+
+.settings-item-details {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.settings-item-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.settings-item-details strong {
+  font-size: 14px;
+}
+
+.settings-item-title small {
+  color: #68767d;
+  font-size: 11px;
+}
+
+.settings-item-details span {
+  color: #66737a;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.settings-item > .settings-switch {
+  position: relative;
+  width: 42px;
+  min-width: 42px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 1px solid #aebac0;
+  border-radius: 999px;
+  padding: 2px;
+  background: #c5ced3;
+  box-shadow: inset 0 1px 2px rgba(31, 48, 58, 0.12);
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.settings-switch > span {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(31, 48, 58, 0.28);
+  transform: translateX(0);
+  transition: transform 150ms ease;
+}
+
+.settings-item > .settings-switch[data-enabled="true"] {
+  border-color: #2563d9;
+  background: #2d68dd;
+}
+
+.settings-switch[data-enabled="true"] > span {
+  transform: translateX(18px);
+}
+
+.settings-item > .settings-switch:hover:not(:disabled) {
+  border-color: #7b8990;
+  background: #b5c0c5;
+}
+
+.settings-item > .settings-switch[data-enabled="true"]:hover:not(:disabled) {
+  border-color: #1f57c1;
+  background: #245ac7;
 }
 
 .share-center-backdrop {
@@ -2100,7 +2209,8 @@ html[data-theme="dark"] :where(button, input, select, textarea, [tabindex]):focu
 }
 
 html[data-theme="dark"] .app-list button[data-active="true"],
-html[data-theme="dark"] .global-share-button:hover:not(:disabled),
+html[data-theme="dark"] .global-action-button:hover:not(:disabled),
+html[data-theme="dark"] .global-action-button[data-active="true"],
 html[data-theme="dark"] .feature-list button[data-active="true"] {
   border-color: #4b565b;
   background: #2b3539;
@@ -2109,7 +2219,7 @@ html[data-theme="dark"] .feature-list button[data-active="true"] {
 }
 
 html[data-theme="dark"] .feature-list button svg,
-html[data-theme="dark"] .global-share-button,
+html[data-theme="dark"] .global-action-button,
 html[data-theme="dark"] .status,
 html[data-theme="dark"] .paths dt,
 html[data-theme="dark"] .metric span,
@@ -2321,7 +2431,7 @@ html[data-theme="dark"] button:not(.primary) {
 html[data-theme="dark"] .window-controls button,
 html[data-theme="dark"] .app-list button,
 html[data-theme="dark"] .feature-list button,
-html[data-theme="dark"] .global-share-button,
+html[data-theme="dark"] .global-action-button,
 html[data-theme="dark"] .icon-button {
   border-color: transparent;
   background: transparent;
@@ -2335,7 +2445,7 @@ html[data-theme="dark"] .window-controls button {
 html[data-theme="dark"] .window-controls button:hover:not(:disabled),
 html[data-theme="dark"] .app-list button:hover:not(:disabled),
 html[data-theme="dark"] .feature-list button:hover:not(:disabled),
-html[data-theme="dark"] .global-share-button:hover:not(:disabled),
+html[data-theme="dark"] .global-action-button:hover:not(:disabled),
 html[data-theme="dark"] .icon-button:hover:not(:disabled) {
   border-color: transparent;
   background: #2a2a2a;
@@ -2349,6 +2459,31 @@ html[data-theme="dark"] .window-controls .window-close:hover:not(:disabled) {
 html[data-theme="dark"] .panel {
   border-color: #333;
   background: transparent;
+}
+
+html[data-theme="dark"] .settings-item {
+  border-color: #3a3a3a;
+  background: #262626;
+}
+
+html[data-theme="dark"] .settings-item-details span {
+  color: #a6a6a6;
+}
+
+html[data-theme="dark"] .settings-item-title small {
+  color: #9aa5aa;
+}
+
+html[data-theme="dark"] .settings-item > .settings-switch,
+html[data-theme="dark"] .settings-item > .settings-switch:hover:not(:disabled) {
+  border-color: #60696d;
+  background: #4b5458;
+}
+
+html[data-theme="dark"] .settings-item > .settings-switch[data-enabled="true"],
+html[data-theme="dark"] .settings-item > .settings-switch[data-enabled="true"]:hover:not(:disabled) {
+  border-color: #4b82ee;
+  background: #2d68dd;
 }
 
 html[data-theme="dark"] .account-row {
