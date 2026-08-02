@@ -360,31 +360,8 @@ button.primary.danger-confirm:hover:not(:disabled) {
   margin-top: 10px;
 }
 
-.settings-item-details {
-  display: grid;
-  min-width: 0;
-  gap: 5px;
-}
-
-.settings-item-title {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-
-.settings-item-details strong {
+.settings-item > strong {
   font-size: 14px;
-}
-
-.settings-item-title small {
-  color: #68767d;
-  font-size: 11px;
-}
-
-.settings-item-details span {
-  color: #66737a;
-  font-size: 12px;
-  line-height: 18px;
 }
 
 .settings-item > .settings-switch {
@@ -2464,14 +2441,6 @@ html[data-theme="dark"] .panel {
 html[data-theme="dark"] .settings-item {
   border-color: #3a3a3a;
   background: #262626;
-}
-
-html[data-theme="dark"] .settings-item-details span {
-  color: #a6a6a6;
-}
-
-html[data-theme="dark"] .settings-item-title small {
-  color: #9aa5aa;
 }
 
 html[data-theme="dark"] .settings-item > .settings-switch,

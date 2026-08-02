@@ -5,7 +5,7 @@
 
 **Not Enough Accounts · Windows 本地多平台账号工作台**
 
-[![Release](https://img.shields.io/badge/release-v1.3.5-2563eb)](https://github.com/M4rkzzz/NEA/releases/latest)
+[![Release](https://img.shields.io/badge/release-v1.3.6-2563eb)](https://github.com/M4rkzzz/NEA/releases/latest)
 [![Windows](https://img.shields.io/badge/Windows-x64-0078d4?logo=windows)](#运行环境)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24c8db?logo=tauri)](https://tauri.app/)
 
@@ -37,20 +37,18 @@ NEA 是面向 Windows 的本地多软件账号切换器，把 OOPZ、Steam 与�
 - 登录能力迁移：分享中心可按 Steam 账号独立选择网页态、账密或两者，并与 OOPZ、完美平台数据一起导出为 `.nea-share` 包或通过一次性码传输。
 - 本地维护：会话缓存瘦身、孤立目录回收、事务恢复和旧数据迁移都由应用内完成。
 
-## 1.3.5 重点更新
+## 1.3.6 重点更新
 
-- 自动签到页面新增账号选择，只允许选择已经具备快速登录状态的 OOPZ 账号。
-- OOPZ 未运行或登录态丢失时，NEA 会使用指定账号静默启动并恢复登录，不弹出 OOPZ 主窗口。
-- 若 OOPZ 正在使用其他账号，自动签到保持等待，不强制关闭或切换玩家当前会话。
-- 本地每分钟观察一次 OOPZ 运行与登录状态，实际签到网络查询改为至少间隔 30 分钟。
-- 同一账号当天确认签到成功后不再启动 OOPZ 或发送重复请求；手动检查仍可跳过时间间隔，但不会重复签到。
-- 删除指定账号时会同步关闭自动签到，避免配置指向不存在的登录状态。
+- 左侧设置入口新增独立的开机自启与静默启动开关，两项默认关闭。
+- 静默启动开启后，NEA 直接驻留系统托盘；左键单击托盘图标即可恢复主窗口。
+- 设置弹窗只保留必要标题与开关，不显示重复状态和常驻说明小字。
+- 正常卸载 NEA 时清理当前用户的开机自启项，版本升级过程保留用户已有设置。
 
-完整变更与安装包见 [NEA v1.3.5 Release](https://github.com/M4rkzzz/NEA/releases/tag/v1.3.5)。
+完整变更与安装包见 [NEA v1.3.6 Release](https://github.com/M4rkzzz/NEA/releases/tag/v1.3.6)。
 
 ## 安装与使用
 
-1. 从 [Releases](https://github.com/M4rkzzz/NEA/releases/latest) 下载 `NEA_1.3.5_x64_en-US.msi`。
+1. 从 [Releases](https://github.com/M4rkzzz/NEA/releases/latest) 下载 `NEA_1.3.6_x64_en-US.msi`。
 2. 安装并打开 NEA；首次启动会自动检查旧 OOPZ+ 数据并执行兼容迁移。
 3. 在左侧选择平台，根据页面提示识别程序路径、导入账号或登录一次。
 4. 后续可从账号列表、托盘菜单或 OOPZ 浮层快速切换。
@@ -104,7 +102,7 @@ pnpm install
 pnpm run dev:app       # 开发运行
 pnpm run check:fast    # 紧密开发循环：仅 TypeScript + Rust 增量检查
 pnpm run verify:dev    # 功能完成：TypeScript + 5 项关键回归测试
-pnpm run verify:release # 正式发布：构建 + 83 项稳定测试 + Clippy
+pnpm run verify:release # 正式发布：构建 + 85 项稳定测试 + Clippy
 pnpm run build:msi     # 构建 Windows MSI
 pnpm run bundle:msi    # 仅在现有 Release EXE 未变化时快速重新封装 MSI
 ```

@@ -2414,10 +2414,7 @@ function App() {
               <button className="icon-button" onClick={() => setShowSettings(false)} disabled={busy} aria-label="关闭设置" title="关闭"><X size={17} /></button>
             </header>
             <section className="settings-item" aria-labelledby="autostart-setting-title">
-              <div className="settings-item-details">
-                <div className="settings-item-title"><strong id="autostart-setting-title">开机自启</strong><small>{startupSettings == null ? "检测中" : startupSettings.autostartEnabled ? "已开启" : "已关闭"}</small></div>
-                <span>登录 Windows 后自动启动 NEA。</span>
-              </div>
+              <strong id="autostart-setting-title">开机自启</strong>
               <button
                 className="settings-switch"
                 type="button"
@@ -2433,10 +2430,7 @@ function App() {
               </button>
             </section>
             <section className="settings-item" aria-labelledby="silent-start-setting-title">
-              <div className="settings-item-details">
-                <div className="settings-item-title"><strong id="silent-start-setting-title">静默启动</strong><small>{startupSettings == null ? "检测中" : startupSettings.silentStartEnabled ? "已开启" : "已关闭"}</small></div>
-                <span>运行 NEA 后直接驻留系统托盘，不显示或弹出主窗口。</span>
-              </div>
+              <strong id="silent-start-setting-title">静默启动</strong>
               <button
                 className="settings-switch"
                 type="button"

@@ -82,7 +82,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 ```powershell
 pnpm run check:fast      # 紧密编辑循环：TypeScript + cargo check，不跑测试
 pnpm run verify:dev      # 功能完成/交付前：TypeScript + 5 项关键 Rust 回归
-pnpm run verify:release  # 仅正式发布：构建、格式、83 项稳定测试、Clippy
+pnpm run verify:release  # 仅正式发布：构建、格式、85 项稳定测试、Clippy
 ```
 
 五项开发冒烟测试统一使用 `dev_smoke_` 前缀，一次启动测试进程，覆盖：
