@@ -66,6 +66,8 @@ const LEGACY_APP_EXECUTABLE_NAME: &str = "oopz-plus.exe";
 const WATCHER_FILE_NAME: &str = "nea-watcher.exe";
 const LEGACY_WATCHER_FILE_NAME: &str = "oopz-plus-watcher.exe";
 const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const APP_RUN_KEY_NAME: &str = "NEA";
+const AUTOSTART_ARGUMENT: &str = "--autostart";
 
 fn process_refresh_kind() -> ProcessRefreshKind {
     ProcessRefreshKind::new()
@@ -2557,6 +2559,50 @@ fn watcher_registration_is_current() -> bool {
     hkcu.open_subkey(RUN_KEY_PATH)
         .and_then(|key| key.get_value::<String, _>(RUN_KEY_NAME))
         .is_ok_and(|value| value.eq_ignore_ascii_case(&expected))
+}
+
+fn autostart_command(executable: &Path) -> String {
+    format!("\"{}\" {}", executable.display(), AUTOSTART_ARGUMENT)
+}
+
+fn autostart_enabled() -> Result<bool, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let expected = autostart_command(&executable);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    Ok(hkcu
+        .open_subkey(RUN_KEY_PATH)
+        .and_then(|key| key.get_value::<String, _>(APP_RUN_KEY_NAME))
+        .is_ok_and(|value| value.eq_ignore_ascii_case(&expected)))
+}
+
+fn set_autostart_registration(enabled: bool) -> Result<bool, String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if enabled {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let (key, _) = hkcu
+            .create_subkey(RUN_KEY_PATH)
+            .map_err(|error| format!("无法打开开机启动配置: {error}"))?;
+        key.set_value(APP_RUN_KEY_NAME, &autostart_command(&executable))
+            .map_err(|error| format!("启用开机自启失败: {error}"))?;
+    } else if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY_PATH, winreg::enums::KEY_SET_VALUE)
+    {
+        match key.delete_value(APP_RUN_KEY_NAME) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("关闭开机自启失败: {error}")),
+        }
+    }
+    autostart_enabled()
+}
+
+#[tauri::command]
+fn get_autostart_enabled() -> Result<bool, String> {
+    autostart_enabled()
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
+    set_autostart_registration(enabled)
 }
 
 fn spawn_plugin_runtime() -> Result<(), String> {
@@ -12918,6 +12964,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    let silent_start = args.iter().any(|arg| arg == AUTOSTART_ARGUMENT);
     if args.iter().any(|arg| arg == "--apply-update") {
         apply_update_helper(&args);
         return;
@@ -12947,8 +12994,10 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
     if !plugin_runtime {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app);
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|arg| arg == AUTOSTART_ARGUMENT) {
+                show_main_window(app);
+            }
         }));
     }
 
@@ -13010,6 +13059,8 @@ pub fn run() {
             set_overlay_layout,
             get_update_status,
             check_for_updates,
+            get_autostart_enabled,
+            set_autostart_enabled,
             get_oopz_auto_sign_status,
             set_oopz_auto_sign_enabled,
             set_oopz_auto_sign_account,
@@ -13148,6 +13199,10 @@ pub fn run() {
                 });
             }
 
+            if !silent_start {
+                show_main_window(app.handle());
+            }
+
             let startup_app = app.handle().clone();
             let cleanup_path = updater_cleanup.clone();
             thread::spawn(move || initialize_main_app(startup_app, cleanup_path));
@@ -13190,6 +13245,14 @@ mod tests {
         assert!(is_watcher_executable_name("nea-watcher.exe"));
         assert!(is_watcher_executable_name("oopz-plus-watcher.exe"));
         assert!(!is_nea_runtime_process_name("oopz.exe"));
+    }
+
+    #[test]
+    fn autostart_command_quotes_the_executable_and_requests_silent_start() {
+        assert_eq!(
+            autostart_command(Path::new("C:\\Program Files\\NEA\\nea.exe")),
+            "\"C:\\Program Files\\NEA\\nea.exe\" --autostart"
+        );
     }
 
     #[test]
@@ -14611,6 +14674,7 @@ mod tests {
             main_window.background_color,
             Some(tauri::utils::config::Color(234, 244, 248, 255))
         );
+        assert!(!main_window.visible);
     }
 
     #[test]

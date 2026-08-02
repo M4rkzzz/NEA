@@ -411,6 +411,7 @@ function App() {
   const [message, setMessage] = useState("正在初始化...");
   const [startupPhase, setStartupPhase] = useState<StartupViewPhase>("loading");
   const [startupError, setStartupError] = useState("");
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [searchingOopz, setSearchingOopz] = useState(false);
   const [searchPath, setSearchPath] = useState("");
@@ -648,6 +649,22 @@ function App() {
         : next.accounts[0]?.id ?? null,
     );
     return next;
+  }
+
+  async function refreshAutostart() {
+    const enabled = await invoke<boolean>("get_autostart_enabled");
+    setAutostartEnabled(enabled);
+    return enabled;
+  }
+
+  async function toggleAutostart(enabled: boolean) {
+    const current = await runTask(
+      enabled ? "正在启用开机自启..." : "正在关闭开机自启...",
+      () => invoke<boolean>("set_autostart_enabled", { enabled }),
+      false,
+    );
+    setAutostartEnabled(current);
+    setMessage(current ? "已启用开机自启；登录 Windows 后会静默驻留托盘" : "已关闭开机自启");
   }
 
   async function runTask<T>(label: string, task: () => Promise<T>, refreshAfter = true) {
@@ -1647,6 +1664,10 @@ function App() {
           refreshOopzAutoSignStatus(),
           refreshPluginStatus(),
           refreshPerfectArena(),
+          refreshAutostart().catch((error) => {
+            setAutostartEnabled(false);
+            setMessage(`无法读取开机自启状态：${errorMessage(error)}`);
+          }),
         ]);
       })
       .catch((error) => {
@@ -1898,6 +1919,23 @@ function App() {
         <div className="metric"><strong>{data.accounts.length}</strong><span>已保存账号</span></div>
         <div className="metric"><strong>{sessionCount}</strong><span>可快速切换</span></div>
         <div className="metric"><strong>{pluginStatus?.pluginModeEnabled ? "已开启" : "未开启"}</strong><span>插件模式</span></div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title"><h2>NEA 启动</h2></div>
+        <div className="plugin-toggle-row">
+          <div>
+            <strong>{autostartEnabled == null ? "正在检测" : autostartEnabled ? "已开启" : "未开启"}</strong>
+            <p>登录 Windows 后静默启动，只驻留系统托盘，不弹出主窗口</p>
+          </div>
+          <button
+            className={autostartEnabled ? "" : "primary"}
+            onClick={() => handleAction(() => toggleAutostart(!autostartEnabled))}
+            disabled={busy || autostartEnabled == null}
+          >
+            {autostartEnabled ? "关闭" : "开启"}
+          </button>
+        </div>
       </div>
 
       <div className="panel">
