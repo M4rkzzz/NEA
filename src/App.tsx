@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { CalendarCheck, Eye, EyeOff, KeyRound, LayoutDashboard, Minus, Moon, MoreHorizontal, RefreshCw, Share2, Square, Sun, Trash2, UsersRound, X } from "lucide-react";
+import { CalendarCheck, Eye, EyeOff, KeyRound, LayoutDashboard, Minus, Moon, MoreHorizontal, RefreshCw, Settings, Share2, Square, Sun, Trash2, UsersRound, X } from "lucide-react";
 import "./App.css";
 
 type AppConfig = {
@@ -278,6 +278,11 @@ type FeatureKey = "overview" | "switcher" | "autoSign";
 type PerfectAvailability = "ready" | "pending" | "blocked";
 type StartupViewPhase = "loading" | "ready" | "error";
 
+type StartupSettings = {
+  autostartEnabled: boolean;
+  silentStartEnabled: boolean;
+};
+
 function fmtDate(value?: string) {
   if (!value) return "-";
   try {
@@ -411,6 +416,7 @@ function App() {
   const [message, setMessage] = useState("正在初始化...");
   const [startupPhase, setStartupPhase] = useState<StartupViewPhase>("loading");
   const [startupError, setStartupError] = useState("");
+  const [startupSettings, setStartupSettings] = useState<StartupSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [searchingOopz, setSearchingOopz] = useState(false);
   const [searchPath, setSearchPath] = useState("");
@@ -457,6 +463,7 @@ function App() {
   const [perfectPendingOnly, setPerfectPendingOnly] = useState(false);
   const [perfectAvailableOnly, setPerfectAvailableOnly] = useState(false);
   const [perfectMenuSessionId, setPerfectMenuSessionId] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [showShareCenter, setShowShareCenter] = useState(false);
   const [sharePerfectAvailableOnly, setSharePerfectAvailableOnly] = useState(false);
   const [shareSelectionNotice, setShareSelectionNotice] = useState("");
@@ -479,9 +486,11 @@ function App() {
         ? `steam-credential-delete:${pendingDeleteSteamCredential.id}`
         : showSteamTextImport
           ? "steam-text-import"
-          : showShareCenter
-            ? "share-center"
-            : null;
+          : showSettings
+            ? "settings"
+            : showShareCenter
+              ? "share-center"
+              : null;
 
   const selected = useMemo(
     () => data.accounts.find((account) => account.id === selectedId) || data.accounts[0],
@@ -650,6 +659,32 @@ function App() {
     return next;
   }
 
+  async function refreshStartupSettings() {
+    const settings = await invoke<StartupSettings>("get_startup_settings");
+    setStartupSettings(settings);
+    return settings;
+  }
+
+  async function toggleAutostart(enabled: boolean) {
+    const settings = await runTask(
+      enabled ? "正在启用开机自启..." : "正在关闭开机自启...",
+      () => invoke<StartupSettings>("set_autostart_enabled", { enabled }),
+      false,
+    );
+    setStartupSettings(settings);
+    setMessage(settings.autostartEnabled ? "已启用开机自启" : "已关闭开机自启");
+  }
+
+  async function toggleSilentStart(enabled: boolean) {
+    const settings = await runTask(
+      enabled ? "正在启用静默启动..." : "正在关闭静默启动...",
+      () => invoke<StartupSettings>("set_silent_start_enabled", { enabled }),
+      false,
+    );
+    setStartupSettings(settings);
+    setMessage(settings.silentStartEnabled ? "已启用静默启动" : "已关闭静默启动");
+  }
+
   async function runTask<T>(label: string, task: () => Promise<T>, refreshAfter = true) {
     if (busyRef.current) throw new Error("已有操作正在进行，请稍候");
     busyRef.current = true;
@@ -809,6 +844,15 @@ function App() {
     setWormholeStatus(null);
     setShareSelectionNotice("");
     setShowShareCenter(true);
+  }
+
+  function openSettings(event?: MouseEvent<HTMLButtonElement>) {
+    rememberDialogOpener(event);
+    setShowSettings(true);
+    refreshStartupSettings().catch((error) => {
+      setStartupSettings({ autostartEnabled: false, silentStartEnabled: false });
+      setMessage(`无法读取启动设置：${errorMessage(error)}`);
+    });
   }
 
   function toggleOopzShareItem(id: string, checked: boolean) {
@@ -1647,6 +1691,10 @@ function App() {
           refreshOopzAutoSignStatus(),
           refreshPluginStatus(),
           refreshPerfectArena(),
+          refreshStartupSettings().catch((error) => {
+            setStartupSettings({ autostartEnabled: false, silentStartEnabled: false });
+            setMessage(`无法读取启动设置：${errorMessage(error)}`);
+          }),
         ]);
       })
       .catch((error) => {
@@ -1765,7 +1813,7 @@ function App() {
   }, [activeApp, activeFeature, startupPhase]);
 
   useEffect(() => {
-    if (!pendingOopzOperation && !pendingDeleteAccount && !pendingDeleteSteamWebSession && !pendingDeleteSteamCredential && !showSteamTextImport && !showShareCenter && !perfectMenuSessionId) return;
+    if (!pendingOopzOperation && !pendingDeleteAccount && !pendingDeleteSteamWebSession && !pendingDeleteSteamCredential && !showSteamTextImport && !showSettings && !showShareCenter && !perfectMenuSessionId) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) {
         setPendingOopzOperation(null);
@@ -1777,12 +1825,13 @@ function App() {
         setSteamImportPreview(null);
         setSteamImportError("");
         setPerfectMenuSessionId(null);
+        setShowSettings(false);
         if (!wormholeActive) setShowShareCenter(false);
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [pendingOopzOperation, pendingDeleteAccount, pendingDeleteSteamWebSession, pendingDeleteSteamCredential, showSteamTextImport, showShareCenter, perfectMenuSessionId, wormholeActive, busy]);
+  }, [pendingOopzOperation, pendingDeleteAccount, pendingDeleteSteamWebSession, pendingDeleteSteamCredential, showSteamTextImport, showSettings, showShareCenter, perfectMenuSessionId, wormholeActive, busy]);
 
   useEffect(() => {
     const rememberPageFocus = (event: Event) => {
@@ -2330,7 +2379,10 @@ function App() {
             <button data-active={activeApp === "steam"} aria-current={activeApp === "steam" ? "page" : undefined} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><img className="app-icon-image" src="/steam-icon.svg" alt="" /></button>
             <button data-active={activeApp === "perfect"} aria-current={activeApp === "perfect" ? "page" : undefined} onClick={() => selectApp("perfect")} aria-label="切换到完美对战平台" title="完美对战平台"><img className="app-icon-image" src="/perfect-arena-icon.png" alt="" /></button>
           </nav>
-          <button className="global-share-button" onClick={openShareCenter} aria-label="账号分享" title="账号分享"><Share2 size={20} strokeWidth={1.9} /></button>
+          <div className="global-actions">
+            <button className="global-action-button" data-active={showSettings || undefined} onClick={openSettings} aria-label="设置" title="设置"><Settings size={20} strokeWidth={1.9} /></button>
+            <button className="global-action-button" onClick={openShareCenter} aria-label="账号分享" title="账号分享"><Share2 size={20} strokeWidth={1.9} /></button>
+          </div>
         </aside>
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <div className="sidebar-app-name">{activeAppName}</div>
@@ -2354,6 +2406,54 @@ function App() {
           {activeContent}
         </section>
       </div>
+      {showSettings && (
+        <div className="confirm-backdrop" onMouseDown={() => !busy && setShowSettings(false)}>
+          <div className="confirm-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+            <header className="settings-dialog-header">
+              <h2 id="settings-title">设置</h2>
+              <button className="icon-button" onClick={() => setShowSettings(false)} disabled={busy} aria-label="关闭设置" title="关闭"><X size={17} /></button>
+            </header>
+            <section className="settings-item" aria-labelledby="autostart-setting-title">
+              <div className="settings-item-details">
+                <div className="settings-item-title"><strong id="autostart-setting-title">开机自启</strong><small>{startupSettings == null ? "检测中" : startupSettings.autostartEnabled ? "已开启" : "已关闭"}</small></div>
+                <span>登录 Windows 后自动启动 NEA。</span>
+              </div>
+              <button
+                className="settings-switch"
+                type="button"
+                role="switch"
+                aria-checked={Boolean(startupSettings?.autostartEnabled)}
+                aria-label="开机自启"
+                data-enabled={startupSettings?.autostartEnabled || undefined}
+                onClick={() => handleAction(() => toggleAutostart(!startupSettings?.autostartEnabled))}
+                disabled={busy || startupSettings == null}
+                title={startupSettings?.autostartEnabled ? "关闭开机自启" : "开启开机自启"}
+              >
+                <span aria-hidden="true" />
+              </button>
+            </section>
+            <section className="settings-item" aria-labelledby="silent-start-setting-title">
+              <div className="settings-item-details">
+                <div className="settings-item-title"><strong id="silent-start-setting-title">静默启动</strong><small>{startupSettings == null ? "检测中" : startupSettings.silentStartEnabled ? "已开启" : "已关闭"}</small></div>
+                <span>运行 NEA 后直接驻留系统托盘，不显示或弹出主窗口。</span>
+              </div>
+              <button
+                className="settings-switch"
+                type="button"
+                role="switch"
+                aria-checked={Boolean(startupSettings?.silentStartEnabled)}
+                aria-label="静默启动"
+                data-enabled={startupSettings?.silentStartEnabled || undefined}
+                onClick={() => handleAction(() => toggleSilentStart(!startupSettings?.silentStartEnabled))}
+                disabled={busy || startupSettings == null}
+                title={startupSettings?.silentStartEnabled ? "关闭静默启动" : "开启静默启动"}
+              >
+                <span aria-hidden="true" />
+              </button>
+            </section>
+          </div>
+        </div>
+      )}
       {showShareCenter && (
         <div className="confirm-backdrop share-center-backdrop" onMouseDown={() => !wormholeActive && !busy && setShowShareCenter(false)}>
           <div className="share-center" role="dialog" aria-modal="true" aria-labelledby="share-center-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
