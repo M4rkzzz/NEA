@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.3.1",
+    [string]$Version,
     [ValidateRange(1, 16)]
     [int]$SampleMiB = 2,
     [ValidateRange(5, 120)]
@@ -7,6 +7,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $manifestPath = Join-Path $PSScriptRoot "..\.github\update.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "未提供 Version，且找不到本地更新清单: $manifestPath"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $Version = [string]$manifest.version
+    } catch {
+        throw "读取本地更新清单失败: $($_.Exception.Message)"
+    }
+}
+
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "版本号格式无效: $Version"
+}
 
 $fileName = "NEA_${Version}_x64_en-US.msi"
 $githubUrl = "https://github.com/M4rkzzz/NEA/releases/download/v${Version}/${fileName}"
