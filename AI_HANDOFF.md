@@ -73,6 +73,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 - 协议名、去重规则、包格式、扩展名、限额公式、中继、超时、Cookie、数据库结构、事务和回滚机制不得堆成弹窗底部小字；这些内容放在 handoff、README 或相关错误处理中。
 - 重要隐含效果应在对应选择处用最短用户语言表达。没有可执行能力的整块禁用列表应直接移除，不用“暂不支持”占据界面。
 - `index.html` 中的静态 `nea-boot`、`nea-app-ready`、`nea-overlay` 和 Tauri `backgroundColor` 是防启动白闪契约。用户可见 Loader 必须先于前端模块存在，不得依赖 React 挂载或后端初始化才创建。
+- 主窗口在 `tauri.conf.json` 中是 `visible: false`，只能由 `show_main_window` 显示，因此「能否显示窗口」是可达性契约，不是外观细节。静默启动只允许作用于带 `--autostart` 参数的开机自启；单实例回调必须无条件显示窗口，因为第二次启动只可能来自用户主动操作。任何新增的启动开关都不得成为主动启动路径上的拦截条件，否则应用会退化成只能从托盘找回。
 - 主进程 setup 必须快速返回：事务恢复、临时目录清理、配置迁移、完整托盘构建和维护任务放到后台；首次 `get_app_data` 与配置健康检查都成功后，App 才能开放主界面并发出 `nea:boot-ready`。失败只能显示只读错误页，前端超时兜底也只能露出不可操作的加载页。
 
 ## 4. 验证纪律
@@ -82,7 +83,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 ```powershell
 pnpm run check:fast      # 紧密编辑循环：TypeScript + cargo check，不跑测试
 pnpm run verify:dev      # 功能完成/交付前：TypeScript + 5 项关键 Rust 回归
-pnpm run verify:release  # 仅正式发布：构建、格式、85 项稳定测试、Clippy
+pnpm run verify:release  # 仅正式发布：构建、格式、86 项稳定测试、Clippy
 ```
 
 五项开发冒烟测试统一使用 `dev_smoke_` 前缀，一次启动测试进程，覆盖：

@@ -1,6 +1,6 @@
 [package]
 name = "nea"
-version = "1.3.7"
+version = "1.3.8"
 description = "NEA local multi-application account switcher"
 authors = ["NEA contributors"]
 edition = "2021"
