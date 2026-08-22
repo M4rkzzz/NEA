@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
     io::{ErrorKind, Read, Write},
     os::windows::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -1491,7 +1492,7 @@ fn apply_update_helper(args: &[String]) {
         let _ = fs::write(error_path, format!("自动安装失败，错误码 {}", exit_code));
     }
     let helper_path = std::env::current_exe().ok();
-    let mut command = Command::new(launch_exe);
+    let mut command = detached_command(launch_exe);
     if let Some(helper_path) = helper_path {
         command.arg("--cleanup-updater").arg(helper_path);
     }
@@ -1503,7 +1504,7 @@ fn launch_update_installer(app: &AppHandle, msi_path: &Path, version: &str) -> R
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let helper = std::env::temp_dir().join(format!("nea-updater-{}.exe", Uuid::new_v4()));
     fs::copy(&current_exe, &helper).map_err(|e| format!("准备更新程序失败: {}", e))?;
-    if let Err(error) = Command::new(&helper)
+    if let Err(error) = detached_command(&helper)
         .arg("--apply-update")
         .arg(msi_path)
         .arg(std::process::id().to_string())
@@ -2662,9 +2663,27 @@ fn set_silent_start_enabled(
     get_startup_settings(state)
 }
 
+/// Builds a child process that inherits no standard handles.
+///
+/// NEA is a GUI process, so it usually has none. But a launcher can still leave
+/// non-null standard handles in the PEB without duplicating them into our handle
+/// table — and the updater carries whatever the previous process had into the new
+/// one. `Stdio::inherit()` then tries to duplicate a handle that is not valid
+/// here and every spawn fails with `ERROR_INVALID_HANDLE`, which took down Steam
+/// credential login and its rollback together. Fire-and-forget children need no
+/// stdio, so detach it instead of depending on the launch context.
+pub(crate) fn detached_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
 fn spawn_plugin_runtime() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    Command::new(exe)
+    detached_command(exe)
         .arg("--plugin-runtime")
         .spawn()
         .map_err(|e| format!("启动插件运行态失败: {}", e))?;
@@ -2718,7 +2737,7 @@ fn launch_oopz(executable: &str, silent: bool) -> Result<(), String> {
     if silent {
         spawn_oopz_hidden(Path::new(executable))
     } else {
-        Command::new(executable)
+        detached_command(executable)
             .spawn()
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -12655,7 +12674,7 @@ fn open_oopz_inner(state: State<AppState>) -> Result<(), String> {
         let data = state.data.lock().map_err(|e| e.to_string())?;
         paths_from_config(&data.config)?
     };
-    Command::new(paths.oopz_exe_path)
+    detached_command(paths.oopz_exe_path)
         .spawn()
         .map_err(|e| format!("启动 OOPZ 失败: {}", e))?;
     Ok(())
@@ -12776,7 +12795,7 @@ fn restore_latest_backup_inner(state: &AppState) -> Result<SwitchResult, String>
         let login = fs::read_to_string(login_backup).map_err(|e| e.to_string())?;
         write_registry_login(login.trim())?;
     }
-    Command::new(paths.oopz_exe_path)
+    detached_command(paths.oopz_exe_path)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(SwitchResult {
@@ -13282,7 +13301,7 @@ fn spawn_watcher() -> Result<(), String> {
     } else {
         watcher_path()?
     };
-    Command::new(watcher_exe)
+    detached_command(watcher_exe)
         .arg("--watcher")
         .spawn()
         .map_err(|e| format!("启动守护进程失败: {}", e))?;
@@ -13334,6 +13353,41 @@ mod tests {
             "nea.exe".to_string(),
             "--plugin-runtime".to_string()
         ]));
+    }
+
+    #[test]
+    fn detached_command_survives_invalid_inherited_std_handles() {
+        // Regression: a launch context can leave non-null standard handle values
+        // behind that are not valid in this process (observed on a running client
+        // after an in-app update: no console, yet stdin/stdout/stderr all set).
+        // Stdio::inherit() then tries to duplicate them and every spawn fails with
+        // ERROR_INVALID_HANDLE, which took down Steam credential login together
+        // with its rollback. Anything fire-and-forget must not depend on them.
+        const STD_INPUT_HANDLE: i32 = -10;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(which: i32) -> *mut std::ffi::c_void;
+            fn SetStdHandle(which: i32, handle: *mut std::ffi::c_void) -> i32;
+        }
+
+        static SERIALIZE_STD_HANDLES: Mutex<()> = Mutex::new(());
+        let _guard = SERIALIZE_STD_HANDLES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let poisoned = 0x20cc_usize as *mut std::ffi::c_void;
+        let original = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        unsafe { SetStdHandle(STD_INPUT_HANDLE, poisoned) };
+        let poisoning_took_effect = unsafe { GetStdHandle(STD_INPUT_HANDLE) } == poisoned;
+        let detached = detached_command("cmd").arg("/C").arg("exit").spawn();
+        unsafe { SetStdHandle(STD_INPUT_HANDLE, original) };
+
+        assert!(
+            poisoning_took_effect,
+            "the test must actually reproduce an invalid inherited handle"
+        );
+        let mut child = detached.expect("detached spawn must not depend on inherited std handles");
+        let _ = child.wait();
     }
 
     #[test]

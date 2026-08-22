@@ -58,6 +58,12 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 - Steam 分享包只能用包内 Cookie 归属与隔离 WebView 恢复结果校验账号。不要用无状态 HTTP 请求访问商店页来判定网页登录态是否过期；`steamRefresh_steam` 与 WebView 的完整刷新流程可能让这类请求落到登录页，但账号窗口仍可直接打开。
 - 恢复记录位于 `%APPDATA%\NEA\recovery`，只记录路径和受影响 ID，不得写入 Steam 密码。账密导入回滚只能删除本事务新增项或恢复非密钥绑定信息。
 
+### 进程启动
+
+- 所有「发射后不管」的子进程必须走 `detached_command`（`Stdio::null()`），不得用裸 `Command::new(...).spawn()`。NEA 是 GUI 进程，某些启动方式会在 PEB 里留下非空但在本进程无效的标准句柄（实测：应用内更新后的客户端没有控制台，三个标准句柄却都有值），`Stdio::inherit()` 会去复制这些句柄并让每一次 spawn 都以 `ERROR_INVALID_HANDLE`（os error 6）失败。这曾同时打断 Steam 账密登录和它的回滚。
+- 需要读取子进程输出时才用 `Stdio::piped()`，并显式设置另外两个方向；不要只设 `stdout`/`stderr` 而漏掉 `stdin`。
+- OOPZ 静默启动继续走 `spawn_oopz_hidden` 的原生 `CreateProcessW`，它本身不继承标准句柄，不要改成 `Command`。
+
 ### 数据与并发
 
 - 当前数据根目录是 `%APPDATA%\NEA`，稳定入口为 `config.json`，其余内容按 `workspaces`、`runtime`、`recovery`、`legacy` 分层。
@@ -83,7 +89,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 ```powershell
 pnpm run check:fast      # 紧密编辑循环：TypeScript + cargo check，不跑测试
 pnpm run verify:dev      # 功能完成/交付前：TypeScript + 5 项关键 Rust 回归
-pnpm run verify:release  # 仅正式发布：构建、格式、86 项稳定测试、Clippy
+pnpm run verify:release  # 仅正式发布：构建、格式、87 项稳定测试、Clippy
 ```
 
 五项开发冒烟测试统一使用 `dev_smoke_` 前缀，一次启动测试进程，覆盖：
