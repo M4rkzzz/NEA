@@ -2227,6 +2227,12 @@ fn schedule_zodaccess_login_cleanup(account_id: String) {
     });
 }
 
+fn close_zodaccess_login_window(window: &WebviewWindow) {
+    let _ = window.hide();
+    let _ = window.close();
+    let _ = window.destroy();
+}
+
 fn zodaccess_workspace(app: &AppHandle) -> zodaccess::ZodAccessWorkspace {
     let state = app.state::<AppState>();
     let mut workspace = state
@@ -2510,7 +2516,7 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
                 match result {
                     Ok(()) => {
                         let _ = app.emit("zodaccess-login-complete", display_name);
-                        let _ = window.destroy();
+                        close_zodaccess_login_window(&window);
                         schedule_zodaccess_auto_sign_check(app, true, false, None);
                     }
                     Err(error) => {
@@ -2533,7 +2539,10 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
     };
     let cleanup_account_id = account_id;
     window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
+        if matches!(
+            event,
+            WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+        ) {
             schedule_zodaccess_login_cleanup(cleanup_account_id.clone());
         }
     });
