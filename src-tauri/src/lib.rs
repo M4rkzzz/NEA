@@ -4774,13 +4774,54 @@ fn watch_config_changes(app: AppHandle) {
     });
 }
 
+fn bind_main_window_events(window: &WebviewWindow) {
+    let window_for_close = window.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = window_for_close.destroy();
+        } else if let WindowEvent::Resized(_) = event {
+            let minimized = window_for_close.is_minimized().unwrap_or(false);
+            set_webview_low_memory(&window_for_close, minimized);
+        } else if let WindowEvent::ScaleFactorChanged { .. } = event {
+            fit_main_window_to_monitor(&window_for_close, false);
+        }
+    });
+}
+
+fn create_main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .ok_or_else(|| "NEA 主窗口配置缺失".to_string())?;
+    let window = WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+    fit_main_window_to_monitor(&window, true);
+    bind_main_window_events(&window);
+    Ok(window)
+}
+
 fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        set_webview_low_memory(&window, false);
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => match create_main_window(app) {
+            Ok(window) => window,
+            Err(error) => {
+                eprintln!("无法重新打开 NEA 主窗口: {error}");
+                return;
+            }
+        },
+    };
+    set_webview_low_memory(&window, false);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 fn finish_tray_switch(app: &AppHandle, result: Result<SwitchResult, String>) {
@@ -14051,19 +14092,10 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 fit_main_window_to_monitor(&window, true);
-                let window_for_close = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        set_webview_low_memory(&window_for_close, true);
-                        let _ = window_for_close.hide();
-                    } else if let WindowEvent::Resized(_) = event {
-                        let minimized = window_for_close.is_minimized().unwrap_or(false);
-                        set_webview_low_memory(&window_for_close, minimized);
-                    } else if let WindowEvent::ScaleFactorChanged { .. } = event {
-                        fit_main_window_to_monitor(&window_for_close, false);
-                    }
-                });
+                bind_main_window_events(&window);
+                if silent_start {
+                    window.destroy()?;
+                }
             }
 
             if !silent_start {
