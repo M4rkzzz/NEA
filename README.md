@@ -12,7 +12,7 @@
 [下载最新版](https://github.com/M4rkzzz/NEA/releases/latest) · [查看 Releases](https://github.com/M4rkzzz/NEA/releases) · [反馈问题](https://github.com/M4rkzzz/NEA/issues)
 </div>
 
-NEA 是面向 Windows 的本地多软件账号切换器，把 OOPZ、Steam 与完美世界竞技平台的账号资料、登录能力和常用入口收拢到一个桌面应用中。数据默认留在当前 Windows 用户目录，不依赖 NEA 自建云端服务。
+NEA 是面向 Windows 的本地多软件账号工作台，把 OOPZ、Steam、完美世界竞技平台与 ZodAccess 的账号资料、登录能力和常用入口收拢到一个桌面应用中。数据默认留在当前 Windows 用户目录，不依赖 NEA 自建云端服务。
 
 通过左侧栏底部的“设置”可分别控制开机自启与静默启动，两项默认均关闭。开机自启决定 NEA 是否随当前用户登录 Windows 自动运行；静默启动开启后，运行 NEA 会直接驻留系统托盘，不显示或弹出主窗口。左键单击托盘图标即可打开，关闭主窗口后仍会继续在托盘运行。
 
@@ -25,6 +25,7 @@ NEA 是面向 Windows 的本地多软件账号切换器，把 OOPZ、Steam 与�
 | OOPZ | 本地账号快照、一键切号、静默自动签到、托盘与头像浮层、导入导出、加密通道快捷分享 |
 | Steam | SteamID64 统一身份、网页登录、保存账密登录客户端、Steam Guard 状态识别、托盘切号 |
 | 完美世界竞技平台 | 账号资料与筛选、网页授权同步、使用关联 Steam 账密打开客户端 |
+| ZodAccess | 隔离网页登录、多账号自动签到、逐账号开关与登录失效提示 |
 
 ## 主要能力
 
@@ -34,6 +35,7 @@ NEA 是面向 Windows 的本地多软件账号切换器，把 OOPZ、Steam 与�
 - 原生最近账号隔离：可将 NEA 账密登录的账号从 Steam 原生“切换账号”最近列表中安全移除，避免挤占五个位置。
 - OOPZ 多入口切号：支持主界面、系统托盘与贴附浮层，并在切换前保存恢复点。
 - OOPZ 自动签到：用户指定账号并开启后，OOPZ 未运行或未登录时会静默启动并恢复该账号；每 30 分钟查询签到状态，当天完成后不重复请求。
+- ZodAccess 多账号自动签到：用户在隔离的官方页面自行完成滑块或二次验证；登录后由轻量 HTTP 请求顺序检查账号，临时失败每小时重试，当日成功后停止请求。
 - 登录能力迁移：分享中心可按 Steam 账号独立选择网页态、账密或两者，并与 OOPZ、完美平台数据一起导出为 `.nea-share` 包或通过一次性码传输。
 - 本地维护：会话缓存瘦身、孤立目录回收、事务恢复和旧数据迁移都由应用内完成。
 
@@ -65,6 +67,7 @@ Steam Guard、手机确认和邮件验证仍由 Steam 官方页面或客户端�
 - Magic Wormhole 快捷分享使用一次性代码和端到端加密通道；连接协商支持设备直连，需中继时只使用免费的 Winden / Least Authority 公共中继，不再竞速旧的慢中继。中继服务不能读取包内容，但速度与可用性仍受公共服务和双方网络影响；网络不理想时可导出 `.nea-share` 包自行传递。
 - 生成和接收快捷分享时会短暂创建未额外加密的本地包；提交阶段的回滚记录位于 `%APPDATA%\NEA\recovery`。正常结束会立即删除，异常退出后会在下次主程序启动时先恢复 Steam/完美文件与配置，再回收已完成或未进入提交阶段的残留。
 - NEA 不修改平台程序文件、不注入 DLL，也不绕过 Steam Guard；OOPZ 自动签到只使用当前 Windows 用户已有的本地 OOPZ 登录态连接其官方服务，不保存额外密码或上传登录态到 NEA 服务。
+- ZodAccess 登录窗口复用系统 Edge WebView2，仅在添加账号或重新登录时创建隔离临时目录；Cookie 只保存在 Windows 凭据管理器，后台签到使用现有 Rust HTTP 客户端，不引入 Chromium，也不绕过滑块或二次验证。
 - NEA 默认只管理当前 Windows 用户的数据；共享 Windows 账户会扩大配置与登录态的可见范围。
 
 ## 数据目录
@@ -79,19 +82,19 @@ NEA/
 │  ├─ oopz/                        OOPZ 账号快照与切号备份
 │  ├─ steam/web-sessions/          Steam WebView2 必要登录态
 │  └─ perfect/avatars/             完美平台头像缓存
-├─ runtime/                        Watcher 与更新运行状态
-├─ recovery/                       可恢复事务数据
+├─ runtime/                        Watcher、更新状态与一次性登录目录
+├─ recovery/                       可恢复事务数据与待清理凭据标识
 └─ legacy/                         旧目录迁移归档
 ```
 
-Steam 会话只保留 Cookie、Local Storage 等必要状态。页面缓存、代码缓存、GPU/Shader 缓存和统计文件会在窗口关闭或“整理存储”时清理；升级后目录结构保持兼容，不要求用户手工移动文件。
+Steam 会话只保留 Cookie、Local Storage 等必要状态。页面缓存、代码缓存、GPU/Shader 缓存和统计文件会在窗口关闭或“整理存储”时清理；ZodAccess Cookie 不写入上述目录或 `config.json`，其一次性登录目录在窗口销毁后清理。升级后目录结构保持兼容，不要求用户手工移动文件。
 
 ## 运行环境
 
 - Windows 10 x64 1709 或更高版本；推荐 Windows 10 22H2 / Windows 11。
 - 不支持 32 位 Windows。
 - 图形界面依赖 Microsoft Edge WebView2 Runtime；MSI 会在缺失时引导安装。
-- Steam、OOPZ 和完美世界竞技平台的可用性仍受各自客户端、网络与账号安全策略影响。
+- Steam、OOPZ、完美世界竞技平台和 ZodAccess 的可用性仍受各自客户端、页面、网络与账号安全策略影响。
 
 ## 本地开发
 
@@ -102,7 +105,7 @@ pnpm install
 pnpm run dev:app       # 开发运行
 pnpm run check:fast    # 紧密开发循环：仅 TypeScript + Rust 增量检查
 pnpm run verify:dev    # 功能完成：TypeScript + 5 项关键回归测试
-pnpm run verify:release # 正式发布：构建 + 87 项稳定测试 + Clippy
+pnpm run verify:release # 正式发布：构建 + 99 项稳定测试 + Clippy
 pnpm run build:msi     # 构建 Windows MSI
 pnpm run bundle:msi    # 仅在现有 Release EXE 未变化时快速重新封装 MSI
 ```
