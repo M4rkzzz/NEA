@@ -791,6 +791,7 @@ fn stop(installation: &PerfectArenaInstallation) -> Result<(), String> {
             let _ = Command::new("taskkill.exe")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -808,7 +809,7 @@ fn stop(installation: &PerfectArenaInstallation) -> Result<(), String> {
 }
 
 fn start(installation: &PerfectArenaInstallation) -> Result<(), String> {
-    Command::new(&installation.executable)
+    crate::detached_command(&installation.executable)
         .current_dir(&installation.install_dir)
         .spawn()
         .map(|_| ())

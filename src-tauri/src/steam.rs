@@ -6,7 +6,6 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::Command,
     sync::{mpsc, Mutex, OnceLock},
     thread,
     time::Duration,
@@ -849,7 +848,7 @@ impl SteamAdapter {
         if account_name.trim().is_empty() || password.is_empty() {
             return Err("Steam 账号或密码为空".to_string());
         }
-        Command::new(&installation.executable)
+        crate::detached_command(&installation.executable)
             .current_dir(&installation.data_dir)
             .arg("-login")
             .arg(account_name)
@@ -918,7 +917,7 @@ impl AppAdapter for SteamAdapter {
             return Ok(());
         }
 
-        let _ = Command::new(&installation.executable)
+        let _ = crate::detached_command(&installation.executable)
             .current_dir(&installation.data_dir)
             .arg("-shutdown")
             .spawn();
@@ -962,7 +961,7 @@ impl AppAdapter for SteamAdapter {
         }
     }
     fn start(&self, installation: &AppInstallation) -> Result<(), String> {
-        Command::new(&installation.executable)
+        crate::detached_command(&installation.executable)
             .current_dir(&installation.data_dir)
             .spawn()
             .map(|_| ())
