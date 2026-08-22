@@ -2258,11 +2258,18 @@ fn decode_zodaccess_login_title(title: &str) -> Result<String, String> {
     let display_name =
         String::from_utf8(raw).map_err(|_| "ZodAccess 账号昵称无法解析".to_string())?;
     let display_name = display_name.trim();
+    if display_name == "__NO_RELIABLE_NAME__" {
+        return Err("ZodAccess 页面未找到账号昵称，请保持登录窗口打开后重试".to_string());
+    }
     if display_name.is_empty()
         || display_name.chars().count() > 64
         || display_name.chars().any(char::is_control)
     {
         return Err("ZodAccess 账号昵称无效".to_string());
+    }
+    let normalized = display_name.to_ascii_lowercase().replace('’', "'");
+    if matches!(normalized.as_str(), "don't look at me" | "dont look at me") {
+        return Err("ZodAccess 页面返回的是提示文案，不是账号昵称，请重试".to_string());
     }
     Ok(display_name.to_string())
 }
@@ -2384,23 +2391,30 @@ fn persist_zodaccess_login(
 fn zodaccess_login_script() -> String {
     format!(
         r#"(() => {{
+  let attempts = 0;
+  let published = false;
   const publishAccount = () => {{
-    if (location.origin !== {origin:?} || !['/', '/user'].includes(location.pathname)) return;
+    if (published) return;
+    if (location.origin !== {origin:?} || location.pathname !== '/user') return;
     const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
     const candidates = [];
-    const heading = Array.from(document.querySelectorAll('h1, h2, h3'))
-      .map(node => clean(node.textContent))
-      .find(text => text.startsWith('用户中心'));
-    if (heading) candidates.push(heading.slice('用户中心'.length).trim());
-    for (const selector of [
-      '[data-user-name]', '[data-username]', '[data-nickname]',
-      '.user-name', '.username', '.nickname', '.profile-name', '.account-name'
-    ]) {{
-      for (const node of document.querySelectorAll(selector)) candidates.push(clean(node.textContent || node.getAttribute('aria-label')));
+    const profileName = document.querySelector('#kt_header_user_menu_toggle .menu-content .fw-bold');
+    if (profileName) {{
+      const directText = Array.from(profileName.childNodes)
+        .filter(node => node.nodeType === Node.TEXT_NODE)
+        .map(node => clean(node.textContent))
+        .join(' ');
+      candidates.push(clean(directText));
     }}
-    const excluded = new Set(['用户中心', '首页', 'ZodAccess', '登录', '退出登录']);
-    const name = candidates.find(value => value && value.length <= 64 && !excluded.has(value)) || 'ZodAccess 账号';
-    const bytes = new TextEncoder().encode(name);
+    const excluded = new Set(['用户中心', '首页', 'ZodAccess', '登录', '退出登录', "Don't look at me", 'Dont look at me']);
+    const name = candidates.find(value => value && value.length <= 64 && !excluded.has(value));
+    if (!name && attempts++ < 20) {{
+      setTimeout(publishAccount, 250);
+      return;
+    }}
+    published = true;
+    const resolvedName = name || '__NO_RELIABLE_NAME__';
+    const bytes = new TextEncoder().encode(resolvedName);
     let binary = '';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     document.title = {prefix:?} + btoa(binary);
@@ -14087,6 +14101,23 @@ fn spawn_watcher() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zodaccess_login_title_requires_a_real_profile_name() {
+        let title = |name: &str| {
+            format!(
+                "{}{}",
+                ZODACCESS_LOGIN_TITLE_PREFIX,
+                general_purpose::STANDARD.encode(name)
+            )
+        };
+        assert_eq!(
+            decode_zodaccess_login_title(&title("qwer")),
+            Ok("qwer".to_string())
+        );
+        assert!(decode_zodaccess_login_title(&title("Don't look at me")).is_err());
+        assert!(decode_zodaccess_login_title(&title("__NO_RELIABLE_NAME__")).is_err());
+    }
 
     #[test]
     fn current_runtime_names_use_nea_and_keep_legacy_detection() {
