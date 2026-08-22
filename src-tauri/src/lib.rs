@@ -54,6 +54,7 @@ mod adapters;
 mod oopz_daily;
 mod perfect_arena;
 mod steam;
+mod zodaccess;
 use adapters::AppAdapter;
 
 const APP_DIR_NAME: &str = "NEA";
@@ -113,9 +114,14 @@ const OOPZ_AUTO_SIGN_NETWORK_INTERVAL_SECONDS: u64 = 30 * 60;
 const OOPZ_AUTO_SIGN_OBSERVE_INTERVAL_SECONDS: u64 = 60;
 const OOPZ_AUTO_SIGN_STARTUP_DELAY_SECONDS: u64 = 8;
 const OOPZ_AUTO_SIGN_RESTART_COOLDOWN_SECONDS: u64 = 2 * 60;
+const ZODACCESS_AUTO_SIGN_INTERVAL_SECONDS: u64 = 60 * 60;
+const ZODACCESS_AUTO_SIGN_OBSERVE_INTERVAL_SECONDS: u64 = 60;
+const ZODACCESS_AUTO_SIGN_STARTUP_DELAY_SECONDS: u64 = 8;
+const ZODACCESS_LOGIN_TITLE_PREFIX: &str = "NEA-ZOD-READY:";
 static CONFIG_WRITES_BLOCKED: AtomicBool = AtomicBool::new(false);
 static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LAST_INTERNAL_CONFIG_BYTES: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static ZODACCESS_CREDENTIAL_CLEANUP_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -273,6 +279,8 @@ struct AppData {
     perfect_profiles: HashMap<String, perfect_arena::PerfectArenaProfile>,
     #[serde(default)]
     perfect_unavailable_account_ids: HashSet<String>,
+    #[serde(default)]
+    zodaccess: zodaccess::ZodAccessWorkspace,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_login_uid: Option<String>,
 }
@@ -660,6 +668,8 @@ struct AppState {
     oopz_auto_sign_last_attempt: Mutex<Option<Instant>>,
     oopz_auto_sign_last_start: Mutex<Option<Instant>>,
     oopz_auto_sign_completed_key: Mutex<Option<String>>,
+    zodaccess_auto_sign_running: AtomicBool,
+    zodaccess_auto_sign_last_attempt: Mutex<Option<Instant>>,
 }
 
 fn initial_app_state(data: AppData, startup_phase: StartupPhase) -> AppState {
@@ -694,6 +704,8 @@ fn initial_app_state(data: AppData, startup_phase: StartupPhase) -> AppState {
         oopz_auto_sign_last_attempt: Mutex::new(None),
         oopz_auto_sign_last_start: Mutex::new(None),
         oopz_auto_sign_completed_key: Mutex::new(None),
+        zodaccess_auto_sign_running: AtomicBool::new(false),
+        zodaccess_auto_sign_last_attempt: Mutex::new(None),
     }
 }
 
@@ -2047,6 +2059,769 @@ async fn check_oopz_auto_sign(app: AppHandle) -> Result<OopzAutoSignStatus, Stri
         .map_err(|error| error.to_string())?
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ZodAccessCredentialCleanup {
+    account_id: String,
+}
+
+fn zodaccess_credential_name(account_id: &str) -> Result<String, String> {
+    Uuid::parse_str(account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    Ok(format!("zodaccess:{account_id}"))
+}
+
+fn zodaccess_credential_entry(account_id: &str) -> Result<Entry, String> {
+    let name = zodaccess_credential_name(account_id)?;
+    Entry::new(CREDENTIAL_SERVICE, &name).map_err(|_| "无法访问 ZodAccess 登录状态".to_string())
+}
+
+fn read_zodaccess_secret_raw(account_id: &str) -> Result<Option<String>, String> {
+    match zodaccess_credential_entry(account_id)?.get_password() {
+        Ok(raw) => Ok(Some(raw)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("无法读取 ZodAccess 登录状态".to_string()),
+    }
+}
+
+fn write_zodaccess_secret_raw(account_id: &str, raw: &str) -> Result<(), String> {
+    zodaccess_credential_entry(account_id)?
+        .set_password(raw)
+        .map_err(|_| "无法保存 ZodAccess 登录状态".to_string())
+}
+
+fn write_zodaccess_session(
+    account_id: &str,
+    session: &zodaccess::ZodAccessSession,
+) -> Result<(), String> {
+    let raw =
+        serde_json::to_string(session).map_err(|_| "无法保存 ZodAccess 登录状态".to_string())?;
+    write_zodaccess_secret_raw(account_id, &raw)
+}
+
+fn read_zodaccess_session(account_id: &str) -> Result<Option<zodaccess::ZodAccessSession>, String> {
+    let Some(raw) = read_zodaccess_secret_raw(account_id)? else {
+        return Ok(None);
+    };
+    let session = serde_json::from_str(&raw)
+        .map_err(|_| "ZodAccess 登录状态无法解析，请重新登录".to_string())?;
+    zodaccess::validate_session(session).map(Some)
+}
+
+fn delete_zodaccess_credential(account_id: &str) -> Result<(), String> {
+    match zodaccess_credential_entry(account_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("无法清理 ZodAccess 登录状态".to_string()),
+    }
+}
+
+fn zodaccess_cleanup_marker_path(account_id: &str) -> Result<PathBuf, String> {
+    Uuid::parse_str(account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    Ok(recovery_dir()?.join(format!("zodaccess-credential-{account_id}.json")))
+}
+
+fn stage_zodaccess_credential_cleanup(account_id: &str) -> Result<PathBuf, String> {
+    let _guard = ZODACCESS_CREDENTIAL_CLEANUP_LOCK
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let path = zodaccess_cleanup_marker_path(account_id)?;
+    let temp = path.with_extension("json.tmp");
+    let raw = serde_json::to_vec(&ZodAccessCredentialCleanup {
+        account_id: account_id.to_string(),
+    })
+    .map_err(|error| error.to_string())?;
+    fs::write(&temp, raw).map_err(|error| format!("无法记录 ZodAccess 清理任务: {error}"))?;
+    if path.exists() {
+        let _ = fs::remove_file(&temp);
+        return Ok(path);
+    }
+    fs::rename(&temp, &path).map_err(|error| format!("无法提交 ZodAccess 清理任务: {error}"))?;
+    Ok(path)
+}
+
+fn finish_zodaccess_credential_cleanup(account_id: &str, marker: &Path) {
+    if delete_zodaccess_credential(account_id).is_ok() {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+fn recover_zodaccess_credential_cleanup(data: &AppData) {
+    let Ok(root) = recovery_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with("zodaccess-credential-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(raw) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(cleanup) = serde_json::from_slice::<ZodAccessCredentialCleanup>(&raw) else {
+            continue;
+        };
+        if zodaccess_cleanup_marker_path(&cleanup.account_id)
+            .ok()
+            .as_deref()
+            != Some(path.as_path())
+        {
+            continue;
+        }
+        if zodaccess::credential_cleanup_is_committed(&data.zodaccess, &cleanup.account_id) {
+            finish_zodaccess_credential_cleanup(&cleanup.account_id, &path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn zodaccess_login_root() -> Result<PathBuf, String> {
+    let root = runtime_dir()?.join("zodaccess-login");
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    Ok(root)
+}
+
+fn zodaccess_login_dir(account_id: &str) -> Result<PathBuf, String> {
+    Uuid::parse_str(account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    Ok(zodaccess_login_root()?.join(account_id))
+}
+
+fn remove_zodaccess_login_dir(account_id: &str) {
+    let Ok(root) = zodaccess_login_root() else {
+        return;
+    };
+    let Ok(path) = zodaccess_login_dir(account_id) else {
+        return;
+    };
+    if path.parent() == Some(root.as_path()) && path.starts_with(&root) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+fn cleanup_zodaccess_login_profiles() {
+    let Ok(root) = zodaccess_login_root() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(account_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if Uuid::parse_str(&account_id).is_ok() {
+            remove_zodaccess_login_dir(&account_id);
+        }
+    }
+}
+
+fn schedule_zodaccess_login_cleanup(account_id: String) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        remove_zodaccess_login_dir(&account_id);
+    });
+}
+
+fn zodaccess_workspace(app: &AppHandle) -> zodaccess::ZodAccessWorkspace {
+    let state = app.state::<AppState>();
+    let mut workspace = state
+        .data
+        .lock()
+        .map(|data| data.zodaccess.clone())
+        .unwrap_or_default();
+    workspace.running = state.zodaccess_auto_sign_running.load(Ordering::SeqCst);
+    workspace
+}
+
+fn emit_zodaccess_workspace(app: &AppHandle) -> zodaccess::ZodAccessWorkspace {
+    let workspace = zodaccess_workspace(app);
+    let _ = app.emit("zodaccess-workspace-changed", workspace.clone());
+    let _ = app.emit("app-data-changed", ());
+    workspace
+}
+
+fn decode_zodaccess_login_title(title: &str) -> Result<String, String> {
+    let encoded = title
+        .strip_prefix(ZODACCESS_LOGIN_TITLE_PREFIX)
+        .ok_or_else(|| "ZodAccess 登录页面无法识别".to_string())?;
+    if encoded.len() > 1024 {
+        return Err("ZodAccess 账号昵称过长".to_string());
+    }
+    let raw = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "ZodAccess 账号昵称无法解析".to_string())?;
+    let display_name =
+        String::from_utf8(raw).map_err(|_| "ZodAccess 账号昵称无法解析".to_string())?;
+    let display_name = display_name.trim();
+    if display_name.is_empty()
+        || display_name.chars().count() > 64
+        || display_name.chars().any(char::is_control)
+    {
+        return Err("ZodAccess 账号昵称无效".to_string());
+    }
+    Ok(display_name.to_string())
+}
+
+async fn capture_zodaccess_session(
+    window: WebviewWindow,
+) -> Result<zodaccess::ZodAccessSession, String> {
+    let url = tauri::Url::parse(zodaccess::USER_URL).map_err(|error| error.to_string())?;
+    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|_| "无法读取 ZodAccess 登录状态".to_string())?;
+    let mut by_name = HashMap::new();
+    for cookie in cookies {
+        by_name.insert(cookie.name().to_string(), cookie.value().to_string());
+    }
+    let mut cookies = by_name
+        .into_iter()
+        .map(|(name, value)| zodaccess::SessionCookie { name, value })
+        .collect::<Vec<_>>();
+    cookies.sort_by(|left, right| left.name.cmp(&right.name));
+    zodaccess::validate_session(zodaccess::ZodAccessSession { cookies })
+}
+
+fn persist_zodaccess_login(
+    app: &AppHandle,
+    account_id: &str,
+    proposed_name: &str,
+    session: &zodaccess::ZodAccessSession,
+    dashboard: zodaccess::DashboardState,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    let previous_secret = read_zodaccess_secret_raw(account_id)?;
+    write_zodaccess_session(account_id, session)?;
+    let timestamp = now();
+    let today = zodaccess::today_key();
+    let state = app.state::<AppState>();
+    let result = commit_app_data_update(&state, |data| {
+        let display_name = zodaccess::unique_display_name(
+            data.zodaccess.accounts.iter(),
+            proposed_name,
+            Some(account_id),
+        );
+        if let Some(account) = data
+            .zodaccess
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+        {
+            account.display_name = display_name;
+            account.session_state = "ready".to_string();
+            account.check_state = if dashboard == zodaccess::DashboardState::SignedToday {
+                "signed"
+            } else {
+                "waiting"
+            }
+            .to_string();
+            account.message = if dashboard == zodaccess::DashboardState::SignedToday {
+                "今日已签到"
+            } else {
+                "等待检查"
+            }
+            .to_string();
+            account.signed_today = dashboard == zodaccess::DashboardState::SignedToday;
+            account.last_checked_at = Some(timestamp.clone());
+            if account.signed_today {
+                account.last_success_date = Some(today.clone());
+                account.last_signed_at = Some(timestamp.clone());
+            } else if account.last_success_date.as_deref() == Some(today.as_str()) {
+                account.last_success_date = None;
+            }
+            account.updated_at = timestamp.clone();
+        } else {
+            data.zodaccess.accounts.push(zodaccess::ZodAccessAccount {
+                id: account_id.to_string(),
+                display_name,
+                enabled: true,
+                session_state: "ready".to_string(),
+                check_state: if dashboard == zodaccess::DashboardState::SignedToday {
+                    "signed"
+                } else {
+                    "waiting"
+                }
+                .to_string(),
+                message: if dashboard == zodaccess::DashboardState::SignedToday {
+                    "今日已签到"
+                } else {
+                    "等待检查"
+                }
+                .to_string(),
+                signed_today: dashboard == zodaccess::DashboardState::SignedToday,
+                last_success_date: (dashboard == zodaccess::DashboardState::SignedToday)
+                    .then(|| today.clone()),
+                last_checked_at: Some(timestamp.clone()),
+                last_signed_at: (dashboard == zodaccess::DashboardState::SignedToday)
+                    .then(|| timestamp.clone()),
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            });
+        }
+        Ok(data.zodaccess.clone())
+    });
+    if let Err(error) = result {
+        match previous_secret {
+            Some(raw) => {
+                let _ = write_zodaccess_secret_raw(account_id, &raw);
+            }
+            None => {
+                let _ = delete_zodaccess_credential(account_id);
+            }
+        }
+        return Err(error);
+    }
+    if let Ok(mut last_attempt) = state.zodaccess_auto_sign_last_attempt.lock() {
+        *last_attempt = None;
+    }
+    Ok(emit_zodaccess_workspace(app))
+}
+
+fn zodaccess_login_script() -> String {
+    format!(
+        r#"(() => {{
+  const publishAccount = () => {{
+    if (location.origin !== {origin:?} || location.pathname !== '/user') return;
+    const heading = Array.from(document.querySelectorAll('h3'))
+      .map((node) => (node.textContent || '').trim())
+      .find((text) => text.startsWith('用户中心'));
+    const name = heading ? heading.slice('用户中心'.length).trim() : '';
+    if (!name) return;
+    const bytes = new TextEncoder().encode(name);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    document.title = {prefix:?} + btoa(binary);
+  }};
+  document.addEventListener('DOMContentLoaded', () => setTimeout(publishAccount, 250), {{ once: true }});
+  window.addEventListener('load', () => setTimeout(publishAccount, 250), {{ once: true }});
+}})();"#,
+        origin = zodaccess::ORIGIN,
+        prefix = ZODACCESS_LOGIN_TITLE_PREFIX,
+    )
+}
+
+#[tauri::command]
+fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
+    let account_id = if let Some(account_id) = account_id {
+        Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+        let exists = app
+            .state::<AppState>()
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .zodaccess
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id);
+        if !exists {
+            return Err("ZodAccess 账号不存在".to_string());
+        }
+        account_id
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let label = format!("zodaccess-login-{account_id}");
+    if let Some(window) = app.get_webview_window(&label) {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    remove_zodaccess_login_dir(&account_id);
+    let data_dir = zodaccess_login_dir(&account_id)?.join("webview2");
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("创建 ZodAccess 登录窗口失败: {error}"))?;
+    let login_url = tauri::Url::parse("https://kp.zodaccyes.com/auth/login")
+        .map_err(|error| error.to_string())?;
+    let processing = Arc::new(AtomicBool::new(false));
+    let callback_processing = processing.clone();
+    let callback_account_id = account_id.clone();
+    let window_result = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(login_url))
+        .title("NEA - ZodAccess 登录")
+        .data_directory(data_dir)
+        .additional_browser_args("--disk-cache-size=1048576 --media-cache-size=1048576")
+        .initialization_script(zodaccess_login_script())
+        .on_navigation(|url| zodaccess::is_allowed_navigation_url(url.as_str()))
+        .on_document_title_changed(move |window, title| {
+            if !title.starts_with(ZODACCESS_LOGIN_TITLE_PREFIX)
+                || callback_processing.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let Ok(current_url) = window.url() else {
+                callback_processing.store(false, Ordering::SeqCst);
+                return;
+            };
+            if !zodaccess::is_user_page_url(current_url.as_str()) {
+                callback_processing.store(false, Ordering::SeqCst);
+                return;
+            }
+            let display_name = match decode_zodaccess_login_title(&title) {
+                Ok(display_name) => display_name,
+                Err(error) => {
+                    let _ = window.app_handle().emit("zodaccess-login-error", error);
+                    callback_processing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            let account_id = callback_account_id.clone();
+            let processing = callback_processing.clone();
+            tauri::async_runtime::spawn(async move {
+                let app = window.app_handle().clone();
+                let result = async {
+                    let session = capture_zodaccess_session(window.clone()).await?;
+                    let inspect_session = session.clone();
+                    let dashboard = tauri::async_runtime::spawn_blocking(move || {
+                        zodaccess::inspect_session(&inspect_session)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.message)?;
+                    persist_zodaccess_login(&app, &account_id, &display_name, &session, dashboard)?;
+                    Ok::<(), String>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        let _ = app.emit("zodaccess-login-complete", display_name);
+                        let _ = window.destroy();
+                        schedule_zodaccess_auto_sign_check(app, true, false, None);
+                    }
+                    Err(error) => {
+                        let _ = app.emit("zodaccess-login-error", error);
+                        processing.store(false, Ordering::SeqCst);
+                    }
+                }
+            });
+        })
+        .inner_size(1024.0, 760.0)
+        .min_inner_size(760.0, 560.0)
+        .center()
+        .build();
+    let window = match window_result {
+        Ok(window) => window,
+        Err(error) => {
+            remove_zodaccess_login_dir(&account_id);
+            return Err(format!("打开 ZodAccess 登录窗口失败: {error}"));
+        }
+    };
+    let cleanup_account_id = account_id;
+    window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::Destroyed) {
+            schedule_zodaccess_login_cleanup(cleanup_account_id.clone());
+        }
+    });
+    Ok(())
+}
+
+fn update_zodaccess_account_result(
+    app: &AppHandle,
+    account_id: &str,
+    expected_updated_at: &str,
+    result: Result<zodaccess::CheckOutcome, zodaccess::CheckFailure>,
+) -> Result<(), String> {
+    let checked_at = now();
+    let today = zodaccess::today_key();
+    commit_app_data_update(&app.state::<AppState>(), |data| {
+        let Some(account) = data
+            .zodaccess
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+        else {
+            return Ok(());
+        };
+        if account.updated_at != expected_updated_at {
+            return Ok(());
+        }
+        account.last_checked_at = Some(checked_at.clone());
+        account.updated_at = checked_at.clone();
+        match &result {
+            Ok(outcome) => {
+                account.session_state = "ready".to_string();
+                account.check_state = "signed".to_string();
+                account.message = if outcome.newly_signed {
+                    "签到成功"
+                } else {
+                    "今日已签到"
+                }
+                .to_string();
+                account.signed_today = true;
+                account.last_success_date = Some(today.clone());
+                account.last_signed_at = Some(checked_at.clone());
+            }
+            Err(error) => {
+                account.signed_today = false;
+                account.check_state =
+                    if error.kind == zodaccess::CheckFailureKind::ReauthRequired {
+                        account.session_state = "reauthRequired".to_string();
+                        "reauthRequired"
+                    } else {
+                        "error"
+                    }
+                    .to_string();
+                account.message = error.message.clone();
+            }
+        }
+        Ok(())
+    })?;
+    emit_zodaccess_workspace(app);
+    Ok(())
+}
+
+fn perform_zodaccess_auto_sign_check(
+    app: &AppHandle,
+    force: bool,
+    target_account_id: Option<&str>,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    let state = app.state::<AppState>();
+    let today = zodaccess::today_key();
+    let (enabled, accounts) = {
+        let data = state.data.lock().map_err(|error| error.to_string())?;
+        let mut ids = zodaccess::eligible_account_ids(&data.zodaccess, &today);
+        if let Some(target) = target_account_id {
+            let account = data
+                .zodaccess
+                .accounts
+                .iter()
+                .find(|account| account.id == target)
+                .ok_or_else(|| "ZodAccess 账号不存在".to_string())?;
+            if !account.enabled {
+                return Err("该账号的自动签到未开启".to_string());
+            }
+            if account.session_state != "ready" {
+                return Err("该账号需要重新登录".to_string());
+            }
+            ids.retain(|id| id == target);
+        }
+        let accounts = ids
+            .iter()
+            .filter_map(|id| {
+                data.zodaccess
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == *id)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        (data.zodaccess.auto_sign_enabled, accounts)
+    };
+    if !enabled {
+        return Err("ZodAccess 自动签到未开启".to_string());
+    }
+    if accounts.is_empty() {
+        return Ok(zodaccess_workspace(app));
+    }
+    if !force {
+        let last_attempt = state
+            .zodaccess_auto_sign_last_attempt
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if last_attempt.is_some_and(|last| {
+            last.elapsed() < Duration::from_secs(ZODACCESS_AUTO_SIGN_INTERVAL_SECONDS)
+        }) {
+            return Ok(zodaccess_workspace(app));
+        }
+    }
+    *state
+        .zodaccess_auto_sign_last_attempt
+        .lock()
+        .map_err(|error| error.to_string())? = Some(Instant::now());
+
+    let mut checking = zodaccess_workspace(app);
+    checking.running = true;
+    let checking_ids = accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<HashSet<_>>();
+    for account in &mut checking.accounts {
+        if checking_ids.contains(account.id.as_str()) {
+            account.check_state = "checking".to_string();
+            account.message = "正在检查".to_string();
+        }
+    }
+    let _ = app.emit("zodaccess-workspace-changed", checking);
+
+    for (index, account) in accounts.iter().enumerate() {
+        let still_enabled = state
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .zodaccess
+            .accounts
+            .iter()
+            .find(|current| current.id == account.id)
+            .is_some_and(|current| current.enabled && current.session_state == "ready");
+        if !still_enabled {
+            continue;
+        }
+        let result = match read_zodaccess_session(&account.id) {
+            Ok(Some(session)) => zodaccess::check_and_sign(&session),
+            Ok(None) | Err(_) => Err(zodaccess::CheckFailure {
+                kind: zodaccess::CheckFailureKind::ReauthRequired,
+                message: "登录状态已失效，请重新登录".to_string(),
+            }),
+        };
+        update_zodaccess_account_result(app, &account.id, &account.updated_at, result)?;
+        if index + 1 < accounts.len() {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(zodaccess_workspace(app))
+}
+
+fn run_zodaccess_auto_sign_check(
+    app: &AppHandle,
+    force: bool,
+    target_account_id: Option<&str>,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    let state = app.state::<AppState>();
+    if state
+        .zodaccess_auto_sign_running
+        .swap(true, Ordering::SeqCst)
+    {
+        return Ok(zodaccess_workspace(app));
+    }
+    emit_zodaccess_workspace(app);
+    let result = perform_zodaccess_auto_sign_check(app, force, target_account_id);
+    state
+        .zodaccess_auto_sign_running
+        .store(false, Ordering::SeqCst);
+    emit_zodaccess_workspace(app);
+    result
+}
+
+fn schedule_zodaccess_auto_sign_check(
+    app: AppHandle,
+    force: bool,
+    delay: bool,
+    target_account_id: Option<String>,
+) {
+    thread::spawn(move || {
+        if delay {
+            thread::sleep(Duration::from_secs(
+                ZODACCESS_AUTO_SIGN_STARTUP_DELAY_SECONDS,
+            ));
+        }
+        let _ = run_zodaccess_auto_sign_check(&app, force, target_account_id.as_deref());
+    });
+}
+
+fn start_zodaccess_auto_sign_checks(app: AppHandle) {
+    schedule_zodaccess_auto_sign_check(app.clone(), false, true, None);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(
+            ZODACCESS_AUTO_SIGN_OBSERVE_INTERVAL_SECONDS,
+        ));
+        schedule_zodaccess_auto_sign_check(app.clone(), false, false, None);
+    });
+}
+
+#[tauri::command]
+fn get_zodaccess_workspace(app: AppHandle) -> zodaccess::ZodAccessWorkspace {
+    zodaccess_workspace(&app)
+}
+
+#[tauri::command]
+fn set_zodaccess_auto_sign_enabled(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    commit_app_data_update(&app.state::<AppState>(), |data| {
+        data.zodaccess.auto_sign_enabled = enabled;
+        Ok(())
+    })?;
+    *app.state::<AppState>()
+        .zodaccess_auto_sign_last_attempt
+        .lock()
+        .map_err(|error| error.to_string())? = None;
+    let workspace = emit_zodaccess_workspace(&app);
+    if enabled {
+        schedule_zodaccess_auto_sign_check(app, true, false, None);
+    }
+    Ok(workspace)
+}
+
+#[tauri::command]
+fn set_zodaccess_account_enabled(
+    app: AppHandle,
+    account_id: String,
+    enabled: bool,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    commit_app_data_update(&app.state::<AppState>(), |data| {
+        let account = data
+            .zodaccess
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "ZodAccess 账号不存在".to_string())?;
+        account.enabled = enabled;
+        account.updated_at = now();
+        Ok(())
+    })?;
+    let workspace = emit_zodaccess_workspace(&app);
+    if enabled && workspace.auto_sign_enabled {
+        if let Ok(mut last_attempt) = app
+            .state::<AppState>()
+            .zodaccess_auto_sign_last_attempt
+            .lock()
+        {
+            *last_attempt = None;
+        }
+        schedule_zodaccess_auto_sign_check(app, true, false, Some(account_id));
+    }
+    Ok(workspace)
+}
+
+#[tauri::command]
+async fn check_zodaccess_auto_sign(
+    app: AppHandle,
+    account_id: Option<String>,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_zodaccess_auto_sign_check(&app, true, account_id.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn delete_zodaccess_account(
+    app: AppHandle,
+    account_id: String,
+) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    let exists = app
+        .state::<AppState>()
+        .data
+        .lock()
+        .map_err(|error| error.to_string())?
+        .zodaccess
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id);
+    if !exists {
+        return Err("ZodAccess 账号不存在".to_string());
+    }
+    let marker = stage_zodaccess_credential_cleanup(&account_id)?;
+    let commit = commit_app_data_update(&app.state::<AppState>(), |data| {
+        data.zodaccess
+            .accounts
+            .retain(|account| account.id != account_id);
+        Ok(())
+    });
+    if let Err(error) = commit {
+        let _ = fs::remove_file(marker);
+        return Err(error);
+    }
+    finish_zodaccess_credential_cleanup(&account_id, &marker);
+    Ok(emit_zodaccess_workspace(&app))
+}
+
 fn process_update_result(app: &AppHandle) {
     if let Ok(error_path) = update_error_path() {
         if let Ok(error) = fs::read_to_string(&error_path) {
@@ -2176,6 +2951,7 @@ fn load_data() -> AppData {
     reconcile_account_readiness(&mut data);
     reconcile_saved_steam_credentials(&mut data);
     reconcile_steam_identities(&mut data);
+    zodaccess::normalize_workspace_for_today(&mut data.zodaccess, &zodaccess::today_key());
     if let Ok(next_raw) = serde_json::to_string_pretty(&data) {
         if next_raw != raw {
             let _ = save_data(&data);
@@ -4751,6 +5527,7 @@ fn get_app_data_inner(app: &AppHandle) -> Result<AppData, String> {
     refresh_actual_steam_runtime_state(&mut data.steam);
     reconcile_steam_identities(&mut data);
     data.perfect_profiles.clear();
+    data.zodaccess.running = state.zodaccess_auto_sign_running.load(Ordering::SeqCst);
     Ok(data)
 }
 
@@ -12931,6 +13708,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
         || -> Result<AppData, String> {
             recover_import_transactions()?;
             recover_quick_share_transactions()?;
+            cleanup_zodaccess_login_profiles();
             cleanup_stale_share_artifacts();
             ensure_storage()?;
             let data = load_data();
@@ -12939,6 +13717,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
                     "NEA 配置文件损坏且无法自动恢复，已阻止启动以保护现有账号数据".to_string(),
                 );
             }
+            recover_zodaccess_credential_cleanup(&data);
             Ok(data)
         },
     ));
@@ -13012,6 +13791,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
     process_update_result(&app);
     start_auto_update_checks(app.clone());
     start_oopz_auto_sign_checks(app.clone());
+    start_zodaccess_auto_sign_checks(app.clone());
     schedule_storage_maintenance(app.clone());
     tauri::async_runtime::spawn(async move {
         let _ = repair_stored_steam_display_names(app).await;
@@ -13122,7 +13902,13 @@ pub fn run() {
             get_oopz_auto_sign_status,
             set_oopz_auto_sign_enabled,
             set_oopz_auto_sign_account,
-            check_oopz_auto_sign
+            check_oopz_auto_sign,
+            get_zodaccess_workspace,
+            begin_zodaccess_login,
+            set_zodaccess_auto_sign_enabled,
+            set_zodaccess_account_enabled,
+            check_zodaccess_auto_sign,
+            delete_zodaccess_account
         ])
         .setup(move |app| {
             if plugin_runtime {
