@@ -2405,7 +2405,7 @@ fn zodaccess_login_script() -> String {
 }
 
 #[tauri::command]
-fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
+async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
     let account_id = if let Some(account_id) = account_id {
         Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
         let exists = app
