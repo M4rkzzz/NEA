@@ -2385,12 +2385,21 @@ fn zodaccess_login_script() -> String {
     format!(
         r#"(() => {{
   const publishAccount = () => {{
-    if (location.origin !== {origin:?} || location.pathname !== '/user') return;
-    const heading = Array.from(document.querySelectorAll('h3'))
-      .map((node) => (node.textContent || '').trim())
-      .find((text) => text.startsWith('用户中心'));
-    const name = heading ? heading.slice('用户中心'.length).trim() : '';
-    if (!name) return;
+    if (location.origin !== {origin:?} || !['/', '/user'].includes(location.pathname)) return;
+    const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const candidates = [];
+    const heading = Array.from(document.querySelectorAll('h1, h2, h3'))
+      .map(node => clean(node.textContent))
+      .find(text => text.startsWith('用户中心'));
+    if (heading) candidates.push(heading.slice('用户中心'.length).trim());
+    for (const selector of [
+      '[data-user-name]', '[data-username]', '[data-nickname]',
+      '.user-name', '.username', '.nickname', '.profile-name', '.account-name'
+    ]) {{
+      for (const node of document.querySelectorAll(selector)) candidates.push(clean(node.textContent || node.getAttribute('aria-label')));
+    }}
+    const excluded = new Set(['用户中心', '首页', 'ZodAccess', '登录', '退出登录']);
+    const name = candidates.find(value => value && value.length <= 64 && !excluded.has(value)) || 'ZodAccess 账号';
     const bytes = new TextEncoder().encode(name);
     let binary = '';
     for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -2455,7 +2464,7 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
                 callback_processing.store(false, Ordering::SeqCst);
                 return;
             };
-            if !zodaccess::is_user_page_url(current_url.as_str()) {
+            if !zodaccess::is_login_completion_url(current_url.as_str()) {
                 callback_processing.store(false, Ordering::SeqCst);
                 return;
             }

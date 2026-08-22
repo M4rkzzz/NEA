@@ -134,8 +134,9 @@ pub fn is_allowed_navigation_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| has_official_origin(&url))
 }
 
-pub fn is_user_page_url(value: &str) -> bool {
-    reqwest::Url::parse(value).is_ok_and(|url| has_official_origin(&url) && url.path() == "/user")
+pub fn is_login_completion_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .is_ok_and(|url| has_official_origin(&url) && matches!(url.path(), "/" | "/user"))
 }
 
 fn has_official_origin(url: &reqwest::Url) -> bool {
@@ -486,8 +487,15 @@ mod tests {
         assert!(!is_allowed_navigation_url(
             "https://ks.zodaccyes.com/auth/login"
         ));
-        assert!(is_user_page_url("https://kp.zodaccyes.com/user?from=login"));
-        assert!(!is_user_page_url("https://kp.zodaccyes.com/user/settings"));
+        assert!(is_login_completion_url(
+            "https://kp.zodaccyes.com/?from=login"
+        ));
+        assert!(is_login_completion_url(
+            "https://kp.zodaccyes.com/user?from=login"
+        ));
+        assert!(!is_login_completion_url(
+            "https://kp.zodaccyes.com/user/settings"
+        ));
     }
 
     #[test]
