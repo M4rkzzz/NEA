@@ -128,6 +128,9 @@ pub fn today_key() -> String {
 }
 
 pub fn is_allowed_navigation_url(value: &str) -> bool {
+    if value == "about:blank" {
+        return true;
+    }
     reqwest::Url::parse(value).is_ok_and(|url| has_official_origin(&url))
 }
 
@@ -470,6 +473,7 @@ mod tests {
 
     #[test]
     fn navigation_only_allows_the_official_https_origin() {
+        assert!(is_allowed_navigation_url("about:blank"));
         assert!(is_allowed_navigation_url(
             "https://kp.zodaccyes.com/auth/login"
         ));
