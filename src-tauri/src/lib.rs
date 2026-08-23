@@ -3396,19 +3396,17 @@ fn effective_silent_start_enabled(config: &AppConfig) -> bool {
     config.silent_start_enabled.unwrap_or(false)
 }
 
-fn launched_via_autostart(args: &[String]) -> bool {
-    args.iter().any(|arg| arg == AUTOSTART_ARGUMENT)
+/// Silent start applies to every launch, including a manual one: the setting
+/// promises that running NEA lands in the tray without showing the window.
+/// Reachability is guaranteed by the tray icon plus the single-instance
+/// callback, which shows the window unconditionally, so suppressing the first
+/// frame here is never a dead end.
+fn silent_start_for_launch(preference: Option<bool>) -> bool {
+    preference.unwrap_or(false)
 }
 
-fn silent_start_for_launch(preference: Option<bool>, via_autostart: bool) -> bool {
-    via_autostart && preference.unwrap_or(false)
-}
-
-fn should_start_silently(args: &[String]) -> bool {
-    silent_start_for_launch(
-        silent_start_preference_from_disk(),
-        launched_via_autostart(args),
-    )
+fn should_start_silently() -> bool {
+    silent_start_for_launch(silent_start_preference_from_disk())
 }
 
 fn autostart_enabled() -> Result<bool, String> {
@@ -13852,7 +13850,7 @@ fn initialize_main_app(app: AppHandle, updater_cleanup: Option<PathBuf>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let silent_start = should_start_silently(&args);
+    let silent_start = should_start_silently();
     if args.iter().any(|arg| arg == "--apply-update") {
         apply_update_helper(&args);
         return;
@@ -14168,26 +14166,13 @@ mod tests {
     }
 
     #[test]
-    fn silent_start_defaults_off_and_only_applies_to_autostart_launches() {
-        assert!(!silent_start_for_launch(None, true));
-        assert!(!silent_start_for_launch(Some(false), true));
-        assert!(silent_start_for_launch(Some(true), true));
-    }
-
-    #[test]
-    fn manual_launch_always_shows_the_window_even_with_silent_start_enabled() {
-        // Regression: a silent-start preference must never swallow a manual launch,
-        // otherwise the tray icon is the only way back to the window.
-        assert!(!silent_start_for_launch(Some(true), false));
-        assert!(!should_start_silently(&["nea.exe".to_string()]));
-
-        let autostart = ["nea.exe".to_string(), AUTOSTART_ARGUMENT.to_string()];
-        assert!(launched_via_autostart(&autostart));
-        assert!(!launched_via_autostart(&["nea.exe".to_string()]));
-        assert!(!launched_via_autostart(&[
-            "nea.exe".to_string(),
-            "--plugin-runtime".to_string()
-        ]));
+    fn silent_start_defaults_off_and_applies_to_every_launch() {
+        // The setting promises that running NEA stays in the tray, so it must not
+        // be limited to autostart: gating it on --autostart made a manual launch
+        // pop the window and users reported silent start as broken.
+        assert!(!silent_start_for_launch(None));
+        assert!(!silent_start_for_launch(Some(false)));
+        assert!(silent_start_for_launch(Some(true)));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
-  "assetName": "NEA_1.4.0_x64_en-US.msi",
-  "downloadUrl": "https://github.com/M4rkzzz/NEA/releases/download/v1.4.0/NEA_1.4.0_x64_en-US.msi",
-  "size": 6991872,
-  "sha256": "741107d051e1accda2e15e99d061a73493ae21f77eb4aa47fccc4bb9c218cbf9"
+  "version": "1.4.1",
+  "assetName": "NEA_1.4.1_x64_en-US.msi",
+  "downloadUrl": "https://github.com/M4rkzzz/NEA/releases/download/v1.4.1/NEA_1.4.1_x64_en-US.msi",
+  "size": 6995968,
+  "sha256": "ef31c1690e2ee07d8318eb6736e333445c40cc63e507f188c30fe09731f535a3"
 }
