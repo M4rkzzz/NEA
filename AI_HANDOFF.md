@@ -11,14 +11,13 @@
 
 ## 2. 项目定位与技术栈
 
-NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状态管理工具，当前支持 OOPZ、Steam、完美世界竞技平台和 ZodAccess。
+NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状态管理工具，当前支持 OOPZ、Steam 和完美世界竞技平台。
 
 - 桌面框架：Tauri 2。
 - 前端：React 19、TypeScript、Vite，主要入口为 `src/App.tsx`，样式集中在 `src/App.css`。
 - 后端：Rust，主要业务和 Tauri command 集中在 `src-tauri/src/lib.rs`。
 - Steam 客户端适配：`src-tauri/src/steam.rs`。
 - 完美平台适配：`src-tauri/src/perfect_arena.rs`。
-- ZodAccess 签到与协议边界：`src-tauri/src/zodaccess.rs`；窗口、凭据和调度接入仍位于 `src-tauri/src/lib.rs`。
 - 应用配置：`src-tauri/tauri.conf.json`；权限：`src-tauri/capabilities/default.json`。
 - 正式项目名只有 NEA；OOPZ+ 旧名称仅保留在数据、安装和包格式兼容代码中。
 
@@ -34,15 +33,6 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 - 签名材料从当前已安装 OOPZ 的 `data/app.so` 在内存中识别并校验，不修改或复制 OOPZ 文件。客户端版本变化导致布局不再匹配时应显示“不支持当前版本”并等待适配，不能退化为进程注入、内存篡改或硬编码秘密。
 - 自动轮询每分钟观察一次运行/登录状态，以便及时自动启动；实际网络检查至少间隔 30 分钟。同一账号同一自然日确认成功后不再发请求。手动“立即检查”可跳过间隔，但仍不得重复签到。
 - OOPZ 快速切号成功并启动客户端后，应延迟触发一次强制签到状态检查；未开启自动签到、缺少可用登录态或只是打开登录页时不得提交签到请求。
-
-### ZodAccess
-
-- ZodAccess 只提供自动签到。平台总开关和账号开关同时控制自动与手动检查；多账号必须顺序请求，同一账号按本地自然日确认成功后当天不再请求。
-- 主程序启动后检查一次，每分钟只观察是否需要调度，临时网络或站点错误至少间隔一小时重试；登录失效后停止该账号重试并要求用户重新登录。此功能只在 NEA 运行期间工作。
-- 添加账号和重新登录复用系统 Edge WebView2，并为每次窗口使用 `%APPDATA%\NEA\runtime\zodaccess-login\<account-id>` 隔离临时目录；导航只允许 `https://kp.zodaccyes.com`。滑块和可能的二次验证必须由用户在官方页面完成，窗口进入 `/user` 并验证会话后立即销毁和清理。
-- 后台只使用现有 Rust `reqwest`，先读取 `/user`，确认待签到后才向 `/user/checkin` 提交请求；禁止重定向，只接受官方 HTTPS 域、预期内容类型和有限大小响应。页面或协议无法安全识别时明确失败，不做注入、验证码绕过或硬编码秘密。
-- ZodAccess Cookie 只保存在 Windows Credential Manager，不得进入 `config.json`、日志、错误、测试快照或恢复记录。重新登录先验证新会话，配置提交失败时恢复原凭据；删除先提交最新配置，再清理凭据，恢复记录只保存待清理账号 ID。
-- 昵称只能从官方用户页识别，不提供手动改名。重名账号保留为独立记录并追加序号，不得覆盖已有会话。ZodAccess 数据当前不进入分享包。
 
 ### Steam
 
@@ -101,7 +91,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 ```powershell
 pnpm run check:fast      # 紧密编辑循环：TypeScript + cargo check，不跑测试
 pnpm run verify:dev      # 功能完成/交付前：TypeScript + 5 项关键 Rust 回归
-pnpm run verify:release  # 仅正式发布：构建、格式、98 项稳定测试、Clippy
+pnpm run verify:release  # 仅正式发布：构建、格式、87 项稳定测试、Clippy
 ```
 
 五项开发冒烟测试统一使用 `dev_smoke_` 前缀，一次启动测试进程，覆盖：
@@ -147,7 +137,7 @@ NEA 只发布完整 MSI，不提供增量或差分更新，也不生成、上传
 - `config.json` 含明文 Steam 密码；日志、错误、测试快照和恢复日志不得输出或复制密码。只有用户主动勾选“账密”后，密码才允许进入 `.nea-share` 或一次性码的加密传输包。
 - `.nea-share`、OOPZ `.nea` 和旧 `.oopz+` 都应按敏感文件处理。
 - 当前有一个极窄崩溃窗口：混合分享包在 OOPZ 已提交、完成标记尚未落盘时被强杀，启动恢复可能保留 OOPZ 而回滚 Steam/完美。正常失败、取消和常规恢复路径不受影响。若修复，必须避免扩大事务复杂度或破坏字段级并发保护。
-- 网络、Steam/完美/ZodAccess 页面结构和第三方客户端更新属于外部不稳定面。改动自动化选择器时要保留多信号识别和清晰的超时、取消与失败状态。
+- 网络、Steam/完美页面结构和第三方客户端更新属于外部不稳定面。改动自动化选择器时要保留多信号识别和清晰的超时/取消状态。
 
 ## 7. 交付前检查
 

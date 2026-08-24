@@ -44,29 +44,7 @@ type AppData = {
   steamCredentials?: SteamSavedCredential[];
   steamIdentities?: SteamIdentity[];
   perfectUnavailableAccountIds?: string[];
-  zodaccess: ZodAccessWorkspace;
   currentLoginUid?: string;
-};
-
-type ZodAccessAccount = {
-  id: string;
-  displayName: string;
-  enabled: boolean;
-  sessionState: "ready" | "reauthRequired";
-  checkState: "waiting" | "checking" | "signed" | "error" | "reauthRequired";
-  message: string;
-  signedToday: boolean;
-  lastSuccessDate?: string;
-  lastCheckedAt?: string;
-  lastSignedAt?: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type ZodAccessWorkspace = {
-  autoSignEnabled: boolean;
-  running: boolean;
-  accounts: ZodAccessAccount[];
 };
 
 type SteamSavedCredential = {
@@ -295,7 +273,7 @@ type OopzAutoSignStatus = {
 
 const MAX_SHARED_PLATFORM_ACCOUNTS = 100;
 
-type AppKey = "oopz" | "steam" | "perfect" | "zodaccess";
+type AppKey = "oopz" | "steam" | "perfect";
 type FeatureKey = "overview" | "switcher" | "autoSign";
 type PerfectAvailability = "ready" | "pending" | "blocked";
 type StartupViewPhase = "loading" | "ready" | "error";
@@ -432,7 +410,7 @@ function App() {
     if (saved === "light") return false;
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
   });
-  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], clientOnline: false, webSessions: [] }, zodaccess: { autoSignEnabled: false, running: false, accounts: [] } });
+  const [data, setData] = useState<AppData>({ config: {}, accounts: [], steam: { accounts: [], clientOnline: false, webSessions: [] } });
   const [paths, setPaths] = useState<OopzPaths | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState("正在初始化...");
@@ -444,16 +422,14 @@ function App() {
   const [searchPath, setSearchPath] = useState("");
   const [activeApp, setActiveApp] = useState<AppKey>(() => {
     const saved = readPreference("nea-active-app");
-    return saved === "steam" || saved === "perfect" || saved === "zodaccess" ? saved : "oopz";
+    return saved === "steam" || saved === "perfect" ? saved : "oopz";
   });
   const [activeFeature, setActiveFeature] = useState<FeatureKey>(() => {
-    if (activeApp === "zodaccess") return "autoSign";
     const saved = readPreference("nea-active-feature");
     return saved === "switcher" || saved === "autoSign" ? saved : "overview";
   });
   const [pluginStatus, setPluginStatus] = useState<PluginStatus | null>(null);
   const [oopzAutoSignStatus, setOopzAutoSignStatus] = useState<OopzAutoSignStatus | null>(null);
-  const [zodaccessWorkspace, setZodaccessWorkspace] = useState<ZodAccessWorkspace>({ autoSignEnabled: false, running: false, accounts: [] });
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [wormholeStatus, setWormholeStatus] = useState<WormholeStatus | null>(null);
   const [quickCode, setQuickCode] = useState("");
@@ -463,7 +439,6 @@ function App() {
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<SavedAccount | null>(null);
   const [pendingDeleteSteamWebSession, setPendingDeleteSteamWebSession] = useState<SteamWebSession | null>(null);
   const [pendingDeleteSteamCredential, setPendingDeleteSteamCredential] = useState<SteamIdentity | null>(null);
-  const [pendingDeleteZodaccessAccount, setPendingDeleteZodaccessAccount] = useState<ZodAccessAccount | null>(null);
   const [showSteamTextImport, setShowSteamTextImport] = useState(false);
   const [steamTextImportDraft, setSteamTextImportDraft] = useState("");
   const [visibleSteamCredentials, setVisibleSteamCredentials] = useState<string[]>([]);
@@ -509,15 +484,13 @@ function App() {
       ? `steam-web-delete:${pendingDeleteSteamWebSession.id}`
       : pendingDeleteSteamCredential
         ? `steam-credential-delete:${pendingDeleteSteamCredential.id}`
-        : pendingDeleteZodaccessAccount
-          ? `zodaccess-delete:${pendingDeleteZodaccessAccount.id}`
-          : showSteamTextImport
-            ? "steam-text-import"
-            : showSettings
-              ? "settings"
-              : showShareCenter
-                ? "share-center"
-                : null;
+        : showSteamTextImport
+          ? "steam-text-import"
+          : showSettings
+            ? "settings"
+            : showShareCenter
+              ? "share-center"
+              : null;
 
   const selected = useMemo(
     () => data.accounts.find((account) => account.id === selectedId) || data.accounts[0],
@@ -678,7 +651,6 @@ function App() {
       dataSignatureRef.current = nextSignature;
       setData(next);
     }
-    setZodaccessWorkspace(next.zodaccess || { autoSignEnabled: false, running: false, accounts: [] });
     setSelectedId((current) =>
       current && next.accounts.some((account) => account.id === current)
         ? current
@@ -1326,62 +1298,6 @@ function App() {
     setMessage(status.message);
   }
 
-  async function refreshZodaccessWorkspace() {
-    const workspace = await invoke<ZodAccessWorkspace>("get_zodaccess_workspace");
-    setZodaccessWorkspace(workspace);
-    return workspace;
-  }
-
-  async function beginZodaccessLogin(accountId?: string) {
-    await runTask(
-      accountId ? "正在打开 ZodAccess 重新登录窗口..." : "正在打开 ZodAccess 登录窗口...",
-      () => invoke("begin_zodaccess_login", { accountId: accountId || null }),
-      false,
-    );
-    setMessage("请在 ZodAccess 登录窗口完成验证");
-  }
-
-  async function toggleZodaccessAutoSign(enabled: boolean) {
-    const workspace = await runTask(
-      enabled ? "正在开启 ZodAccess 自动签到..." : "正在关闭 ZodAccess 自动签到...",
-      () => invoke<ZodAccessWorkspace>("set_zodaccess_auto_sign_enabled", { enabled }),
-      false,
-    );
-    setZodaccessWorkspace(workspace);
-    setMessage(enabled ? "ZodAccess 自动签到已开启" : "ZodAccess 自动签到已关闭");
-  }
-
-  async function toggleZodaccessAccount(account: ZodAccessAccount, enabled: boolean) {
-    const workspace = await runTask(
-      enabled ? `正在启用 ${account.displayName}...` : `正在停用 ${account.displayName}...`,
-      () => invoke<ZodAccessWorkspace>("set_zodaccess_account_enabled", { accountId: account.id, enabled }),
-      false,
-    );
-    setZodaccessWorkspace(workspace);
-    setMessage(enabled ? `已启用 ${account.displayName}` : `已停用 ${account.displayName}`);
-  }
-
-  async function checkZodaccess(accountId?: string) {
-    const workspace = await runTask(
-      accountId ? "正在检查 ZodAccess 账号..." : "正在检查全部 ZodAccess 账号...",
-      () => invoke<ZodAccessWorkspace>("check_zodaccess_auto_sign", { accountId: accountId || null }),
-      false,
-    );
-    setZodaccessWorkspace(workspace);
-    setMessage("ZodAccess 账号检查完成");
-  }
-
-  async function deleteZodaccessAccount(account: ZodAccessAccount) {
-    const workspace = await runTask(
-      `正在删除 ${account.displayName}...`,
-      () => invoke<ZodAccessWorkspace>("delete_zodaccess_account", { accountId: account.id }),
-      false,
-    );
-    setZodaccessWorkspace(workspace);
-    setPendingDeleteZodaccessAccount(null);
-    setMessage(`已删除 ${account.displayName}`);
-  }
-
   async function resetOverlayPosition() {
     await runTask("正在重置浮层位置...", () => invoke("reset_overlay_position"));
     setMessage("浮层位置已恢复默认");
@@ -1773,7 +1689,6 @@ function App() {
           }),
           invoke<SteamCapabilityStatus>("get_steam_capability_status").then(setSteamCapabilityStatus),
           refreshOopzAutoSignStatus(),
-          refreshZodaccessWorkspace(),
           refreshPluginStatus(),
           refreshPerfectArena(),
           refreshStartupSettings().catch((error) => {
@@ -1857,16 +1772,6 @@ function App() {
         setMessage(event.payload.message);
       }
     }));
-    keepListener(listen<ZodAccessWorkspace>("zodaccess-workspace-changed", (event) => {
-      setZodaccessWorkspace(event.payload);
-    }));
-    keepListener(listen<string>("zodaccess-login-complete", (event) => {
-      refresh().catch(() => undefined);
-      setMessage(`ZodAccess 账号已添加：${event.payload}`);
-    }));
-    keepListener(listen<string>("zodaccess-login-error", (event) => {
-      setMessage(event.payload);
-    }));
     keepListener(listen<UpdateStatus>("update-status", (event) => {
       setUpdateStatus(event.payload);
       setMessage(event.payload.message);
@@ -1904,21 +1809,17 @@ function App() {
     if (activeApp === "perfect") {
       refreshPerfectArena().catch(() => undefined);
     }
-    if (activeApp === "zodaccess") {
-      refreshZodaccessWorkspace().catch(() => undefined);
-    }
     setVisibleSteamCredentials([]);
   }, [activeApp, activeFeature, startupPhase]);
 
   useEffect(() => {
-    if (!pendingOopzOperation && !pendingDeleteAccount && !pendingDeleteSteamWebSession && !pendingDeleteSteamCredential && !pendingDeleteZodaccessAccount && !showSteamTextImport && !showSettings && !showShareCenter && !perfectMenuSessionId) return;
+    if (!pendingOopzOperation && !pendingDeleteAccount && !pendingDeleteSteamWebSession && !pendingDeleteSteamCredential && !showSteamTextImport && !showSettings && !showShareCenter && !perfectMenuSessionId) return;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) {
         setPendingOopzOperation(null);
         setPendingDeleteAccount(null);
         setPendingDeleteSteamWebSession(null);
         setPendingDeleteSteamCredential(null);
-        setPendingDeleteZodaccessAccount(null);
         setShowSteamTextImport(false);
         setSteamTextImportDraft("");
         setSteamImportPreview(null);
@@ -1930,7 +1831,7 @@ function App() {
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [pendingOopzOperation, pendingDeleteAccount, pendingDeleteSteamWebSession, pendingDeleteSteamCredential, pendingDeleteZodaccessAccount, showSteamTextImport, showSettings, showShareCenter, perfectMenuSessionId, wormholeActive, busy]);
+  }, [pendingOopzOperation, pendingDeleteAccount, pendingDeleteSteamWebSession, pendingDeleteSteamCredential, showSteamTextImport, showSettings, showShareCenter, perfectMenuSessionId, wormholeActive, busy]);
 
   useEffect(() => {
     const rememberPageFocus = (event: Event) => {
@@ -2202,79 +2103,6 @@ function App() {
     </section>
   );
 
-  const zodaccessEnabledAccounts = zodaccessWorkspace.accounts.filter((account) => account.enabled);
-  const zodaccessCompletedAccounts = zodaccessEnabledAccounts.filter((account) => account.signedToday);
-  const zodaccessReloginAccounts = zodaccessEnabledAccounts.filter((account) => account.sessionState === "reauthRequired");
-  const zodaccessPendingAccounts = zodaccessEnabledAccounts.filter((account) => !account.signedToday && account.sessionState === "ready");
-  const zodaccessPageState = !zodaccessWorkspace.autoSignEnabled
-    ? "disabled"
-    : zodaccessWorkspace.running
-      ? "checking"
-      : zodaccessEnabledAccounts.length > 0 && zodaccessCompletedAccounts.length === zodaccessEnabledAccounts.length
-        ? "signed"
-        : zodaccessReloginAccounts.length > 0
-          ? "error"
-          : "waiting";
-  const zodaccessAutoSign = (
-    <section className="content-stack auto-sign-page zodaccess-page">
-      <div className="panel auto-sign-hero" data-state={zodaccessPageState}>
-        <div className="auto-sign-icon" aria-hidden="true"><CalendarCheck size={28} /></div>
-        <div className="auto-sign-heading"><h2>自动签到</h2></div>
-        <div className="actions">
-          <button onClick={() => handleAction(() => beginZodaccessLogin())} disabled={busy || zodaccessWorkspace.running}>添加账号</button>
-          <button
-            className={zodaccessWorkspace.autoSignEnabled ? "" : "primary"}
-            onClick={() => handleAction(() => toggleZodaccessAutoSign(!zodaccessWorkspace.autoSignEnabled))}
-            disabled={busy || zodaccessWorkspace.running}
-          >{zodaccessWorkspace.autoSignEnabled ? "关闭" : "开启"}</button>
-        </div>
-      </div>
-
-      <div className="summary-grid auto-sign-summary">
-        <div className="metric"><strong>{zodaccessCompletedAccounts.length}/{zodaccessEnabledAccounts.length}</strong><span>今日完成</span></div>
-        <div className="metric"><strong>{zodaccessPendingAccounts.length}</strong><span>待检查</span></div>
-        <div className="metric"><strong>{zodaccessReloginAccounts.length}</strong><span>需要登录</span></div>
-      </div>
-
-      <div className="panel zodaccess-accounts-panel">
-        <div className="panel-title">
-          <h2>账号</h2>
-          <button
-            onClick={() => handleAction(() => checkZodaccess())}
-            disabled={busy || zodaccessWorkspace.running || !zodaccessWorkspace.autoSignEnabled || zodaccessPendingAccounts.length === 0}
-          >{zodaccessWorkspace.running ? "检查中" : "全部检查"}</button>
-        </div>
-        {zodaccessWorkspace.accounts.length === 0 ? (
-          <div className="empty">尚未添加 ZodAccess 账号</div>
-        ) : (
-          <div className="zodaccess-account-list">
-            {zodaccessWorkspace.accounts.map((account) => (
-              <article className="zodaccess-account-row" key={account.id} data-state={account.checkState}>
-                <div className="zodaccess-account-main">
-                  <img src="/zodaccess-icon.svg" alt="" aria-hidden="true" />
-                  <div>
-                    <strong>{account.displayName}</strong>
-                    <span>{account.enabled ? account.message : "已停用"}</span>
-                  </div>
-                </div>
-                <dl className="meta zodaccess-account-meta">
-                  <dt>最近检查</dt><dd>{fmtDate(account.lastCheckedAt)}</dd>
-                  <dt>最近签到</dt><dd>{fmtDate(account.lastSignedAt)}</dd>
-                </dl>
-                <div className="account-actions zodaccess-account-actions">
-                  <button onClick={() => handleAction(() => toggleZodaccessAccount(account, !account.enabled))} disabled={busy || zodaccessWorkspace.running}>{account.enabled ? "停用" : "启用"}</button>
-                  <button onClick={() => handleAction(() => checkZodaccess(account.id))} disabled={busy || zodaccessWorkspace.running || !zodaccessWorkspace.autoSignEnabled || !account.enabled || account.sessionState !== "ready" || account.signedToday}>立即检查</button>
-                  <button onClick={() => handleAction(() => beginZodaccessLogin(account.id))} disabled={busy || zodaccessWorkspace.running}>重新登录</button>
-                  <button className="danger" onClick={() => setPendingDeleteZodaccessAccount(account)} disabled={busy || zodaccessWorkspace.running}>删除</button>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
-  );
-
   const steamOverview = (
     <section className="content-stack">
       <div className="panel">
@@ -2478,8 +2306,7 @@ function App() {
   function selectApp(app: AppKey) {
     const changingApp = app !== activeApp;
     setActiveApp(app);
-    if (app === "zodaccess") setActiveFeature("autoSign");
-    else if (changingApp || (app !== "oopz" && activeFeature === "autoSign")) setActiveFeature("switcher");
+    if (changingApp || (app !== "oopz" && activeFeature === "autoSign")) setActiveFeature("switcher");
     setVisibleSteamCredentials([]);
     setPerfectMenuSessionId(null);
     if (busyRef.current) return;
@@ -2487,15 +2314,13 @@ function App() {
       setMessage(`已保存 ${data.accounts.length} 个 OOPZ 账号，${sessionCount} 个可快速切换`);
     } else if (app === "steam") {
       setMessage(`Steam 网页账号 ${data.steam.webSessions.length} 个，客户端账号 ${data.steam.accounts.length} 个`);
-    } else if (app === "perfect") {
+    } else {
       const available = data.steam.webSessions.filter((session) => {
         if (!session.steamId) return false;
         const profile = perfectProfiles[session.steamId];
         return perfectAvailability(profile, data.perfectUnavailableAccountIds?.includes(session.steamId)) === "ready";
       }).length;
       setMessage(`完美账号 ${data.steam.webSessions.length} 个，${available} 个可快速切换`);
-    } else {
-      setMessage(`ZodAccess 账号 ${zodaccessWorkspace.accounts.length} 个，今日已完成 ${zodaccessWorkspace.accounts.filter((account) => account.signedToday).length} 个`);
     }
   }
 
@@ -2503,10 +2328,8 @@ function App() {
     ? activeFeature === "overview" ? overview : activeFeature === "autoSign" ? autoSign : switcher
     : activeApp === "steam"
       ? activeFeature === "overview" ? steamOverview : steamSwitcher
-      : activeApp === "perfect"
-        ? activeFeature === "overview" ? perfectOverview : perfectSwitcher
-        : zodaccessAutoSign;
-  const activeAppName = activeApp === "oopz" ? "OOPZ" : activeApp === "steam" ? "Steam" : activeApp === "perfect" ? "完美对战平台" : "ZodAccess";
+      : activeFeature === "overview" ? perfectOverview : perfectSwitcher;
+  const activeAppName = activeApp === "oopz" ? "OOPZ" : activeApp === "steam" ? "Steam" : "完美对战平台";
   const activeFeatureName = activeFeature === "overview" ? "概览" : activeFeature === "autoSign" ? "自动签到" : "账号切换";
 
   if (startupPhase !== "ready") {
@@ -2555,7 +2378,6 @@ function App() {
             <button data-active={activeApp === "oopz"} aria-current={activeApp === "oopz" ? "page" : undefined} onClick={() => selectApp("oopz")} aria-label="切换到 OOPZ" title="OOPZ"><img className="app-icon-image" src="/oopz-icon.png" alt="" /></button>
             <button data-active={activeApp === "steam"} aria-current={activeApp === "steam" ? "page" : undefined} onClick={() => selectApp("steam")} aria-label="切换到 Steam" title="Steam"><img className="app-icon-image" src="/steam-icon.svg" alt="" /></button>
             <button data-active={activeApp === "perfect"} aria-current={activeApp === "perfect" ? "page" : undefined} onClick={() => selectApp("perfect")} aria-label="切换到完美对战平台" title="完美对战平台"><img className="app-icon-image" src="/perfect-arena-icon.png" alt="" /></button>
-            <button data-active={activeApp === "zodaccess"} aria-current={activeApp === "zodaccess" ? "page" : undefined} onClick={() => selectApp("zodaccess")} aria-label="切换到 ZodAccess" title="ZodAccess"><img className="app-icon-image" src="/zodaccess-icon.svg" alt="" /></button>
           </nav>
           <div className="global-actions">
             <button className="global-action-button" data-active={showSettings || undefined} onClick={openSettings} aria-label="设置" title="设置"><Settings size={20} strokeWidth={1.9} /></button>
@@ -2565,10 +2387,9 @@ function App() {
         <aside className="sidebar auto-hide-scrollbar" onScroll={showScrollbarWhileScrolling}>
           <div className="sidebar-app-name">{activeAppName}</div>
           <nav className="feature-list">
-            {activeApp !== "zodaccess" && <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>}
-            {activeApp !== "zodaccess" && <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>}
+            <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={17} strokeWidth={2} aria-hidden="true" /><strong>概览</strong></button>
+            <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={17} strokeWidth={2} aria-hidden="true" /><strong>账号切换</strong></button>
             {activeApp === "oopz" && <button data-active={activeFeature === "autoSign"} aria-current={activeFeature === "autoSign" ? "page" : undefined} onClick={() => setActiveFeature("autoSign")}><CalendarCheck size={17} strokeWidth={2} aria-hidden="true" /><strong>自动签到</strong></button>}
-            {activeApp === "zodaccess" && <button data-active="true" aria-current="page"><CalendarCheck size={17} strokeWidth={2} aria-hidden="true" /><strong>自动签到</strong></button>}
           </nav>
         </aside>
 
@@ -2577,11 +2398,10 @@ function App() {
             <h2>{activeAppName} · {activeFeatureName}</h2>
             <div className="status" data-busy={busy} role="status" aria-live="polite" aria-atomic="true" title={message}>{busy && <span className="spinner" />}<span>{message}</span></div>
           </header>
-          <nav className="mobile-feature-tabs" data-single={activeApp === "zodaccess" || undefined} aria-label={`${activeAppName} 功能`}>
-            {activeApp !== "zodaccess" && <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={15} aria-hidden="true" />概览</button>}
-            {activeApp !== "zodaccess" && <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={15} aria-hidden="true" />账号切换</button>}
+          <nav className="mobile-feature-tabs" aria-label={`${activeAppName} 功能`}>
+            <button data-active={activeFeature === "overview"} aria-current={activeFeature === "overview" ? "page" : undefined} onClick={() => setActiveFeature("overview")}><LayoutDashboard size={15} aria-hidden="true" />概览</button>
+            <button data-active={activeFeature === "switcher"} aria-current={activeFeature === "switcher" ? "page" : undefined} onClick={() => setActiveFeature("switcher")}><UsersRound size={15} aria-hidden="true" />账号切换</button>
             {activeApp === "oopz" && <button data-active={activeFeature === "autoSign"} aria-current={activeFeature === "autoSign" ? "page" : undefined} onClick={() => setActiveFeature("autoSign")}><CalendarCheck size={15} aria-hidden="true" />自动签到</button>}
-            {activeApp === "zodaccess" && <button data-active="true" aria-current="page"><CalendarCheck size={15} aria-hidden="true" />自动签到</button>}
           </nav>
           {activeContent}
         </section>
@@ -2745,15 +2565,6 @@ function App() {
             <p id="steam-credential-delete-title"><strong>清除“{pendingDeleteSteamCredential.displayName}”保存的 Steam 账密？</strong></p>
             <small id="steam-credential-delete-description" className="confirm-description">网页登录会保留，但 NEA 将不能再用账密登录 Steam 客户端。之后可通过文本导入重新保存新密码。</small>
             <div className="confirm-actions"><button className="primary danger-confirm" onClick={() => handleAction(() => deleteSteamCredential(pendingDeleteSteamCredential))} disabled={busy}>清除已保存账密</button><button onClick={() => setPendingDeleteSteamCredential(null)} disabled={busy} autoFocus>取消</button></div>
-          </div>
-        </div>
-      )}
-      {pendingDeleteZodaccessAccount && (
-        <div className="confirm-backdrop" onMouseDown={() => !busy && setPendingDeleteZodaccessAccount(null)}>
-          <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="zodaccess-delete-title" aria-describedby="zodaccess-delete-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
-            <p id="zodaccess-delete-title"><strong>删除“{pendingDeleteZodaccessAccount.displayName}”及其登录态？</strong></p>
-            <small id="zodaccess-delete-description" className="confirm-description">将删除 NEA 保存的 ZodAccess 会话，不会删除网站账号。</small>
-            <div className="confirm-actions"><button className="primary danger-confirm" onClick={() => handleAction(() => deleteZodaccessAccount(pendingDeleteZodaccessAccount))} disabled={busy}>删除账号及登录态</button><button onClick={() => setPendingDeleteZodaccessAccount(null)} disabled={busy} autoFocus>取消</button></div>
           </div>
         </div>
       )}
