@@ -1520,81 +1520,6 @@ html[data-theme="dark"] .steam-import-parallel-hint {
   gap: 6px;
 }
 
-.zodaccess-accounts-panel {
-  min-height: 0;
-}
-
-.zodaccess-account-list {
-  display: grid;
-  gap: 8px;
-  max-height: min(430px, 52vh);
-  padding-right: 4px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-}
-
-.zodaccess-account-row {
-  display: grid;
-  grid-template-columns: minmax(190px, 1fr) minmax(185px, 0.85fr) auto;
-  align-items: center;
-  gap: 16px;
-  min-width: 0;
-  border: 1px solid #e3e7ea;
-  border-radius: 7px;
-  padding: 10px;
-  background: #fff;
-}
-
-.zodaccess-account-row[data-state="signed"] {
-  border-color: #b8dfc9;
-}
-
-.zodaccess-account-row[data-state="reauthRequired"] {
-  border-color: #efc2bc;
-}
-
-.zodaccess-account-main {
-  display: grid;
-  grid-template-columns: 38px minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.zodaccess-account-main img {
-  width: 38px;
-  height: 38px;
-  border-radius: 9px;
-}
-
-.zodaccess-account-main > div {
-  display: grid;
-  min-width: 0;
-}
-
-.zodaccess-account-main strong,
-.zodaccess-account-main span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.zodaccess-account-main span {
-  color: #6b7280;
-  font-size: 12px;
-}
-
-.zodaccess-account-meta {
-  grid-template-columns: 64px minmax(0, 1fr);
-  margin: 0;
-}
-
-.zodaccess-account-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
 .icon-button {
   display: inline-grid;
   width: 30px;
@@ -2198,7 +2123,6 @@ html[data-theme="dark"] .workspace {
 html[data-theme="dark"] .panel,
 html[data-theme="dark"] .metric,
 html[data-theme="dark"] .account-row,
-html[data-theme="dark"] .zodaccess-account-row,
 html[data-theme="dark"] .perfect-account-card,
 html[data-theme="dark"] .confirm-dialog,
 html[data-theme="dark"] .share-center,
@@ -2213,7 +2137,6 @@ html[data-theme="dark"] .perfect-card-menu {
 
 html[data-theme="dark"] .panel,
 html[data-theme="dark"] .account-row,
-html[data-theme="dark"] .zodaccess-account-row,
 html[data-theme="dark"] .perfect-account-card {
   box-shadow: none;
 }
@@ -2539,21 +2462,6 @@ html[data-theme="dark"] .account-row {
   background: transparent;
 }
 
-html[data-theme="dark"] .zodaccess-account-row {
-  border: 0;
-  border-bottom: 1px solid #323232;
-  border-radius: 0;
-  background: transparent;
-}
-
-html[data-theme="dark"] .zodaccess-account-row:last-child {
-  border-bottom: 0;
-}
-
-html[data-theme="dark"] .zodaccess-account-main span {
-  color: #9ba7ad;
-}
-
 html[data-theme="dark"] .account-row:last-child {
   border-bottom: 0;
 }
@@ -2844,14 +2752,6 @@ html[data-theme="dark"].overlay-root #root {
     align-items: flex-start;
     flex-direction: column;
   }
-
-  .zodaccess-account-row {
-    grid-template-columns: minmax(190px, 1fr) minmax(170px, 0.8fr);
-  }
-
-  .zodaccess-account-actions {
-    grid-column: 1 / -1;
-  }
 }
 
 @media (max-width: 760px) {
@@ -2899,15 +2799,6 @@ html[data-theme="dark"].overlay-root #root {
 
   .switcher-grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .zodaccess-account-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .zodaccess-account-actions {
-    grid-column: auto;
-    justify-content: flex-start;
   }
 }
 
@@ -2979,10 +2870,6 @@ html[data-theme="dark"].overlay-root #root {
     background: #eef3f5;
   }
 
-  .mobile-feature-tabs[data-single="true"] {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .mobile-feature-tabs button {
     display: flex;
     height: 30px;
@@ -3018,11 +2905,6 @@ html[data-theme="dark"].overlay-root #root {
   .account-actions {
     justify-content: flex-end;
     padding-left: 44px;
-  }
-
-  .zodaccess-account-actions {
-    justify-content: flex-start;
-    padding-left: 0;
   }
 
   .account-details {
