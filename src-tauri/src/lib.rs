@@ -2241,6 +2241,7 @@ fn zodaccess_workspace(app: &AppHandle) -> zodaccess::ZodAccessWorkspace {
         .lock()
         .map(|data| data.zodaccess.clone())
         .unwrap_or_default();
+    zodaccess::normalize_workspace_for_today(&mut workspace, &zodaccess::today_key());
     workspace.running = state.zodaccess_auto_sign_running.load(Ordering::SeqCst);
     workspace
 }
@@ -2679,16 +2680,11 @@ fn perform_zodaccess_auto_sign_check(
     let _ = app.emit("zodaccess-workspace-changed", checking);
 
     for (index, account) in accounts.iter().enumerate() {
-        let still_enabled = state
-            .data
-            .lock()
-            .map_err(|error| error.to_string())?
-            .zodaccess
-            .accounts
-            .iter()
-            .find(|current| current.id == account.id)
-            .is_some_and(|current| current.enabled && current.session_state == "ready");
-        if !still_enabled {
+        let still_eligible = {
+            let data = state.data.lock().map_err(|error| error.to_string())?;
+            zodaccess::queued_account_is_current(&data.zodaccess, account, &zodaccess::today_key())
+        };
+        if !still_eligible {
             continue;
         }
         let result = match read_zodaccess_session(&account.id) {
@@ -2723,8 +2719,8 @@ fn run_zodaccess_auto_sign_check(
     state
         .zodaccess_auto_sign_running
         .store(false, Ordering::SeqCst);
-    emit_zodaccess_workspace(app);
-    result
+    let workspace = emit_zodaccess_workspace(app);
+    result.map(|_| workspace)
 }
 
 fn schedule_zodaccess_auto_sign_check(
@@ -5576,6 +5572,7 @@ fn get_app_data_inner(app: &AppHandle) -> Result<AppData, String> {
     refresh_actual_steam_runtime_state(&mut data.steam);
     reconcile_steam_identities(&mut data);
     data.perfect_profiles.clear();
+    zodaccess::normalize_workspace_for_today(&mut data.zodaccess, &zodaccess::today_key());
     data.zodaccess.running = state.zodaccess_auto_sign_running.load(Ordering::SeqCst);
     Ok(data)
 }
@@ -8629,7 +8626,9 @@ fn rollback_staged_deletion(staged: &StagedDeletion) {
     if staged.staged.exists() && !staged.original.exists() {
         let _ = fs::rename(&staged.staged, &staged.original);
     }
-    let _ = fs::remove_file(&staged.marker);
+    if !staged.staged.exists() && staged.original.exists() {
+        let _ = fs::remove_file(&staged.marker);
+    }
 }
 
 fn mark_staged_deletion_committed(staged: &StagedDeletion) {
@@ -8677,7 +8676,7 @@ fn recover_staged_deletions_in(storage_root: &Path, trash: &Path) {
             let _ = fs::rename(&marker.staged, &marker.original);
             marker.original.exists()
         } else {
-            marker.original.exists()
+            !marker.staged.exists() && marker.original.exists()
         };
         if resolved {
             let _ = fs::remove_file(marker_path);
@@ -13389,62 +13388,66 @@ async fn delete_account(app: AppHandle, account_id: String) -> Result<(), String
     .map_err(|e| e.to_string())?
 }
 
+fn remove_oopz_account_from_data(
+    data: &mut AppData,
+    account_id: &str,
+    actual_current_uid: Option<&str>,
+) -> Result<bool, String> {
+    if !is_safe_account_component(account_id) {
+        return Err("账号 ID 无效".to_string());
+    }
+    if !data.accounts.iter().any(|account| account.id == account_id) {
+        return Err("账号不存在".to_string());
+    }
+    let deleting_uid = data
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .and_then(|account| account.uid.as_deref());
+    let deleting_current = deleting_uid.is_some_and(|uid| {
+        actual_current_uid == Some(uid) || data.current_login_uid.as_deref() == Some(uid)
+    });
+    if deleting_current {
+        return Err("当前登录账号不能删除，请先切换账号或退出 OOPZ".to_string());
+    }
+    data.accounts.retain(|account| account.id != account_id);
+    let cleared_auto_sign_account =
+        data.config.oopz_auto_sign_account_id.as_deref() == Some(account_id);
+    if cleared_auto_sign_account {
+        data.config.oopz_auto_sign_account_id = None;
+        data.config.oopz_auto_sign_enabled = false;
+    }
+    Ok(cleared_auto_sign_account)
+}
+
 fn delete_account_inner(
     app: AppHandle,
     state: State<AppState>,
     account_id: String,
 ) -> Result<(), String> {
     let _operation = state.account_operation.lock().map_err(|e| e.to_string())?;
-    let dir = accounts_dir()?.join(&account_id);
-    let staged = stage_for_deletion(&dir)?;
-    let mut next_data = state.data.lock().map_err(|e| e.to_string())?.clone();
-    if !next_data
-        .accounts
-        .iter()
-        .any(|account| account.id == account_id)
-    {
-        if let Some(staged) = &staged {
-            rollback_staged_deletion(staged);
-        }
-        return Err("账号不存在".to_string());
-    }
-    let deleting_uid = next_data
-        .accounts
-        .iter()
-        .find(|account| account.id == account_id)
-        .and_then(|account| account.uid.as_deref());
     let actual_current_uid = current_registry_login()
         .as_deref()
         .and_then(uid_from_registry_login);
-    let deleting_current = deleting_uid.is_some_and(|uid| {
-        actual_current_uid.as_deref() == Some(uid)
-            || next_data.current_login_uid.as_deref() == Some(uid)
+    let mut staged = None;
+    let result = commit_app_data_update(&state, |data| {
+        let cleared =
+            remove_oopz_account_from_data(data, &account_id, actual_current_uid.as_deref())?;
+        staged = stage_for_deletion(&accounts_dir()?.join(&account_id))?;
+        Ok(cleared)
     });
-    if deleting_current {
-        if let Some(staged) = &staged {
-            rollback_staged_deletion(staged);
+    let cleared_auto_sign_account = match result {
+        Ok(cleared) => cleared,
+        Err(error) => {
+            if let Some(staged) = &staged {
+                rollback_staged_deletion(staged);
+            }
+            return Err(error);
         }
-        return Err("当前登录账号不能删除，请先切换账号或退出 OOPZ".to_string());
-    }
-    next_data
-        .accounts
-        .retain(|account| account.id != account_id);
-    let cleared_auto_sign_account =
-        next_data.config.oopz_auto_sign_account_id.as_deref() == Some(account_id.as_str());
-    if cleared_auto_sign_account {
-        next_data.config.oopz_auto_sign_account_id = None;
-        next_data.config.oopz_auto_sign_enabled = false;
-    }
-    if let Err(error) = save_data(&next_data) {
-        if let Some(staged) = &staged {
-            rollback_staged_deletion(staged);
-        }
-        return Err(error);
-    }
+    };
     if let Some(staged) = &staged {
         mark_staged_deletion_committed(staged);
     }
-    *state.data.lock().map_err(|e| e.to_string())? = next_data;
     delete_credential(&account_id);
     finish_staged_deletion(staged);
     if cleared_auto_sign_account {
@@ -15477,6 +15480,50 @@ mod tests {
     }
 
     #[test]
+    fn staged_deletion_keeps_recovery_record_until_restore_succeeds() {
+        let root = std::env::temp_dir().join(format!("nea-delete-conflict-{}", Uuid::new_v4()));
+        let trash = root.join("trash");
+        let original = root.join("account");
+        let staged = trash.join("operation.data");
+        let marker = trash.join("operation.json");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("state.bin"), b"saved-account").unwrap();
+        fs::write(&original, b"conflicting-file").unwrap();
+        fs::write(
+            &marker,
+            serde_json::to_vec(&StagedDeletionMarker {
+                original: original.clone(),
+                staged: staged.clone(),
+                committed: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        rollback_staged_deletion(&StagedDeletion {
+            original: original.clone(),
+            staged: staged.clone(),
+            marker: marker.clone(),
+        });
+        assert!(marker.exists());
+        recover_staged_deletions(&root);
+        assert!(marker.exists());
+        assert_eq!(fs::read(&original).unwrap(), b"conflicting-file");
+        assert_eq!(
+            fs::read(staged.join("state.bin")).unwrap(),
+            b"saved-account"
+        );
+        fs::remove_file(&original).unwrap();
+        recover_staged_deletions(&root);
+        assert_eq!(
+            fs::read(original.join("state.bin")).unwrap(),
+            b"saved-account"
+        );
+        assert!(!marker.exists());
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn startup_recovers_interrupted_deletion_transaction() {
         let root = std::env::temp_dir().join(format!("nea-delete-recovery-{}", Uuid::new_v4()));
         let trash = root.join("trash");
@@ -15918,6 +15965,86 @@ mod tests {
             "overlayOffsetY": 0,
             "overlayVertical": false
         })
+    }
+
+    #[test]
+    fn oopz_deletion_rejects_unsafe_missing_and_current_accounts_before_commit() {
+        for id in [
+            "",
+            "..",
+            "../outside",
+            r"..\outside",
+            r"C:\outside",
+            "account/child",
+            "account:stream",
+        ] {
+            let mut data = AppData::default();
+            data.accounts
+                .push(serde_json::from_value(test_account(id, "uid-one")).unwrap());
+            let state = Mutex::new(data);
+            assert!(commit_data_update_with(
+                &state,
+                |data| remove_oopz_account_from_data(data, id, None),
+                |_| panic!("invalid deletion must never reach persistence"),
+            )
+            .is_err());
+            assert_eq!(state.lock().unwrap().accounts.len(), 1);
+        }
+        let mut data = AppData::default();
+        data.accounts
+            .push(serde_json::from_value(test_account("account-one", "uid-one")).unwrap());
+        assert!(remove_oopz_account_from_data(&mut data, "missing", None).is_err());
+        assert!(remove_oopz_account_from_data(&mut data, "account-one", Some("uid-one")).is_err());
+        data.current_login_uid = Some("uid-one".to_string());
+        assert!(remove_oopz_account_from_data(&mut data, "account-one", None).is_err());
+        assert_eq!(data.accounts.len(), 1);
+    }
+
+    #[test]
+    fn oopz_deletion_preserves_latest_settings_and_failed_commit_keeps_account() {
+        let mut data = AppData::default();
+        data.accounts
+            .push(serde_json::from_value(test_account("account-one", "uid-one")).unwrap());
+        data.config.oopz_auto_sign_account_id = Some("account-one".to_string());
+        data.config.oopz_auto_sign_enabled = true;
+        let state = Mutex::new(data);
+        commit_data_update_with(
+            &state,
+            |data| {
+                data.config.silent_start_enabled = Some(true);
+                data.zodaccess.auto_sign_enabled = true;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(commit_data_update_with(
+            &state,
+            |data| remove_oopz_account_from_data(data, "account-one", None),
+            |_| Err("simulated persistence failure".to_string()),
+        )
+        .is_err());
+        {
+            let unchanged = state.lock().unwrap();
+            assert_eq!(unchanged.accounts.len(), 1);
+            assert!(unchanged.config.oopz_auto_sign_enabled);
+        }
+        assert!(commit_data_update_with(
+            &state,
+            |data| remove_oopz_account_from_data(data, "account-one", None),
+            |next| {
+                assert_eq!(next.config.silent_start_enabled, Some(true));
+                assert!(next.zodaccess.auto_sign_enabled);
+                Ok(())
+            },
+        )
+        .unwrap());
+        let current = state.lock().unwrap();
+        assert!(current.accounts.is_empty());
+        assert!(current.config.oopz_auto_sign_account_id.is_none());
+        assert!(!current.config.oopz_auto_sign_enabled);
+        assert_eq!(current.config.silent_start_enabled, Some(true));
+        assert!(current.zodaccess.auto_sign_enabled);
     }
 
     #[test]

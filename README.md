@@ -5,7 +5,7 @@
 
 **Not Enough Accounts · Windows 本地多平台账号工作台**
 
-[![Release](https://img.shields.io/badge/release-v1.4.1-2563eb)](https://github.com/M4rkzzz/NEA/releases/latest)
+[![Release](https://img.shields.io/badge/release-v1.4.2-2563eb)](https://github.com/M4rkzzz/NEA/releases/latest)
 [![Windows](https://img.shields.io/badge/Windows-x64-0078d4?logo=windows)](#运行环境)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24c8db?logo=tauri)](https://tauri.app/)
 
@@ -39,19 +39,18 @@ NEA 是面向 Windows 的本地多软件账号工作台，把 OOPZ、Steam、完
 - 登录能力迁移：分享中心可按 Steam 账号独立选择网页态、账密或两者，并与 OOPZ、完美平台数据一起导出为 `.nea-share` 包或通过一次性码传输。
 - 本地维护：会话缓存瘦身、孤立目录回收、事务恢复和旧数据迁移都由应用内完成。
 
-## 1.4.1 重点更新
+## 1.4.2 重点更新
 
-- 恢复静默启动的原本行为：开启后任何方式运行 NEA 都直接驻留系统托盘，不再弹出主窗口。1.4.0 曾把它限制为只对开机自启生效。
-- 已在后台运行时，双击图标或再次启动仍会正常唤出主窗口，不会像 1.3.6 至 1.3.7 那样只能从托盘找回。
-- 新增 ZodAccess 平台与多账号自动签到：登录在隔离的官方页面完成，后台只用轻量 HTTP 请求顺序检查，Cookie 仅保存在 Windows 凭据管理器。
-- 修复启动子进程时可能出现的「句柄无效」失败。此前该问题会同时打断 Steam 账密登录和它的自动回滚。
-- 更新检查改为优先读取不受 GitHub 匿名 API 配额影响的静态清单。
+- OOPZ 删除账号前先校验账号与路径，并基于最新配置提交，避免覆盖同时发生的其他设置变更。
+- 删除回滚受阻时保留恢复记录和暂存数据，后续启动可继续恢复。
+- ZodAccess 批量签到逐个确认最新开关和登录状态，关闭功能后停止处理尚未开始的账号。
+- 修复跨日后仍显示昨天签到状态，以及手动检查完成后按钮仍被禁用的问题。
 
-完整变更与安装包见 [NEA v1.4.1 Release](https://github.com/M4rkzzz/NEA/releases/tag/v1.4.1)。
+完整变更与安装包见 [NEA v1.4.2 Release](https://github.com/M4rkzzz/NEA/releases/tag/v1.4.2)。
 
 ## 安装与使用
 
-1. 从 [Releases](https://github.com/M4rkzzz/NEA/releases/latest) 下载 `NEA_1.4.1_x64_en-US.msi`。
+1. 从 [Releases](https://github.com/M4rkzzz/NEA/releases/latest) 下载 `NEA_1.4.2_x64_en-US.msi`。
 2. 安装并打开 NEA；首次启动会自动检查旧 OOPZ+ 数据并执行兼容迁移。
 3. 在左侧选择平台，根据页面提示识别程序路径、导入账号或登录一次。
 4. 后续可从账号列表、托盘菜单或 OOPZ 浮层快速切换。
@@ -106,7 +105,7 @@ pnpm install
 pnpm run dev:app       # 开发运行
 pnpm run check:fast    # 紧密开发循环：仅 TypeScript + Rust 增量检查
 pnpm run verify:dev    # 功能完成：TypeScript + 5 项关键回归测试
-pnpm run verify:release # 正式发布：构建 + 98 项稳定测试 + Clippy
+pnpm run verify:release # 正式发布：构建 + 103 项稳定测试 + Clippy
 pnpm run build:msi     # 构建 Windows MSI
 pnpm run bundle:msi    # 仅在现有 Release EXE 未变化时快速重新封装 MSI
 ```

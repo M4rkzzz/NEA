@@ -41,6 +41,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 - 主程序启动后检查一次，每分钟只观察是否需要调度，临时网络或站点错误至少间隔一小时重试；登录失效后停止该账号重试并要求用户重新登录。此功能只在 NEA 运行期间工作。
 - 添加账号和重新登录复用系统 Edge WebView2，并为每次窗口使用 `%APPDATA%\NEA\runtime\zodaccess-login\<account-id>` 隔离临时目录；导航只允许 `https://kp.zodaccyes.com`。滑块和可能的二次验证必须由用户在官方页面完成，窗口进入 `/user` 并验证会话后立即销毁和清理。
 - 后台只使用现有 Rust `reqwest`，先读取 `/user`，确认待签到后才向 `/user/checkin` 提交请求；禁止重定向，只接受官方 HTTPS 域、预期内容类型和有限大小响应。页面或协议无法安全识别时明确失败，不做注入、验证码绕过或硬编码秘密。
+- 批量检查在处理每个账号前重新读取总开关、账号开关、会话版本和当日完成状态；队列建立后关闭功能或重新登录，应跳过旧队列中的对应账号。返回 UI 的工作区每次按本地日期重算今日状态，检查完成的接口返回值必须在释放运行标志后生成。
 - ZodAccess Cookie 只保存在 Windows Credential Manager，不得进入 `config.json`、日志、错误、测试快照或恢复记录。重新登录先验证新会话，配置提交失败时恢复原凭据；删除先提交最新配置，再清理凭据，恢复记录只保存待清理账号 ID。
 - 昵称只能从官方用户页识别，不提供手动改名。重名账号保留为独立记录并追加序号，不得覆盖已有会话。ZodAccess 数据当前不进入分享包。
 
@@ -80,6 +81,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 - 不要更改稳定路径来“整理目录”；迁移必须兼容旧版并可恢复。
 - Steam 网页导入、批量导入、能力补全和存储整理之间已有互斥保护，不得绕过。
 - 配置更新必须基于最新内存数据提交，禁止先克隆、长时间操作后覆盖整个配置，这会重新引入并行导入丢失更新。
+- OOPZ 删除账号必须先校验 ID、账号存在性和当前登录保护，再暂存目录；字段删除与配置持久化使用同一次 `commit_app_data_update`，失败时回滚暂存目录。回滚失败或原路径存在冲突时必须保留恢复记录和暂存数据，供后续启动继续恢复。
 - WebView 会话瘦身只能删除缓存、代码缓存、GPU/Shader 缓存和统计数据，必须保留 Cookie、Local Storage 等登录状态。
 
 ### UI
@@ -101,7 +103,7 @@ NEA（Not Enough Accounts）是 Windows 本地多平台账号切换与登录状�
 ```powershell
 pnpm run check:fast      # 紧密编辑循环：TypeScript + cargo check，不跑测试
 pnpm run verify:dev      # 功能完成/交付前：TypeScript + 5 项关键 Rust 回归
-pnpm run verify:release  # 仅正式发布：构建、格式、98 项稳定测试、Clippy
+pnpm run verify:release  # 仅正式发布：构建、格式、103 项稳定测试、Clippy
 ```
 
 五项开发冒烟测试统一使用 `dev_smoke_` 前缀，一次启动测试进程，覆盖：

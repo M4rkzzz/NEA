@@ -148,7 +148,9 @@ pub fn normalize_workspace_for_today(workspace: &mut ZodAccessWorkspace, today: 
     workspace.running = false;
     for account in &mut workspace.accounts {
         account.signed_today = account.last_success_date.as_deref() == Some(today);
-        if account.check_state == "checking" {
+        if account.check_state == "checking"
+            || (account.check_state == "signed" && !account.signed_today)
+        {
             account.check_state = if account.signed_today {
                 "signed"
             } else {
@@ -165,6 +167,12 @@ pub fn normalize_workspace_for_today(workspace: &mut ZodAccessWorkspace, today: 
     }
 }
 
+pub fn account_is_eligible(account: &ZodAccessAccount, today: &str) -> bool {
+    account.enabled
+        && account.session_state == "ready"
+        && account.last_success_date.as_deref() != Some(today)
+}
+
 pub fn eligible_account_ids(workspace: &ZodAccessWorkspace, today: &str) -> Vec<String> {
     if !workspace.auto_sign_enabled {
         return Vec::new();
@@ -172,13 +180,22 @@ pub fn eligible_account_ids(workspace: &ZodAccessWorkspace, today: &str) -> Vec<
     workspace
         .accounts
         .iter()
-        .filter(|account| {
-            account.enabled
-                && account.session_state == "ready"
-                && account.last_success_date.as_deref() != Some(today)
-        })
+        .filter(|account| account_is_eligible(account, today))
         .map(|account| account.id.clone())
         .collect()
+}
+
+pub fn queued_account_is_current(
+    workspace: &ZodAccessWorkspace,
+    queued: &ZodAccessAccount,
+    today: &str,
+) -> bool {
+    workspace.auto_sign_enabled
+        && workspace.accounts.iter().any(|current| {
+            current.id == queued.id
+                && current.updated_at == queued.updated_at
+                && account_is_eligible(current, today)
+        })
 }
 
 pub fn credential_cleanup_is_committed(workspace: &ZodAccessWorkspace, account_id: &str) -> bool {
@@ -590,6 +607,66 @@ mod tests {
         assert_eq!(eligible_account_ids(&workspace, "2026-08-22"), vec!["one"]);
         workspace.auto_sign_enabled = false;
         assert!(eligible_account_ids(&workspace, "2026-08-22").is_empty());
+    }
+
+    #[test]
+    fn queued_checks_stop_when_settings_or_session_change() {
+        let queued = account("one", "One");
+        let original = ZodAccessWorkspace {
+            auto_sign_enabled: true,
+            running: true,
+            accounts: vec![queued.clone()],
+        };
+        assert!(queued_account_is_current(&original, &queued, "2026-08-23"));
+        let mut changed = original.clone();
+        changed.auto_sign_enabled = false;
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+        changed = original.clone();
+        changed.accounts[0].enabled = false;
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+        changed = original.clone();
+        changed.accounts[0].session_state = "reauthRequired".to_string();
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+        changed = original.clone();
+        changed.accounts[0].updated_at = "2026-08-23T01:00:00Z".to_string();
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+        changed = original.clone();
+        changed.accounts[0].last_success_date = Some("2026-08-23".to_string());
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+        changed.accounts.clear();
+        assert!(!queued_account_is_current(&changed, &queued, "2026-08-23"));
+    }
+
+    #[test]
+    fn workspace_rolls_completed_accounts_over_to_the_new_day() {
+        let mut signed = account("one", "One");
+        signed.signed_today = true;
+        signed.check_state = "signed".to_string();
+        signed.message = "签到成功".to_string();
+        signed.last_success_date = Some("2026-08-22".to_string());
+        let mut expired = account("two", "Two");
+        expired.session_state = "reauthRequired".to_string();
+        expired.check_state = "reauthRequired".to_string();
+        expired.message = "请重新登录".to_string();
+        let mut workspace = ZodAccessWorkspace {
+            auto_sign_enabled: true,
+            running: false,
+            accounts: vec![signed, expired],
+        };
+        normalize_workspace_for_today(&mut workspace, "2026-08-22");
+        assert!(workspace.accounts[0].signed_today);
+        assert_eq!(workspace.accounts[0].check_state, "signed");
+        normalize_workspace_for_today(&mut workspace, "2026-08-23");
+        assert!(!workspace.accounts[0].signed_today);
+        assert_eq!(workspace.accounts[0].check_state, "waiting");
+        assert_eq!(workspace.accounts[0].message, "等待检查");
+        assert_eq!(
+            workspace.accounts[0].last_success_date.as_deref(),
+            Some("2026-08-22")
+        );
+        assert_eq!(workspace.accounts[1].check_state, "reauthRequired");
+        assert_eq!(workspace.accounts[1].message, "请重新登录");
+        assert_eq!(eligible_account_ids(&workspace, "2026-08-23"), vec!["one"]);
     }
 
     #[test]
