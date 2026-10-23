@@ -90,9 +90,10 @@ pub enum DashboardState {
     ReadyToSign,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOutcome {
     pub newly_signed: bool,
+    pub checked_date: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,18 +302,41 @@ fn client() -> Result<Client, CheckFailure> {
         .map_err(|_| CheckFailure::temporary("无法创建 ZodAccess 签到连接"))
 }
 
-pub fn inspect_session(session: &ZodAccessSession) -> Result<DashboardState, CheckFailure> {
-    inspect_session_with_client(&client()?, session)
+fn with_stable_local_day<T>(
+    mut date: impl FnMut() -> String,
+    mut operation: impl FnMut() -> Result<T, CheckFailure>,
+) -> Result<(T, String), CheckFailure> {
+    for _ in 0..2 {
+        let started_date = date();
+        let result = operation()?;
+        if started_date == date() {
+            return Ok((result, started_date));
+        }
+    }
+    Err(CheckFailure::temporary(
+        "日期发生变化，稍后重新检查签到状态",
+    ))
+}
+
+pub fn inspect_session(
+    session: &ZodAccessSession,
+) -> Result<(DashboardState, String), CheckFailure> {
+    let client = client()?;
+    with_stable_local_day(today_key, || inspect_session_with_client(&client, session))
 }
 
 pub fn check_and_sign(session: &ZodAccessSession) -> Result<CheckOutcome, CheckFailure> {
     let client = client()?;
-    match inspect_session_with_client(&client, session)? {
-        DashboardState::SignedToday => Ok(CheckOutcome {
-            newly_signed: false,
-        }),
-        DashboardState::ReadyToSign => submit_checkin(&client, session),
-    }
+    let (newly_signed, checked_date) = with_stable_local_day(today_key, || {
+        match inspect_session_with_client(&client, session)? {
+            DashboardState::SignedToday => Ok(false),
+            DashboardState::ReadyToSign => submit_checkin(&client, session),
+        }
+    })?;
+    Ok(CheckOutcome {
+        newly_signed,
+        checked_date,
+    })
 }
 
 fn inspect_session_with_client(
@@ -329,10 +353,7 @@ fn inspect_session_with_client(
     classify_dashboard(&raw)
 }
 
-fn submit_checkin(
-    client: &Client,
-    session: &ZodAccessSession,
-) -> Result<CheckOutcome, CheckFailure> {
+fn submit_checkin(client: &Client, session: &ZodAccessSession) -> Result<bool, CheckFailure> {
     let response = client
         .post(CHECKIN_URL)
         .header(ACCEPT, "application/json")
@@ -345,11 +366,9 @@ fn submit_checkin(
     let payload: Value = serde_json::from_slice(&raw)
         .map_err(|_| CheckFailure::temporary("ZodAccess 签到响应无法识别"))?;
     match classify_checkin_payload(&payload)? {
-        true => Ok(CheckOutcome { newly_signed: true }),
+        true => Ok(true),
         false => match inspect_session_with_client(client, session)? {
-            DashboardState::SignedToday => Ok(CheckOutcome {
-                newly_signed: false,
-            }),
+            DashboardState::SignedToday => Ok(false),
             DashboardState::ReadyToSign => Err(CheckFailure::temporary(
                 "ZodAccess 未确认签到成功，稍后重试",
             )),
@@ -467,6 +486,52 @@ mod tests {
             created_at: "2026-08-22T00:00:00Z".to_string(),
             updated_at: "2026-08-22T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn day_boundary_rechecks_instead_of_reusing_yesterdays_result() {
+        let mut dates = ["2026-10-23", "2026-10-24", "2026-10-24", "2026-10-24"].into_iter();
+        let mut checks = 0;
+        let (signed, date) = with_stable_local_day(
+            || dates.next().unwrap().to_string(),
+            || {
+                checks += 1;
+                Ok(checks == 1)
+            },
+        )
+        .unwrap();
+        assert_eq!(checks, 2);
+        assert!(
+            !signed,
+            "yesterday's signed result must not mark today complete"
+        );
+        assert_eq!(date, "2026-10-24");
+        let mut checks = 0;
+        let (_, date) = with_stable_local_day(
+            || "2026-10-24".to_string(),
+            || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(checks, 1);
+        assert_eq!(date, "2026-10-24");
+    }
+
+    #[test]
+    fn unstable_dates_stop_after_one_retry() {
+        let mut dates = ["2026-10-23", "2026-10-24", "2026-10-24", "2026-10-25"].into_iter();
+        let mut checks = 0;
+        let result = with_stable_local_day(
+            || dates.next().unwrap().to_string(),
+            || {
+                checks += 1;
+                Ok(true)
+            },
+        );
+        assert_eq!(checks, 2);
+        assert_eq!(result.unwrap_err().kind, CheckFailureKind::Temporary);
     }
 
     #[test]

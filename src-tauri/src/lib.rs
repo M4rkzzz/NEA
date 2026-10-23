@@ -671,6 +671,7 @@ struct AppState {
     oopz_auto_sign_completed_key: Mutex<Option<String>>,
     zodaccess_auto_sign_running: AtomicBool,
     zodaccess_auto_sign_last_attempt: Mutex<Option<Instant>>,
+    zodaccess_account_operation: Mutex<()>,
 }
 
 fn initial_app_state(data: AppData, startup_phase: StartupPhase) -> AppState {
@@ -707,6 +708,7 @@ fn initial_app_state(data: AppData, startup_phase: StartupPhase) -> AppState {
         oopz_auto_sign_completed_key: Mutex::new(None),
         zodaccess_auto_sign_running: AtomicBool::new(false),
         zodaccess_auto_sign_last_attempt: Mutex::new(None),
+        zodaccess_account_operation: Mutex::new(()),
     }
 }
 
@@ -2302,19 +2304,59 @@ async fn capture_zodaccess_session(
     zodaccess::validate_session(zodaccess::ZodAccessSession { cookies })
 }
 
+struct ZodAccessLoginAttempt {
+    account_id: String,
+    reauth: bool,
+    cancelled: AtomicBool,
+}
+
+impl ZodAccessLoginAttempt {
+    fn validate(&self, workspace: &zodaccess::ZodAccessWorkspace) -> Result<(), String> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err("登录操作已取消".to_string());
+        }
+        let exists = workspace
+            .accounts
+            .iter()
+            .any(|account| account.id == self.account_id);
+        if self.reauth && !exists {
+            return Err("该账号已删除，登录操作已取消".to_string());
+        }
+        if !self.reauth && exists {
+            return Err("该登录操作已完成".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn persist_zodaccess_login(
     app: &AppHandle,
-    account_id: &str,
+    attempt: &ZodAccessLoginAttempt,
     proposed_name: &str,
     session: &zodaccess::ZodAccessSession,
-    dashboard: zodaccess::DashboardState,
+    dashboard: (zodaccess::DashboardState, String),
 ) -> Result<zodaccess::ZodAccessWorkspace, String> {
+    let state = app.state::<AppState>();
+    let _operation = state
+        .zodaccess_account_operation
+        .lock()
+        .map_err(|error| error.to_string())?;
+    attempt.validate(
+        &state
+            .data
+            .lock()
+            .map_err(|error| error.to_string())?
+            .zodaccess,
+    )?;
+    let account_id = attempt.account_id.as_str();
     let previous_secret = read_zodaccess_secret_raw(account_id)?;
     write_zodaccess_session(account_id, session)?;
     let timestamp = now();
     let today = zodaccess::today_key();
-    let state = app.state::<AppState>();
+    let (dashboard, checked_date) = dashboard;
+    let signed_today = dashboard == zodaccess::DashboardState::SignedToday && checked_date == today;
     let result = commit_app_data_update(&state, |data| {
+        attempt.validate(&data.zodaccess)?;
         let display_name = zodaccess::unique_display_name(
             data.zodaccess.accounts.iter(),
             proposed_name,
@@ -2328,19 +2370,14 @@ fn persist_zodaccess_login(
         {
             account.display_name = display_name;
             account.session_state = "ready".to_string();
-            account.check_state = if dashboard == zodaccess::DashboardState::SignedToday {
-                "signed"
-            } else {
-                "waiting"
-            }
-            .to_string();
-            account.message = if dashboard == zodaccess::DashboardState::SignedToday {
+            account.check_state = if signed_today { "signed" } else { "waiting" }.to_string();
+            account.message = if signed_today {
                 "今日已签到"
             } else {
                 "等待检查"
             }
             .to_string();
-            account.signed_today = dashboard == zodaccess::DashboardState::SignedToday;
+            account.signed_today = signed_today;
             account.last_checked_at = Some(timestamp.clone());
             if account.signed_today {
                 account.last_success_date = Some(today.clone());
@@ -2355,21 +2392,16 @@ fn persist_zodaccess_login(
                 display_name,
                 enabled: true,
                 session_state: "ready".to_string(),
-                check_state: if dashboard == zodaccess::DashboardState::SignedToday {
-                    "signed"
-                } else {
-                    "waiting"
-                }
-                .to_string(),
-                message: if dashboard == zodaccess::DashboardState::SignedToday {
+                check_state: if signed_today { "signed" } else { "waiting" }.to_string(),
+                message: if signed_today {
                     "今日已签到"
                 } else {
                     "等待检查"
                 }
                 .to_string(),
-                signed_today: dashboard == zodaccess::DashboardState::SignedToday,
+                signed_today,
                 last_success_date: (dashboard == zodaccess::DashboardState::SignedToday)
-                    .then(|| today.clone()),
+                    .then(|| checked_date.clone()),
                 last_checked_at: Some(timestamp.clone()),
                 last_signed_at: (dashboard == zodaccess::DashboardState::SignedToday)
                     .then(|| timestamp.clone()),
@@ -2437,6 +2469,7 @@ fn zodaccess_login_script() -> String {
 
 #[tauri::command]
 async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Result<(), String> {
+    let reauth = account_id.is_some();
     let account_id = if let Some(account_id) = account_id {
         Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
         let exists = app
@@ -2469,7 +2502,12 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
         .map_err(|error| error.to_string())?;
     let processing = Arc::new(AtomicBool::new(false));
     let callback_processing = processing.clone();
-    let callback_account_id = account_id.clone();
+    let attempt = Arc::new(ZodAccessLoginAttempt {
+        account_id: account_id.clone(),
+        reauth,
+        cancelled: AtomicBool::new(false),
+    });
+    let callback_attempt = attempt.clone();
     let window_result = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(login_url))
         .title("NEA - ZodAccess 登录")
         .data_directory(data_dir)
@@ -2498,7 +2536,7 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
                     return;
                 }
             };
-            let account_id = callback_account_id.clone();
+            let attempt = callback_attempt.clone();
             let processing = callback_processing.clone();
             tauri::async_runtime::spawn(async move {
                 let app = window.app_handle().clone();
@@ -2511,7 +2549,7 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.message)?;
-                    persist_zodaccess_login(&app, &account_id, &display_name, &session, dashboard)?;
+                    persist_zodaccess_login(&app, &attempt, &display_name, &session, dashboard)?;
                     Ok::<(), String>(())
                 }
                 .await;
@@ -2522,7 +2560,9 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
                         schedule_zodaccess_auto_sign_check(app, true, false, None);
                     }
                     Err(error) => {
-                        let _ = app.emit("zodaccess-login-error", error);
+                        if !attempt.cancelled.load(Ordering::SeqCst) {
+                            let _ = app.emit("zodaccess-login-error", error);
+                        }
                         processing.store(false, Ordering::SeqCst);
                     }
                 }
@@ -2545,6 +2585,7 @@ async fn begin_zodaccess_login(app: AppHandle, account_id: Option<String>) -> Re
             event,
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
         ) {
+            attempt.cancelled.store(true, Ordering::SeqCst);
             schedule_zodaccess_login_cleanup(cleanup_account_id.clone());
         }
     });
@@ -2559,6 +2600,9 @@ fn update_zodaccess_account_result(
 ) -> Result<(), String> {
     let checked_at = now();
     let today = zodaccess::today_key();
+    let crossed_day = result
+        .as_ref()
+        .is_ok_and(|outcome| outcome.checked_date != today);
     commit_app_data_update(&app.state::<AppState>(), |data| {
         let Some(account) = data
             .zodaccess
@@ -2576,15 +2620,17 @@ fn update_zodaccess_account_result(
         match &result {
             Ok(outcome) => {
                 account.session_state = "ready".to_string();
-                account.check_state = "signed".to_string();
-                account.message = if outcome.newly_signed {
+                account.check_state = if crossed_day { "waiting" } else { "signed" }.to_string();
+                account.message = if crossed_day {
+                    "日期已变化，等待重新检查"
+                } else if outcome.newly_signed {
                     "签到成功"
                 } else {
                     "今日已签到"
                 }
                 .to_string();
-                account.signed_today = true;
-                account.last_success_date = Some(today.clone());
+                account.signed_today = !crossed_day;
+                account.last_success_date = Some(outcome.checked_date.clone());
                 account.last_signed_at = Some(checked_at.clone());
             }
             Err(error) => {
@@ -2602,6 +2648,12 @@ fn update_zodaccess_account_result(
         }
         Ok(())
     })?;
+    if crossed_day {
+        *app.state::<AppState>()
+            .zodaccess_auto_sign_last_attempt
+            .lock()
+            .map_err(|error| error.to_string())? = None;
+    }
     emit_zodaccess_workspace(app);
     Ok(())
 }
@@ -2824,6 +2876,11 @@ fn delete_zodaccess_account(
     account_id: String,
 ) -> Result<zodaccess::ZodAccessWorkspace, String> {
     Uuid::parse_str(&account_id).map_err(|_| "ZodAccess 账号 ID 无效".to_string())?;
+    let state = app.state::<AppState>();
+    let operation = state
+        .zodaccess_account_operation
+        .lock()
+        .map_err(|error| error.to_string())?;
     let exists = app
         .state::<AppState>()
         .data
@@ -2848,6 +2905,10 @@ fn delete_zodaccess_account(
         return Err(error);
     }
     finish_zodaccess_credential_cleanup(&account_id, &marker);
+    drop(operation);
+    if let Some(window) = app.get_webview_window(&format!("zodaccess-login-{account_id}")) {
+        close_zodaccess_login_window(&window);
+    }
     Ok(emit_zodaccess_workspace(&app))
 }
 
@@ -10318,6 +10379,48 @@ fn cleanup_transaction_credentials(journal: &ImportJournal) {
     }
 }
 
+fn read_import_credential(account_id: &str) -> Result<Option<String>, String> {
+    for service in [CREDENTIAL_SERVICE, LEGACY_CREDENTIAL_SERVICE] {
+        let entry = Entry::new(service, account_id).map_err(|_| "无法访问导入凭据".to_string())?;
+        match entry.get_password() {
+            Ok(raw) => return Ok(Some(raw)),
+            Err(keyring::Error::NoEntry) => {}
+            Err(_) => return Err("读取导入凭据失败，已保留恢复记录".to_string()),
+        }
+    }
+    Ok(None)
+}
+
+fn delete_import_credential(account_id: &str) -> Result<(), String> {
+    for service in [CREDENTIAL_SERVICE, LEGACY_CREDENTIAL_SERVICE] {
+        let entry = Entry::new(service, account_id).map_err(|_| "无法访问导入凭据".to_string())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(_) => return Err("恢复导入前凭据失败，已保留恢复记录".to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn restore_import_credential_with(
+    entry: &ImportJournalEntry,
+    read: impl FnOnce(&str) -> Result<Option<String>, String>,
+    write: impl FnOnce(&str, &str) -> Result<(), String>,
+    delete: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    // No account credential can have changed before its snapshot replacement starts.
+    if entry.phase == "pending" {
+        return Ok(());
+    }
+    let raw = read(&entry.credential_backup_id)?
+        .ok_or_else(|| "导入凭据备份缺失，已保留恢复记录".to_string())?;
+    if raw == MISSING_CREDENTIAL_MARKER || raw == LEGACY_MISSING_CREDENTIAL_MARKER {
+        delete(&entry.account_id)
+    } else {
+        write(&entry.account_id, &raw)
+    }
+}
+
 fn rollback_snapshot_entry(
     root: &Path,
     entry: &ImportJournalEntry,
@@ -10341,6 +10444,7 @@ fn rollback_snapshot_entry(
 fn restore_oopz_accounts_from_import_backup(
     root: &Path,
     journal: &ImportJournal,
+    state: Option<&AppState>,
 ) -> Result<(), String> {
     let original_data = if journal.config_existed {
         let backup = root.join("config.backup");
@@ -10350,12 +10454,18 @@ fn restore_oopz_accounts_from_import_backup(
     } else {
         AppData::default()
     };
+    if let Some(state) = state {
+        return commit_app_data_update(state, |latest| {
+            restore_imported_oopz_accounts(latest, &original_data, journal);
+            Ok(())
+        });
+    }
     let config = config_path()?;
     let (mut latest, requires_verified_recovery) = match recover_config_file(&config) {
         Some((data, _)) => (data, false),
         None => (original_data.clone(), true),
     };
-    latest.accounts = original_data.accounts;
+    restore_imported_oopz_accounts(&mut latest, &original_data, journal);
     if requires_verified_recovery {
         save_verified_recovery_data(&latest)
     } else {
@@ -10363,7 +10473,59 @@ fn restore_oopz_accounts_from_import_backup(
     }
 }
 
-fn rollback_import_transaction(root: &Path, journal: &ImportJournal) -> Result<(), String> {
+fn restore_imported_oopz_accounts(
+    latest: &mut AppData,
+    original: &AppData,
+    journal: &ImportJournal,
+) {
+    let affected = journal
+        .entries
+        .iter()
+        .map(|entry| entry.account_id.as_str())
+        .collect::<HashSet<_>>();
+    latest.accounts.retain_mut(|account| {
+        if !affected.contains(account.id.as_str()) {
+            return true;
+        }
+        if let Some(previous) = original
+            .accounts
+            .iter()
+            .find(|previous| previous.id == account.id)
+        {
+            *account = previous.clone();
+            true
+        } else {
+            false
+        }
+    });
+    for previous in &original.accounts {
+        if affected.contains(previous.id.as_str())
+            && !latest
+                .accounts
+                .iter()
+                .any(|account| account.id == previous.id)
+        {
+            latest.accounts.push(previous.clone());
+        }
+    }
+}
+
+fn finish_import_rollback_with(
+    result: Result<(), String>,
+    mark_restored: impl FnOnce() -> Result<(), String>,
+    cleanup: impl FnOnce(),
+) -> Result<(), String> {
+    result?;
+    mark_restored()?;
+    cleanup();
+    Ok(())
+}
+
+fn rollback_import_transaction(
+    root: &Path,
+    journal: &ImportJournal,
+    state: Option<&AppState>,
+) -> Result<(), String> {
     let mut first_error = None;
     for entry in &journal.entries {
         if !valid_storage_id(&entry.account_id) {
@@ -10374,29 +10536,30 @@ fn rollback_import_transaction(root: &Path, journal: &ImportJournal) -> Result<(
         if let Err(error) = rollback_snapshot_entry(root, entry, &target) {
             first_error.get_or_insert(error);
         }
-        if let Some(raw) = read_secret_raw(&entry.credential_backup_id) {
-            let result =
-                if raw == MISSING_CREDENTIAL_MARKER || raw == LEGACY_MISSING_CREDENTIAL_MARKER {
-                    delete_credential(&entry.account_id);
-                    Ok(())
-                } else {
-                    write_secret_raw(&entry.account_id, &raw)
-                };
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
+        if let Err(error) = restore_import_credential_with(
+            entry,
+            read_import_credential,
+            write_secret_raw,
+            delete_import_credential,
+        ) {
+            first_error.get_or_insert(error);
         }
     }
-    if let Err(error) = restore_oopz_accounts_from_import_backup(root, journal) {
+    if let Err(error) = restore_oopz_accounts_from_import_backup(root, journal, state) {
         first_error.get_or_insert(error);
     }
-    cleanup_transaction_credentials(journal);
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
+    finish_import_rollback_with(
+        first_error.map_or(Ok(()), Err),
+        || {
+            let mut restored = journal.clone();
+            restored.status = "rolled-back".to_string();
+            write_import_journal(root, &restored)
+        },
+        || {
+            cleanup_transaction_credentials(journal);
+            let _ = fs::remove_dir_all(root);
+        },
+    )
 }
 
 fn recover_import_transactions() -> Result<(), String> {
@@ -10416,12 +10579,12 @@ fn recover_import_transactions() -> Result<(), String> {
             .ok()
             .and_then(|raw| serde_json::from_slice::<ImportJournal>(&raw).ok());
         match journal {
-            Some(journal) if journal.status == "committed" => {
+            Some(journal) if matches!(journal.status.as_str(), "committed" | "rolled-back") => {
                 cleanup_transaction_credentials(&journal);
                 let _ = fs::remove_dir_all(root);
             }
             Some(journal) => {
-                if let Err(error) = rollback_import_transaction(&root, &journal) {
+                if let Err(error) = rollback_import_transaction(&root, &journal, None) {
                     first_error.get_or_insert_with(|| {
                         format!("恢复导入事务 {} 失败: {error}", root.display())
                     });
@@ -10476,11 +10639,16 @@ fn commit_prepared_import(
         return Err(error);
     }
     for entry in &journal.entries {
-        let old_raw = read_secret_raw(&entry.account_id)
-            .unwrap_or_else(|| MISSING_CREDENTIAL_MARKER.to_string());
-        if let Err(error) = write_secret_raw(&entry.credential_backup_id, &old_raw) {
+        let backup_result = read_import_credential(&entry.account_id).and_then(|raw| {
+            write_secret_raw(
+                &entry.credential_backup_id,
+                &raw.unwrap_or_else(|| MISSING_CREDENTIAL_MARKER.to_string()),
+            )
+        });
+        if let Err(error) = backup_result {
             delete_credential(&entry.credential_backup_id);
-            let rollback = rollback_import_transaction(root, &journal).err();
+            let rollback =
+                rollback_import_transaction(root, &journal, Some(&app.state::<AppState>())).err();
             return match rollback {
                 Some(rollback) => Err(format!("{}；清理事务失败: {}", error, rollback)),
                 None => Err(error),
@@ -10537,11 +10705,8 @@ fn commit_prepared_import(
             Ok(imported)
         }
         Err(error) => {
-            let rollback_error = rollback_import_transaction(root, &journal).err();
-            *app.state::<AppState>()
-                .data
-                .lock()
-                .map_err(|e| e.to_string())? = load_data();
+            let rollback_error =
+                rollback_import_transaction(root, &journal, Some(&app.state::<AppState>())).err();
             match rollback_error {
                 Some(rollback) => Err(format!("{}；回滚失败: {}", error, rollback)),
                 None => Err(error),
@@ -16537,6 +16702,203 @@ mod tests {
             QUICK_SHARE_CANCELLED
         );
         assert!(target.is_empty());
+    }
+
+    #[test]
+    fn zodaccess_login_attempt_rejects_deleted_and_cancelled_targets() {
+        let mut workspace = zodaccess::ZodAccessWorkspace::default();
+        let attempt = ZodAccessLoginAttempt {
+            account_id: "fixture-id".to_string(),
+            reauth: true,
+            cancelled: AtomicBool::new(false),
+        };
+        let account: zodaccess::ZodAccessAccount = serde_json::from_value(serde_json::json!({
+            "id": "fixture-id", "displayName": "Fixture", "sessionState": "ready",
+            "checkState": "waiting", "message": "waiting", "createdAt": now(), "updatedAt": now()
+        }))
+        .unwrap();
+        workspace.accounts.push(account.clone());
+        assert!(attempt.validate(&workspace).is_ok());
+        workspace.accounts.clear();
+        assert!(attempt.validate(&workspace).is_err());
+        assert!(workspace.accounts.is_empty());
+        let new_attempt = ZodAccessLoginAttempt {
+            reauth: false,
+            ..attempt
+        };
+        assert!(new_attempt.validate(&workspace).is_ok());
+        workspace.accounts.push(account);
+        assert!(new_attempt.validate(&workspace).is_err());
+        workspace.accounts.clear();
+        new_attempt.cancelled.store(true, Ordering::SeqCst);
+        assert!(new_attempt.validate(&workspace).is_err());
+    }
+
+    #[test]
+    fn import_credential_restore_preserves_errors_and_requires_backup() {
+        let entry = ImportJournalEntry {
+            account_id: "account".to_string(),
+            had_snapshot: true,
+            credential_backup_id: "backup".to_string(),
+            phase: "snapshot-moved".to_string(),
+        };
+        for failure in [Ok(None), Err("read failed".to_string())] {
+            assert!(restore_import_credential_with(
+                &entry,
+                |_| failure,
+                |_, _| panic!("must not overwrite credential without a backup"),
+                |_| panic!("must not delete credential without a backup"),
+            )
+            .is_err());
+        }
+        assert!(restore_import_credential_with(
+            &entry,
+            |_| Ok(Some("fixture-secret".to_string())),
+            |_, _| Err("write failed".to_string()),
+            |_| Ok(()),
+        )
+        .is_err());
+        assert!(restore_import_credential_with(
+            &entry,
+            |_| Ok(Some(MISSING_CREDENTIAL_MARKER.to_string())),
+            |_, _| panic!("missing marker must not be saved as a secret"),
+            |_| Err("delete failed".to_string()),
+        )
+        .is_err());
+        restore_import_credential_with(
+            &entry,
+            |_| Ok(Some("fixture-secret".to_string())),
+            |id, raw| {
+                assert_eq!(id, "account");
+                assert_eq!(raw, "fixture-secret");
+                Ok(())
+            },
+            |_| panic!("existing credential must be restored"),
+        )
+        .unwrap();
+        let pending = ImportJournalEntry {
+            phase: "pending".to_string(),
+            ..entry
+        };
+        restore_import_credential_with(
+            &pending,
+            |_| panic!("unstarted entries need no credential rollback"),
+            |_, _| panic!(),
+            |_| panic!(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn import_rollback_cleanup_waits_for_durable_success() {
+        let cleaned = AtomicBool::new(false);
+        assert!(finish_import_rollback_with(
+            Err("restore failed".to_string()),
+            || panic!("failed restoration must not be committed"),
+            || cleaned.store(true, Ordering::SeqCst),
+        )
+        .is_err());
+        assert!(!cleaned.load(Ordering::SeqCst));
+        assert!(finish_import_rollback_with(
+            Ok(()),
+            || Err("journal write failed".to_string()),
+            || cleaned.store(true, Ordering::SeqCst),
+        )
+        .is_err());
+        assert!(!cleaned.load(Ordering::SeqCst));
+        let marked = AtomicBool::new(false);
+        finish_import_rollback_with(
+            Ok(()),
+            || {
+                marked.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                assert!(marked.load(Ordering::SeqCst));
+                cleaned.store(true, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn import_rollback_preserves_concurrent_unrelated_updates() {
+        let mut original = AppData::default();
+        original
+            .accounts
+            .push(serde_json::from_value(test_account("existing", "uid-one")).unwrap());
+        let mut current = original.clone();
+        current.accounts[0].display_name = "imported replacement".to_string();
+        for id in ["imported-new", "unrelated-new"] {
+            current
+                .accounts
+                .push(serde_json::from_value(test_account(id, id)).unwrap());
+        }
+        current.config.silent_start_enabled = Some(true);
+        current.zodaccess.auto_sign_enabled = true;
+        let journal = ImportJournal {
+            id: "fixture".to_string(),
+            status: "snapshots-committed".to_string(),
+            config_existed: true,
+            entries: ["existing", "imported-new"]
+                .into_iter()
+                .map(|id| ImportJournalEntry {
+                    account_id: id.to_string(),
+                    had_snapshot: id == "existing",
+                    credential_backup_id: format!("backup-{id}"),
+                    phase: "snapshot-moved".to_string(),
+                })
+                .collect(),
+        };
+        let state = Arc::new(Mutex::new(current));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let rollback_state = state.clone();
+        let rollback = thread::spawn(move || {
+            commit_data_update_with(
+                &rollback_state,
+                |data| {
+                    restore_imported_oopz_accounts(data, &original, &journal);
+                    Ok(())
+                },
+                |_| {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer_state = state.clone();
+        let writer = thread::spawn(move || {
+            commit_data_update_with(
+                &writer_state,
+                |data| {
+                    data.config.overlay_offset_x = 321;
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        });
+        release_tx.send(()).unwrap();
+        rollback.join().unwrap();
+        writer.join().unwrap();
+        let latest = state.lock().unwrap();
+        assert_eq!(
+            latest
+                .accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["existing", "unrelated-new"]
+        );
+        assert_eq!(latest.accounts[0].display_name, "existing");
+        assert_eq!(latest.config.silent_start_enabled, Some(true));
+        assert!(latest.zodaccess.auto_sign_enabled);
+        assert_eq!(latest.config.overlay_offset_x, 321);
     }
 
     #[test]
